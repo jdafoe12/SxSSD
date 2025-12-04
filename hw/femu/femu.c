@@ -542,6 +542,19 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     }
 
     bs_size = ((int64_t)n->memsz) * 1024 * 1024;
+    if (BBSSD(n)) {
+        const BbCtrlParams *bbp = &n->bb_params;
+        uint64_t bb_bytes = (uint64_t)bbp->secsz *
+                            bbp->secs_per_pg *
+                            bbp->pgs_per_blk *
+                            bbp->blks_per_pl *
+                            bbp->pls_per_lun *
+                            bbp->luns_per_ch *
+                            bbp->nchs;
+        if (bb_bytes > bs_size) {
+            bs_size = bb_bytes;
+        }
+    }
 
     init_dram_backend(&n->mbe, bs_size);
     n->mbe->femu_mode = n->femu_mode;

@@ -1,4 +1,5 @@
 #include "ftl.h"
+#include "../backend/ftl-backend.h"
 
 //#define FEMU_DEBUG_FTL
 
@@ -767,7 +768,7 @@ static int do_gc(struct ssd *ssd, bool force)
     return 0;
 }
 
-static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
+static uint64_t ssd_read(SsdDramBackend *mbe, struct ssd *ssd, NvmeRequest *req)
 {
     struct ssdparams *spp = &ssd->sp;
     uint64_t lba = req->slba;
@@ -775,6 +776,7 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
     struct ppa ppa;
     uint64_t start_lpn = lba / spp->secs_per_pg;
     uint64_t end_lpn = (lba + nsecs - 1) / spp->secs_per_pg;
+    uint64_t lpn_cnt = end_lpn - start_lpn + 1;
     uint64_t lpn;
     uint64_t sublat, maxlat = 0;
 
@@ -782,6 +784,9 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
 
+
+    uint64_t *lpn_list = g_malloc0(sizeof(uint64_t) * lpn_cnt);
+    int lpn_idx = 0;
     /* normal IO read path */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
         ppa = get_maptbl_ent(ssd, lpn);
@@ -792,6 +797,8 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
             continue;
         }
 
+        lpn_list[lpn_idx++] = ppa2pgidx(ssd, &ppa);
+
         struct nand_cmd srd;
         srd.type = USER_IO;
         srd.cmd = NAND_READ;
@@ -800,21 +807,29 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         maxlat = (sublat > maxlat) ? sublat : maxlat;
     }
 
+    uint64_t page_size = spp->secs_per_pg * spp->secsz;
+    ftl_backend_read(mbe, req, lpn_list, lpn_idx, page_size);
+    g_free(lpn_list);
+
     return maxlat;
 }
 
-static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
+static uint64_t ssd_write(SsdDramBackend *mbe, struct ssd *ssd, NvmeRequest *req)
 {
     uint64_t lba = req->slba;
     struct ssdparams *spp = &ssd->sp;
     int len = req->nlb;
     uint64_t start_lpn = lba / spp->secs_per_pg;
     uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
+    uint64_t lpn_cnt = end_lpn - start_lpn + 1;
     struct ppa ppa;
     uint64_t lpn;
     uint64_t curlat = 0, maxlat = 0;
     int r;
 
+
+    uint64_t *lpn_list = g_malloc0(sizeof(uint64_t) * lpn_cnt);
+    int lpn_idx = 0;
     if (end_lpn >= spp->tt_pgs) {
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
@@ -843,6 +858,8 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 
         mark_page_valid(ssd, &ppa);
 
+        lpn_list[lpn_idx++] = ppa2pgidx(ssd, &ppa);
+
         /* need to advance the write pointer here */
         ssd_advance_write_pointer(ssd);
 
@@ -854,6 +871,9 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         curlat = ssd_advance_status(ssd, &ppa, &swr);
         maxlat = (curlat > maxlat) ? curlat : maxlat;
     }
+
+    ftl_backend_write(mbe, req, lpn_list, lpn_idx, spp->secs_per_pg * spp->secsz);
+    g_free(lpn_list);
 
     return maxlat;
 }
@@ -971,10 +991,10 @@ static void *ftl_thread(void *arg)
             ftl_assert(req);
             switch (req->cmd.opcode) {
             case NVME_CMD_WRITE:
-                lat = ssd_write(ssd, req);
+                lat = ssd_write(n->mbe, ssd, req);
                 break;
             case NVME_CMD_READ:
-                lat = ssd_read(ssd, req);
+                lat = ssd_read(n->mbe, ssd, req);
                 break;
             case NVME_CMD_DSM:
                 if (req->dsm_ranges && req->dsm_nr_ranges > 0) {

@@ -285,12 +285,20 @@ uint16_t nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
     req->status = NVME_SUCCESS;
     req->nlb = nlb;
 
-    ret = backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
-    if (!ret) {
+    if (n->femu_mode == FEMU_BBSSD_MODE) {
+        return NVME_SUCCESS;
+    }
+    if (n->femu_mode == FEMU_BBSSD_MODE) {
+        /* BBSSD FTL consumes req->qsg later, so skip the generic DMA. */
         return NVME_SUCCESS;
     }
 
-    return NVME_DNR;
+    ret = backend_rw(n->mbe, &req->qsg, &data_offset, 1, req->is_write, 0, 0);
+    if (ret) {
+        return NVME_DNR;
+    }
+
+    return NVME_SUCCESS;
 }
 
 static uint16_t nvme_dsm(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,

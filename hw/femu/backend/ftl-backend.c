@@ -75,3 +75,55 @@ int ftl_backend_write(SsdDramBackend *mbe, NvmeRequest *req, uint64_t *lpn_list,
     return 0;
 }
 
+int ftl_backend_raw_read(SsdDramBackend *mbe, uint8_t *buffer, uint64_t *ppn_list,
+                         uint64_t ppn_count, uint64_t page_size)
+{
+    if (!buffer || !ppn_list || !ppn_count || !page_size) {
+        return 0;
+    }
+
+    uint64_t *offset_list = build_offset_list(ppn_list, ppn_count, page_size);
+    if (!offset_list) {
+        return 0;
+    }
+    for (uint64_t i = 0; i < ppn_count; ++i) {
+        memcpy(buffer + i * page_size, mbe->logical_space + offset_list[i], page_size);
+    }
+    g_free(offset_list);
+
+
+    return 0;
+}
+
+int ftl_backend_raw_write(SsdDramBackend *mbe, uint8_t *buffer, uint64_t *ppn_list,
+                          uint64_t ppn_count, uint64_t page_size)
+{
+    if (!buffer || !ppn_list || !ppn_count || !page_size) {
+        return 0;
+    }
+
+    uint64_t *offset_list = build_offset_list(ppn_list, ppn_count, page_size);
+    if (!offset_list) {
+        return 0;
+    }
+    for (uint64_t i = 0; i < ppn_count; ++i) {
+        memcpy(mbe->logical_space + offset_list[i], buffer + i * page_size, page_size);
+    }
+    g_free(offset_list);
+
+    return 0;
+}
+
+// Note: this is the raw operation. The FTL will handle relevant metadata updates.
+int ftl_backend_raw_erase(SsdDramBackend *mbe, uint64_t *pbn, uint64_t block_size)
+{
+    if (!pbn || !block_size) {
+        return 0;
+    }
+
+    for (uint64_t i = 0; i < block_size; ++i) {
+        // Erasure sets the block to all 1s.
+        memset(mbe->logical_space + pbn[i] * block_size, 0xFF, block_size); 
+    }
+    return 0;
+}

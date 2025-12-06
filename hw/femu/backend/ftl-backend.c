@@ -75,6 +75,8 @@ int ftl_backend_write(SsdDramBackend *mbe, NvmeRequest *req, uint64_t *lpn_list,
     return 0;
 }
 
+// Raw operations
+
 int ftl_backend_raw_read(SsdDramBackend *mbe, uint8_t *buffer, uint64_t *ppn_list,
                          uint64_t ppn_count, uint64_t page_size)
 {

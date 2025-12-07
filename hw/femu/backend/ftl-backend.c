@@ -39,6 +39,19 @@ static uint64_t calc_first_page_offset(NvmeRequest *req, uint64_t page_size)
     return sector_offset * secsz;
 }
 
+static int should_read_fail;
+
+static int should_write_fail;
+
+static int should_erase_fail;
+
+static int report_read_fail; // events should be passed to the upper layer, 
+                             // where some policy is attached to a given event.
+
+static int report_write_fail; // index into lookup table for what to do on write failure.
+
+static int report_erase_fail; // index into lookup table for what to do.
+
 int ftl_backend_read(SsdDramBackend *mbe, NvmeRequest *req, uint64_t *lpn_list,
                      uint64_t lpn_count, uint64_t page_size)
 {

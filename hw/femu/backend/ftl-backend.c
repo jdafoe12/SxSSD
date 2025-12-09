@@ -39,21 +39,53 @@ static uint64_t calc_first_page_offset(NvmeRequest *req, uint64_t page_size)
     return sector_offset * secsz;
 }
 
-static int should_read_fail;
+static int get_read_status(SsdDramBackend *mbe, uint64_t offset)
+{
+    return 0; // zero is success. other number is ecc error count.
+}
 
-static int should_write_fail;
+static int get_write_status(SsdDramBackend *mbe, uint64_t offset)
+{
+    return 0; // zero is success. other number is failure.
+}
 
-static int should_erase_fail;
+static int get_erase_status(SsdDramBackend *mbe, uint64_t pbn)
+{
+    return 0; // zero is success. other number is failure.
+}
 
-static int report_read_fail; // events should be passed to the upper layer, 
-                             // where some policy is attached to a given event.
+static void fill_read_event(SsdDramBackend *mbe, FtlBackendEvent *event, uint64_t *offset_list, uint64_t count)
+{
+    event->type = FTL_BACKEND_EVENT_READ;
+    event->count = count;
+    event->entries = g_malloc0(sizeof(int) * count);
+    for (uint64_t i = 0; i < count; ++i) {
+        event->entries[i] = get_read_status(mbe, offset_list[i]);
+    }
+}
 
-static int report_write_fail; // index into lookup table for what to do on write failure.
+static void fill_write_event(SsdDramBackend *mbe, FtlBackendEvent *event, uint64_t *offset_list, uint64_t count)
+{
+    event->type = FTL_BACKEND_EVENT_WRITE;
+    event->count = count;
+    event->entries = g_malloc0(sizeof(int) * count);
+    for (uint64_t i = 0; i < count; ++i) {
+        event->entries[i] = get_write_status(mbe, offset_list[i]);
+    }
+}
 
-static int report_erase_fail; // index into lookup table for what to do.
+static void fill_erase_event(SsdDramBackend *mbe, FtlBackendEvent *event, uint64_t *pbn, uint64_t count)
+{
+    event->type = FTL_BACKEND_EVENT_ERASE;
+    event->count = count;
+    event->entries = g_malloc0(sizeof(int) * count);
+    for (uint64_t i = 0; i < count; ++i) {
+        event->entries[i] = get_erase_status(mbe, pbn[i]);
+    }
+}
 
 int ftl_backend_read(SsdDramBackend *mbe, NvmeRequest *req, uint64_t *lpn_list,
-                     uint64_t lpn_count, uint64_t page_size)
+                     uint64_t lpn_count, uint64_t page_size, FtlBackendEvent *event)
 {
     uint64_t *offset_list = build_offset_list(lpn_list, lpn_count, page_size);
     uint64_t first_page_off = calc_first_page_offset(req, page_size);
@@ -65,13 +97,15 @@ int ftl_backend_read(SsdDramBackend *mbe, NvmeRequest *req, uint64_t *lpn_list,
 
     backend_rw(mbe, &req->qsg, offset_list, lpn_count, false, page_size,
                first_page_off);
+    
+    fill_read_event(mbe, event, offset_list, lpn_count);
     g_free(offset_list);
 
     return 0;
 }
 
 int ftl_backend_write(SsdDramBackend *mbe, NvmeRequest *req, uint64_t *lpn_list,
-                      uint64_t lpn_count, uint64_t page_size)
+                      uint64_t lpn_count, uint64_t page_size, FtlBackendEvent *event)
 {
     uint64_t *offset_list = build_offset_list(lpn_list, lpn_count, page_size);
     uint64_t first_page_off = calc_first_page_offset(req, page_size);
@@ -84,14 +118,14 @@ int ftl_backend_write(SsdDramBackend *mbe, NvmeRequest *req, uint64_t *lpn_list,
     backend_rw(mbe, &req->qsg, offset_list, lpn_count, true, page_size,
                first_page_off);
     g_free(offset_list);
-
+    fill_write_event(mbe, event, offset_list, lpn_count);
     return 0;
 }
 
 // Raw operations
 
 int ftl_backend_raw_read(SsdDramBackend *mbe, uint8_t *buffer, uint64_t *ppn_list,
-                         uint64_t ppn_count, uint64_t page_size)
+                         uint64_t ppn_count, uint64_t page_size, FtlBackendEvent *event)
 {
     if (!buffer || !ppn_list || !ppn_count || !page_size) {
         return 0;
@@ -104,6 +138,7 @@ int ftl_backend_raw_read(SsdDramBackend *mbe, uint8_t *buffer, uint64_t *ppn_lis
     for (uint64_t i = 0; i < ppn_count; ++i) {
         memcpy(buffer + i * page_size, mbe->logical_space + offset_list[i], page_size);
     }
+    fill_read_event(mbe, event, offset_list, ppn_count);
     g_free(offset_list);
 
 
@@ -111,7 +146,7 @@ int ftl_backend_raw_read(SsdDramBackend *mbe, uint8_t *buffer, uint64_t *ppn_lis
 }
 
 int ftl_backend_raw_write(SsdDramBackend *mbe, uint8_t *buffer, uint64_t *ppn_list,
-                          uint64_t ppn_count, uint64_t page_size)
+                          uint64_t ppn_count, uint64_t page_size, FtlBackendEvent *event)
 {
     if (!buffer || !ppn_list || !ppn_count || !page_size) {
         return 0;
@@ -124,13 +159,14 @@ int ftl_backend_raw_write(SsdDramBackend *mbe, uint8_t *buffer, uint64_t *ppn_li
     for (uint64_t i = 0; i < ppn_count; ++i) {
         memcpy(mbe->logical_space + offset_list[i], buffer + i * page_size, page_size);
     }
+    fill_write_event(mbe, event, offset_list, ppn_count);
     g_free(offset_list);
 
     return 0;
 }
 
 // Note: this is the raw operation. The FTL will handle relevant metadata updates.
-int ftl_backend_raw_erase(SsdDramBackend *mbe, uint64_t *pbn, uint64_t block_size)
+int ftl_backend_raw_erase(SsdDramBackend *mbe, uint64_t *pbn, uint64_t block_size, FtlBackendEvent *event)
 {
     if (!pbn || !block_size) {
         return 0;
@@ -140,5 +176,6 @@ int ftl_backend_raw_erase(SsdDramBackend *mbe, uint64_t *pbn, uint64_t block_siz
         // Erasure sets the block to all 1s.
         memset(mbe->logical_space + pbn[i] * block_size, 0xFF, block_size); 
     }
+    fill_erase_event(mbe, event, pbn, block_size);
     return 0;
 }

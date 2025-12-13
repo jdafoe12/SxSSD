@@ -24,35 +24,63 @@
  * This prevents issues with the ordering of events.
  */
 
-typedef enum FtlBackendEventType {
+
+/*
+ * TODO: does the ftl backend need to be aware of internal ssd geometry? 
+ * At least for error simulation, it think this is needed. For example,
+ * we shoudl probably simulate errors based on the erase count of the block. 
+ * but, we are given page numbers in the request. We need the ability to convert this.
+ * we can see what the FTL will actually call. The direct call will be to bad block management functions,
+ * since this provides the pseudophysical address space. 
+ * Maybe erase count is handled in the bad block management layer?
+ */
+
+
+
+
+
+
+
+
+
+
+
+enum FtlBackendEventType {
     FTL_BACKEND_EVENT_READ,
     FTL_BACKEND_EVENT_WRITE,
     FTL_BACKEND_EVENT_ERASE
-} FtlBackendEventType;
+};
 
-typedef struct FtlBackendEvent {
+struct FtlBackendEvent {
     FtlBackendEventType type; 
     uint32_t count; 
-    int *entries; /* for read, entries[i] = bit error count for page i */
-                   /* for write, entries[i] = 0/1 success for page i */
-                   /* for erase, entries[i] = 0/1 success for block i */
+    int *status_list; /* for read, status_list[i] = bit error count for page i */
+                   /* for write, status_list[i] = 0/1 success for page i */
+                   /* for erase, status_list[i] = 0/1 success for block i */
                    /* As far as I understand, this models errors closely to a real SSD.
                     * We will simply use a probabilistic model for the errors. */
                     // 0 is success. Non-zero is failure.
-} FtlBackendEvent;
+};
+
+
+
+struct FtlBackend {
+
+
+}
 
 /* These are for serving NVMe requests directly. */
- ftl_backend_read(SsdDramBackend *mbe, NvmeRequest *req, uint64_t *lpn_list,
-                     uint64_t lpn_count, uint64_t page_size, FtlBackendEvent *event);
+int ftl_backend_read(SsdDramBackend *mbe, NvmeRequest *req, uint64_t *lpn_list,
+                     uint64_t lpn_count, uint64_t page_size, struct FtlBackendEvent *event);
 int ftl_backend_write(SsdDramBackend *mbe, NvmeRequest *req, uint64_t *lpn_list,
-                      uint64_t lpn_count, uint64_t page_size, FtlBackendEvent *event);
+                      uint64_t lpn_count, uint64_t page_size, struct FtlBackendEvent *event);
 
 /* These are for direct operations on the FTL backend, without involving the host. */
 int ftl_backend_raw_read(SsdDramBackend *mbe,uint8_t *buffer, uint64_t *ppn_list,
-                         uint64_t ppn_count, uint64_t page_size, FtlBackendEvent *event);
+                         uint64_t ppn_count, uint64_t page_size, struct FtlBackendEvent *event);
 int ftl_backend_raw_write(SsdDramBackend *mbe, uint8_t *buffer, uint64_t *ppn_list,
-                          uint64_t ppn_count, uint64_t page_size, FtlBackendEvent *event);
-int ftl_backend_raw_erase(SsdDramBackend *mbe, uint64_t *pbn, uint64_t block_size, FtlBackendEvent *event);
+                          uint64_t ppn_count, uint64_t page_size, struct FtlBackendEvent *event);
+int ftl_backend_raw_erase(SsdDramBackend *mbe, uint64_t *pbn, uint64_t block_size, struct FtlBackendEvent *event);
 
 
 #endif

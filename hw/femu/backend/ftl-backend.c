@@ -54,38 +54,38 @@ static int get_erase_status(SsdDramBackend *mbe, uint64_t pbn)
     return 0; // zero is success. other number is failure.
 }
 
-static void fill_read_event(SsdDramBackend *mbe, FtlBackendEvent *event, uint64_t *offset_list, uint64_t count)
+static void fill_read_event(SsdDramBackend *mbe, struct FtlBackendEvent *event, uint64_t *offset_list, uint64_t count)
 {
     event->type = FTL_BACKEND_EVENT_READ;
     event->count = count;
-    event->entries = g_malloc0(sizeof(int) * count);
+    event->status_list = g_malloc0(sizeof(int) * count);
     for (uint64_t i = 0; i < count; ++i) {
-        event->entries[i] = get_read_status(mbe, offset_list[i]);
+        event->status_list[i] = get_read_status(mbe, offset_list[i]);
     }
 }
 
-static void fill_write_event(SsdDramBackend *mbe, FtlBackendEvent *event, uint64_t *offset_list, uint64_t count)
+static void fill_write_event(SsdDramBackend *mbe, struct FtlBackendEvent *event, uint64_t *offset_list, uint64_t count)
 {
     event->type = FTL_BACKEND_EVENT_WRITE;
     event->count = count;
-    event->entries = g_malloc0(sizeof(int) * count);
+    event->status_list = g_malloc0(sizeof(int) * count);
     for (uint64_t i = 0; i < count; ++i) {
-        event->entries[i] = get_write_status(mbe, offset_list[i]);
+        event->status_list[i] = get_write_status(mbe, offset_list[i]);
     }
 }
 
-static void fill_erase_event(SsdDramBackend *mbe, FtlBackendEvent *event, uint64_t *pbn, uint64_t count)
+static void fill_erase_event(SsdDramBackend *mbe, struct FtlBackendEvent *event, uint64_t *pbn, uint64_t count)
 {
     event->type = FTL_BACKEND_EVENT_ERASE;
     event->count = count;
-    event->entries = g_malloc0(sizeof(int) * count);
+    event->status_list = g_malloc0(sizeof(int) * count);
     for (uint64_t i = 0; i < count; ++i) {
-        event->entries[i] = get_erase_status(mbe, pbn[i]);
+        event->status_list[i] = get_erase_status(mbe, pbn[i]);
     }
 }
 
 int ftl_backend_read(SsdDramBackend *mbe, NvmeRequest *req, uint64_t *lpn_list,
-                     uint64_t lpn_count, uint64_t page_size, FtlBackendEvent *event)
+                     uint64_t lpn_count, uint64_t page_size, struct FtlBackendEvent *event)
 {
     uint64_t *offset_list = build_offset_list(lpn_list, lpn_count, page_size);
     uint64_t first_page_off = calc_first_page_offset(req, page_size);
@@ -105,7 +105,7 @@ int ftl_backend_read(SsdDramBackend *mbe, NvmeRequest *req, uint64_t *lpn_list,
 }
 
 int ftl_backend_write(SsdDramBackend *mbe, NvmeRequest *req, uint64_t *lpn_list,
-                      uint64_t lpn_count, uint64_t page_size, FtlBackendEvent *event)
+                      uint64_t lpn_count, uint64_t page_size, struct FtlBackendEvent *event)
 {
     uint64_t *offset_list = build_offset_list(lpn_list, lpn_count, page_size);
     uint64_t first_page_off = calc_first_page_offset(req, page_size);
@@ -125,7 +125,7 @@ int ftl_backend_write(SsdDramBackend *mbe, NvmeRequest *req, uint64_t *lpn_list,
 // Raw operations
 
 int ftl_backend_raw_read(SsdDramBackend *mbe, uint8_t *buffer, uint64_t *ppn_list,
-                         uint64_t ppn_count, uint64_t page_size, FtlBackendEvent *event)
+                         uint64_t ppn_count, uint64_t page_size, struct FtlBackendEvent *event)
 {
     if (!buffer || !ppn_list || !ppn_count || !page_size) {
         return 0;
@@ -146,7 +146,7 @@ int ftl_backend_raw_read(SsdDramBackend *mbe, uint8_t *buffer, uint64_t *ppn_lis
 }
 
 int ftl_backend_raw_write(SsdDramBackend *mbe, uint8_t *buffer, uint64_t *ppn_list,
-                          uint64_t ppn_count, uint64_t page_size, FtlBackendEvent *event)
+                          uint64_t ppn_count, uint64_t page_size, struct FtlBackendEvent *event)
 {
     if (!buffer || !ppn_list || !ppn_count || !page_size) {
         return 0;
@@ -166,7 +166,7 @@ int ftl_backend_raw_write(SsdDramBackend *mbe, uint8_t *buffer, uint64_t *ppn_li
 }
 
 // Note: this is the raw operation. The FTL will handle relevant metadata updates.
-int ftl_backend_raw_erase(SsdDramBackend *mbe, uint64_t *pbn, uint64_t block_size, FtlBackendEvent *event)
+int ftl_backend_raw_erase(SsdDramBackend *mbe, uint64_t *pbn, uint64_t block_size, struct FtlBackendEvent *event)
 {
     if (!pbn || !block_size) {
         return 0;

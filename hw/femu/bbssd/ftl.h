@@ -3,6 +3,8 @@
 
 #include "../nvme.h"
 
+struct FtlBackend;
+
 #define INVALID_PPA     (~(0ULL))
 #define INVALID_LPN     (~(0ULL))
 #define UNMAPPED_PPA    (~(0ULL))
@@ -15,12 +17,12 @@ enum {
     NAND_READ_LATENCY = 40000,
     NAND_PROG_LATENCY = 200000,
     NAND_ERASE_LATENCY = 2000000,
-};
+}; // probably remove... I think no need to add to ftl-backend - not even used in ftl.c! 
 
-enum {
+/* enum {
     USER_IO = 0,
     GC_IO = 1,
-};
+};*/
 
 enum {
     SEC_FREE = 0,
@@ -32,7 +34,7 @@ enum {
     PG_VALID = 2
 };
 
-enum {
+enum { // these things should be done in backend, or no? may be policy level.?
     FEMU_ENABLE_GC_DELAY = 1,
     FEMU_DISABLE_GC_DELAY = 2,
 
@@ -45,30 +47,30 @@ enum {
 };
 
 
-#define BLK_BITS    (16)
-#define PG_BITS     (16)
-#define SEC_BITS    (8)
-#define PL_BITS     (8)
-#define LUN_BITS    (8)
-#define CH_BITS     (7)
+// #define BLK_BITS    (16)
+// #define PG_BITS     (16)
+// #define SEC_BITS    (8)
+// #define PL_BITS     (8)
+// #define LUN_BITS    (8)
+// #define CH_BITS     (7)
 
 
-/* describe a physical page addr */
-struct ppa { // ppa shoudl be moved to backend / BBM mapping engine layer.
-    union {
-        struct {
-            uint64_t blk : BLK_BITS;
-            uint64_t pg  : PG_BITS;
-            uint64_t sec : SEC_BITS;
-            uint64_t pl  : PL_BITS;
-            uint64_t lun : LUN_BITS;
-            uint64_t ch  : CH_BITS;
-            uint64_t rsv : 1;
-        } g;
+// /* describe a physical page addr */
+// struct ppa { // ppa shoudl be moved to backend / BBM mapping engine layer.
+//     union {
+//         struct {
+//             uint64_t blk : BLK_BITS;
+//             uint64_t pg  : PG_BITS;
+//             uint64_t sec : SEC_BITS;
+//             uint64_t pl  : PL_BITS;
+//             uint64_t lun : LUN_BITS;
+//             uint64_t ch  : CH_BITS;
+//             uint64_t rsv : 1;
+//         } g;
 
-        uint64_t ppa;
-    };
-};
+//         uint64_t ppa;
+//     };
+// };
 
 typedef int nand_sec_status_t;
 
@@ -84,7 +86,7 @@ struct nand_block {
     int npgs;
     int ipc; /* invalid page count */
     int vpc; /* valid page count */
-    int erase_cnt;
+   // int erase_cnt;
     int wp; /* current write pointer */
 };
 
@@ -109,54 +111,54 @@ struct ssd_channel {
     uint64_t gc_endtime;
 };
 
-struct ssdparams {
-    int secsz;        /* sector size in bytes */
-    int secs_per_pg;  /* # of sectors per page */
-    int pgs_per_blk;  /* # of NAND pages per block */
-    int blks_per_pl;  /* # of blocks per plane */
-    int pls_per_lun;  /* # of planes per LUN (Die) */
-    int luns_per_ch;  /* # of LUNs per channel */
-    int nchs;         /* # of channels in the SSD */
+// struct ssdparams {
+//     int secsz;        /* sector size in bytes */
+//     int secs_per_pg;  /* # of sectors per page */
+//     int pgs_per_blk;  /* # of NAND pages per block */
+//     int blks_per_pl;  /* # of blocks per plane */
+//     int pls_per_lun;  /* # of planes per LUN (Die) */
+//     int luns_per_ch;  /* # of LUNs per channel */
+//     int nchs;         /* # of channels in the SSD */
 
-    int pg_rd_lat;    /* NAND page read latency in nanoseconds */
-    int pg_wr_lat;    /* NAND page program latency in nanoseconds */
-    int blk_er_lat;   /* NAND block erase latency in nanoseconds */
-    int ch_xfer_lat;  /* channel transfer latency for one page in nanoseconds
-                       * this defines the channel bandwith
-                       */
+//     int pg_rd_lat;    /* NAND page read latency in nanoseconds */
+//     int pg_wr_lat;    /* NAND page program latency in nanoseconds */
+//     int blk_er_lat;   /* NAND block erase latency in nanoseconds */
+//     int ch_xfer_lat;  /* channel transfer latency for one page in nanoseconds
+//                        * this defines the channel bandwith
+//                        */
 
-    double gc_thres_pcent;
-    int gc_thres_lines;
-    double gc_thres_pcent_high;
-    int gc_thres_lines_high;
-    bool enable_gc_delay;
+//    // double gc_thres_pcent;
+//    // int gc_thres_lines;
+//    // double gc_thres_pcent_high;
+//    // int gc_thres_lines_high;
+//    // bool enable_gc_delay;
 
-    /* below are all calculated values */
-    int secs_per_blk; /* # of sectors per block */
-    int secs_per_pl;  /* # of sectors per plane */
-    int secs_per_lun; /* # of sectors per LUN */
-    int secs_per_ch;  /* # of sectors per channel */
-    int tt_secs;      /* # of sectors in the SSD */
+//     /* below are all calculated values */
+//     int secs_per_blk; /* # of sectors per block */
+//     int secs_per_pl;  /* # of sectors per plane */
+//     int secs_per_lun; /* # of sectors per LUN */
+//     int secs_per_ch;  /* # of sectors per channel */
+//     int tt_secs;      /* # of sectors in the SSD */
 
-    int pgs_per_pl;   /* # of pages per plane */
-    int pgs_per_lun;  /* # of pages per LUN (Die) */
-    int pgs_per_ch;   /* # of pages per channel */
-    int tt_pgs;       /* total # of pages in the SSD */
+//     int pgs_per_pl;   /* # of pages per plane */
+//     int pgs_per_lun;  /* # of pages per LUN (Die) */
+//     int pgs_per_ch;   /* # of pages per channel */
+//     int tt_pgs;       /* total # of pages in the SSD */
 
-    int blks_per_lun; /* # of blocks per LUN */
-    int blks_per_ch;  /* # of blocks per channel */
-    int tt_blks;      /* total # of blocks in the SSD */
+//     int blks_per_lun; /* # of blocks per LUN */
+//     int blks_per_ch;  /* # of blocks per channel */
+//     int tt_blks;      /* total # of blocks in the SSD */
 
-    int secs_per_line;
-    int pgs_per_line;
-    int blks_per_line;
-    int tt_lines;
+//     int secs_per_line;
+//     int pgs_per_line;
+//     int blks_per_line;
+//     int tt_lines;
 
-    int pls_per_ch;   /* # of planes per channel */
-    int tt_pls;       /* total # of planes in the SSD */
+//     int pls_per_ch;   /* # of planes per channel */
+//     int tt_pls;       /* total # of planes in the SSD */
 
-    int tt_luns;      /* total # of LUNs in the SSD */
-};
+//     int tt_luns;      /* total # of LUNs in the SSD */
+// };
 
 typedef struct line {
     int id;  /* line id, the same as corresponding block id */
@@ -190,15 +192,16 @@ struct line_mgmt {
     int full_line_cnt;
 };
 
-struct nand_cmd {
+/*struct nand_cmd {
     int type;
     int cmd;
-    int64_t stime; /* Coperd: request arrival time */
-};
+    int64_t stime; 
+};*/
 
-struct ssd {
+struct ssd { // This needs to be dissected and probably renamed
     char *ssdname;
-    struct ssdparams sp;
+    struct FtlBackend *fb; /* backend timing/error model */
+   // struct ssdparams sp;
     struct ssd_channel *ch;
     struct ppa *maptbl; /* page level mapping table */
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */

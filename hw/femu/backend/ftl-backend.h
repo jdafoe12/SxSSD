@@ -49,15 +49,70 @@
 
 
 
+#define BLK_BITS    (16)
+#define PG_BITS     (16)
+#define SEC_BITS    (8)
+#define PL_BITS     (8)
+#define LUN_BITS    (8)
+#define CH_BITS     (7)
 
-enum FtlBackendEventType {
+
+/* describe a physical page addr */
+struct ppa { // ppa shoudl be moved to backend / BBM mapping engine layer.
+    union {
+        struct {
+            uint64_t blk : BLK_BITS;
+            uint64_t pg  : PG_BITS;
+            uint64_t sec : SEC_BITS;
+            uint64_t pl  : PL_BITS;
+            uint64_t lun : LUN_BITS;
+            uint64_t ch  : CH_BITS;
+            uint64_t rsv : 1;
+        } g;
+
+        uint64_t ppa;
+    };
+};
+
+struct pba {
+    union {
+        struct {
+            uint64_t blk : BLK_BITS;  /* block within plane */
+            uint64_t pl  : PL_BITS;   /* plane within LUN  */
+            uint64_t lun : LUN_BITS;  /* die within chan   */
+            uint64_t ch  : CH_BITS;   /* channel           */
+            uint64_t rsv : (64 - BLK_BITS - PL_BITS - LUN_BITS - CH_BITS);
+        } g;
+
+        uint64_t pba;
+    };
+};
+
+enum FtlBackendEventCmd {
     FTL_BACKEND_EVENT_READ,
     FTL_BACKEND_EVENT_WRITE,
     FTL_BACKEND_EVENT_ERASE
 };
 
+// add a latency enum?
+
+enum FtlBackendEventType {
+    POLICY_IO = 0,
+    USER_IO  = 1,
+};
+
+struct FtlBackendTiming {
+    uint64_t *lun_next_avail;
+    uint64_t *ch_next_avail;
+  //  uint64_t *lun_policy_end;
+  //  uint64_t *ch_policy_end;
+};
+
+
+
 struct FtlBackendEvent {
-    FtlBackendEventType type; 
+    FtlBackendEventCmd cmd; 
+    FtlBackendEventType type; // may not be important?
     uint32_t count; 
     int *status_list; /* for read, status_list[i] = bit error count for page i */
                    /* for write, status_list[i] = 0/1 success for page i */
@@ -65,27 +120,92 @@ struct FtlBackendEvent {
                    /* As far as I understand, this models errors closely to a real SSD.
                     * We will simply use a probabilistic model for the errors. */
                     // 0 is success. Non-zero is failure.
+    int64_t stime; /* Request arrival time. */
+    int64_t lat;   /* latency. May not need this here. Delete if not used? 
+                    * I think it belongs here. It needs to be reported to upper layers */
+    // need to report updates to erase count
+};
+
+struct ssdparams {
+    int secsz;        /* sector size in bytes */
+    int secs_per_pg;  /* # of sectors per page */
+    int pgs_per_blk;  /* # of NAND pages per block */
+    int blks_per_pl;  /* # of blocks per plane */
+    int pls_per_lun;  /* # of planes per LUN (Die) */
+    int luns_per_ch;  /* # of LUNs per channel */
+    int nchs;         /* # of channels in the SSD */
+
+    int pg_rd_lat;    /* NAND page read latency in nanoseconds */
+    int pg_wr_lat;    /* NAND page program latency in nanoseconds */
+    int blk_er_lat;   /* NAND block erase latency in nanoseconds */
+    int ch_xfer_lat;  /* channel transfer latency for one page in nanoseconds
+                       * this defines the channel bandwith
+                       */
+
+   // double gc_thres_pcent;
+   // int gc_thres_lines;
+   // double gc_thres_pcent_high;
+   // int gc_thres_lines_high;
+   // bool enable_gc_delay;
+
+    /* below are all calculated values */
+    int secs_per_blk; /* # of sectors per block */
+    int secs_per_pl;  /* # of sectors per plane */
+    int secs_per_lun; /* # of sectors per LUN */
+    int secs_per_ch;  /* # of sectors per channel */
+    int tt_secs;      /* # of sectors in the SSD */
+
+    int pgs_per_pl;   /* # of pages per plane */
+    int pgs_per_lun;  /* # of pages per LUN (Die) */
+    int pgs_per_ch;   /* # of pages per channel */
+    int tt_pgs;       /* total # of pages in the SSD */
+
+    int blks_per_lun; /* # of blocks per LUN */
+    int blks_per_ch;  /* # of blocks per channel */
+    int tt_blks;      /* total # of blocks in the SSD */
+
+    int secs_per_line;
+    int pgs_per_line;
+    int blks_per_line;
+    int tt_lines;
+
+    int pls_per_ch;   /* # of planes per channel */
+    int tt_pls;       /* total # of planes in the SSD */
+
+    int tt_luns;      /* total # of LUNs in the SSD */
 };
 
 
 
+
+
 struct FtlBackend {
+    int *erase_cnt; // indexed in bbm, by physical block number. 
+                    // bbm should have a "getter" function for the "translated erase count" - given a pseudophysical block address.
+    struct ssdparams sp;
+    struct FtlBackendTiming bt; 
+};
 
+int ftl_backend_init(FtlBackend *fb, const BbCtrlParams *bbp);
 
-}
+// Note: the below functions should directly recieve PPA from bbm, not ppn_list.
 
 /* These are for serving NVMe requests directly. */
-int ftl_backend_read(SsdDramBackend *mbe, NvmeRequest *req, uint64_t *lpn_list,
+// note that we do not break bell-lapadula by passing
+// requests down. The usual communication paradigm is to pass requsets down
+// and responses up.
+
+int ftl_backend_read(SsdDramBackend *mbe, NvmeRequest *req, struct ppa *ppa_list,
                      uint64_t lpn_count, uint64_t page_size, struct FtlBackendEvent *event);
-int ftl_backend_write(SsdDramBackend *mbe, NvmeRequest *req, uint64_t *lpn_list,
+int ftl_backend_write(SsdDramBackend *mbe, NvmeRequest *req, struct ppa *ppa_list,
                       uint64_t lpn_count, uint64_t page_size, struct FtlBackendEvent *event);
 
 /* These are for direct operations on the FTL backend, without involving the host. */
-int ftl_backend_raw_read(SsdDramBackend *mbe,uint8_t *buffer, uint64_t *ppn_list,
+int ftl_backend_raw_read(SsdDramBackend *mbe,uint8_t *buffer, struct ppa *ppa_list,
                          uint64_t ppn_count, uint64_t page_size, struct FtlBackendEvent *event);
-int ftl_backend_raw_write(SsdDramBackend *mbe, uint8_t *buffer, uint64_t *ppn_list,
+int ftl_backend_raw_write(SsdDramBackend *mbe, uint8_t *buffer, struct ppa *ppa_list,
                           uint64_t ppn_count, uint64_t page_size, struct FtlBackendEvent *event);
-int ftl_backend_raw_erase(SsdDramBackend *mbe, uint64_t *pbn, uint64_t block_size, struct FtlBackendEvent *event);
+int ftl_backend_raw_erase(SsdDramBackend *mbe, struct pba *pbn, uint64_t block_size, struct FtlBackendEvent *event);
 
 
 #endif

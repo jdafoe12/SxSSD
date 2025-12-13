@@ -29,6 +29,48 @@
 // This is for the bbm backend. i.e. the "mapping engine".
 // It should map from pseudophysical address to ppa. 
 
+
+// IMPORTANT NOTE: we want to maintain parallelism. Thus, the "replaced" blocks should be in same (lun/channel?) as previous? 
+// Something like this. double think/check.
+
+
+#define BLK_BITS    (16)
+#define PG_BITS     (16)
+#define SEC_BITS    (8)
+#define PL_BITS     (8)
+#define LUN_BITS    (8)
+#define CH_BITS     (7)
+
+struct PseudoPpa { // ppa shoudl be moved to backend / BBM mapping engine layer.
+    union {
+        struct {
+            uint64_t blk : BLK_BITS;
+            uint64_t pg  : PG_BITS;
+            uint64_t sec : SEC_BITS;
+            uint64_t pl  : PL_BITS;
+            uint64_t lun : LUN_BITS;
+            uint64_t ch  : CH_BITS;
+            uint64_t rsv : 1;
+        } g;
+
+        uint64_t ppa;
+    };
+};
+
+struct PseudoPba {
+    union {
+        struct {
+            uint64_t blk : BLK_BITS;  /* block within plane */
+            uint64_t pl  : PL_BITS;   /* plane within LUN  */
+            uint64_t lun : LUN_BITS;  /* die within chan   */
+            uint64_t ch  : CH_BITS;   /* channel           */
+            uint64_t rsv : (64 - BLK_BITS - PL_BITS - LUN_BITS - CH_BITS);
+        } g;
+
+        uint64_t pba;
+    };
+};
+
 bbm_read(SsdDramBackend *mbe, uint8_t *buffer, uint64_t *ppn_list,
          uint64_t ppn_count, uint64_t page_size, FtlBackendEvent *event);
 bbm_write(SsdDramBackend *mbe, uint8_t *buffer, uint64_t *ppn_list,

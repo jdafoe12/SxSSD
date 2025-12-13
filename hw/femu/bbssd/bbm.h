@@ -26,6 +26,9 @@
 // The only difference is that the BBM is invoked.. This means that the operations are performed
 // over the pseudophysical blocks.
 
+// This is for the bbm backend. i.e. the "mapping engine".
+// It should map from pseudophysical address to ppa. 
+
 bbm_read(SsdDramBackend *mbe, uint8_t *buffer, uint64_t *ppn_list,
          uint64_t ppn_count, uint64_t page_size, FtlBackendEvent *event);
 bbm_write(SsdDramBackend *mbe, uint8_t *buffer, uint64_t *ppn_list,

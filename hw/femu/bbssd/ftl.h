@@ -52,8 +52,9 @@ enum {
 #define LUN_BITS    (8)
 #define CH_BITS     (7)
 
+
 /* describe a physical page addr */
-struct ppa {
+struct ppa { // ppa shoudl be moved to backend / BBM mapping engine layer.
     union {
         struct {
             uint64_t blk : BLK_BITS;
@@ -71,7 +72,8 @@ struct ppa {
 
 typedef int nand_sec_status_t;
 
-struct nand_page {
+struct nand_page { // the nand_page, nand_block and such shoudl stay in the ftl. This is becuase they purely track the metadata at different granularities.
+                   // the geometry needed by the backend is mostly the things currently in the ssd struct.
     nand_sec_status_t *sec;
     int nsecs;
     int status;

@@ -35,7 +35,12 @@
  * Maybe erase count is handled in the bad block management layer?
  */
 
+ 
+// in addition to keeping track of the geometry (and such low level metadata currently tracked by the FTL),
+// we need the erase count here instead of in the FTL.
 
+// the geometry and timing should be here, because it is generated here. Note that we have
+// read-down, so that the FTL can be aware of the geometry.
 
 
 

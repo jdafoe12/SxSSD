@@ -30,25 +30,25 @@ static void bb_flip(FemuCtrl *n, NvmeCmd *cmd)
 
     switch (cdw10) {
     case FEMU_ENABLE_GC_DELAY:
-        ssd->sp.enable_gc_delay = true;
+        ssd->fb->sp.enable_gc_delay = true;
         femu_log("%s,FEMU GC Delay Emulation [Enabled]!\n", n->devname);
         break;
     case FEMU_DISABLE_GC_DELAY:
-        ssd->sp.enable_gc_delay = false;
+        ssd->fb->sp.enable_gc_delay = false;
         femu_log("%s,FEMU GC Delay Emulation [Disabled]!\n", n->devname);
         break;
     case FEMU_ENABLE_DELAY_EMU:
-        ssd->sp.pg_rd_lat = NAND_READ_LATENCY;
-        ssd->sp.pg_wr_lat = NAND_PROG_LATENCY;
-        ssd->sp.blk_er_lat = NAND_ERASE_LATENCY;
-        ssd->sp.ch_xfer_lat = 0;
+        ssd->fb->sp.pg_rd_lat = 40000;     /* 40us NAND read latency */
+        ssd->fb->sp.pg_wr_lat = 200000;    /* 200us NAND program latency */
+        ssd->fb->sp.blk_er_lat = 2000000;  /* 2ms NAND erase latency */
+        ssd->fb->sp.ch_xfer_lat = 0;
         femu_log("%s,FEMU Delay Emulation [Enabled]!\n", n->devname);
         break;
     case FEMU_DISABLE_DELAY_EMU:
-        ssd->sp.pg_rd_lat = 0;
-        ssd->sp.pg_wr_lat = 0;
-        ssd->sp.blk_er_lat = 0;
-        ssd->sp.ch_xfer_lat = 0;
+        ssd->fb->sp.pg_rd_lat = 0;
+        ssd->fb->sp.pg_wr_lat = 0;
+        ssd->fb->sp.blk_er_lat = 0;
+        ssd->fb->sp.ch_xfer_lat = 0;
         femu_log("%s,FEMU Delay Emulation [Disabled]!\n", n->devname);
         break;
     case FEMU_RESET_ACCT:

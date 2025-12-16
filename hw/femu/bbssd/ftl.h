@@ -2,6 +2,7 @@
 #define __FEMU_FTL_H
 
 #include "../nvme.h"
+#include "./bbm.h" // we have access to PseudoPpa and PseudoPba through this.
 
 struct FtlBackend;
 
@@ -9,15 +10,15 @@ struct FtlBackend;
 #define INVALID_LPN     (~(0ULL))
 #define UNMAPPED_PPA    (~(0ULL))
 
-enum {
-    NAND_READ =  0,
-    NAND_WRITE = 1,
-    NAND_ERASE = 2,
+// enum {
+//     NAND_READ =  0,
+//     NAND_WRITE = 1,
+//     NAND_ERASE = 2,
 
-    NAND_READ_LATENCY = 40000,
-    NAND_PROG_LATENCY = 200000,
-    NAND_ERASE_LATENCY = 2000000,
-}; // probably remove... I think no need to add to ftl-backend - not even used in ftl.c! 
+//     NAND_READ_LATENCY = 40000,
+//     NAND_PROG_LATENCY = 200000,
+//     NAND_ERASE_LATENCY = 2000000,
+// }; // probably remove... I think no need to add to ftl-backend - not even used in ftl.c! 
 
 /* enum {
     USER_IO = 0,
@@ -201,9 +202,10 @@ struct line_mgmt {
 struct ssd { // This needs to be dissected and probably renamed
     char *ssdname;
     struct FtlBackend *fb; /* backend timing/error model */
+    struct bbm *bbm;     /* bad block manager / OP mapping context */
    // struct ssdparams sp;
     struct ssd_channel *ch;
-    struct ppa *maptbl; /* page level mapping table */
+    PseudoPpa *maptbl; /* page level mapping table */
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
     struct write_pointer wp;
     struct line_mgmt lm;

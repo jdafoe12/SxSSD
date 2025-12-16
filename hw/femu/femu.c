@@ -358,6 +358,8 @@ static int nvme_init_namespace(FemuCtrl *n, NvmeNamespace *ns, Error **errp)
 
     lba_index = NVME_ID_NS_FLBAS_INDEX(ns->id_ns.flbas);
     num_blks = n->ns_size / ((1 << id_ns->lbaf[lba_index].lbads));
+    /* Set nsze to the logical capacity, measured in LBAs rather than bytes. 
+     * This is used to check that requests from above are within the logical capacity. */
     id_ns->nuse = id_ns->ncap = id_ns->nsze = cpu_to_le64(num_blks);
 
     n->csi = NVME_CSI_NVM;
@@ -530,10 +532,39 @@ static int nvme_register_extensions(FemuCtrl *n)
     return 0;
 }
 
+static uint64_t bbssd_logical_bytes(const BbCtrlParams *bbp)
+{
+    /* compute logical capacity excluding overprovisioned blocks */
+    int blks_per_pl_phys = bbp->blks_per_pl;
+    int reserved = (blks_per_pl_phys * bbp->op_pct) / 100; /* implicit floor by integer division */
+    if (reserved >= blks_per_pl_phys && blks_per_pl_phys > 0) {
+        reserved = blks_per_pl_phys - 1; /* leave at least one logical block */
+    }
+    int blks_per_pl_log = blks_per_pl_phys - reserved; /* overprovisioning is at the per-plane level */
+    uint64_t blks_per_lun_log = (uint64_t)blks_per_pl_log * bbp->pls_per_lun; /* overprovisioning is at the per-plane level */
+    uint64_t total_blks_log = blks_per_lun_log * bbp->luns_per_ch * bbp->nchs;
+    return (uint64_t)bbp->secsz * bbp->secs_per_pg * bbp->pgs_per_blk *
+           total_blks_log;
+}
+
+static int64_t bbssd_physical_bytes(const BbCtrlParams *bbp)
+{
+    /* Physical capacity ignores overprovisioning; use raw geometry. */
+    uint64_t blks_per_lun_phys = (uint64_t)bbp->blks_per_pl * bbp->pls_per_lun;
+    uint64_t total_blks_phys = blks_per_lun_phys * bbp->luns_per_ch * bbp->nchs;
+    return (int64_t)bbp->secsz * bbp->secs_per_pg * bbp->pgs_per_blk *
+           total_blks_phys;
+}
+
 static void femu_realize(PCIDevice *pci_dev, Error **errp)
 {
     FemuCtrl *n = FEMU(pci_dev);
-    int64_t bs_size;
+    int64_t bs_size; /* BACKEND STORAGE SIZE!
+                      * This is the physical 
+                      * capacity in bytes. */
+    int64_t ls_size; /* LOGICAL STORAGE SIZE!
+                      * This is the logical
+                      * capacity in bytes. */
 
     nvme_check_size();
 
@@ -541,28 +572,35 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
         return;
     }
 
+    
     bs_size = ((int64_t)n->memsz) * 1024 * 1024;
+    ls_size = ((int64_t)n->memsz) * 1024 * 1024;
+    /* Josh: in BBSSD mode, we have overprovisioned blocks,
+     * so that we only expose the logical capacity to the guest. 
+     */
     if (BBSSD(n)) {
         const BbCtrlParams *bbp = &n->bb_params;
-        uint64_t bb_bytes = (uint64_t)bbp->secsz *
-                            bbp->secs_per_pg *
-                            bbp->pgs_per_blk *
-                            bbp->blks_per_pl *
-                            bbp->pls_per_lun *
-                            bbp->luns_per_ch *
-                            bbp->nchs;
-        if (bb_bytes > bs_size) {
-            bs_size = bb_bytes;
-        }
+        bs_size = bbssd_physical_bytes(bbp);
+        ls_size = bbssd_logical_bytes(bbp);
     }
 
-    init_dram_backend(&n->mbe, bs_size);
+    /* There are problems with this call. The backend should 
+     * occupy the physical capacity of the SSD, not the logical
+     * capacity!
+     */
+    init_dram_backend(&n->mbe, bs_size); 
     n->mbe->femu_mode = n->femu_mode;
 
     n->completed = 0;
     n->start_time = time(NULL);
     n->reg_size = pow2ceil(0x1004 + 2 * (n->nr_io_queues + 1) * 4);
-    n->ns_size = bs_size / (uint64_t)n->num_namespaces;
+    /*
+     * n->ns_size is the namespace size in bytes. Here, it is set to correspond to the logical capacity
+     * (i.e. the physical capacity minus the overprovisioned blocks in BBSSD mode).
+     * During namespace initialization, the number of LBAs is derived. 
+     * This (nsze) is then used to check that requests from above are within the logical capacity.
+     */
+    n->ns_size = ls_size / (uint64_t)n->num_namespaces;
 
     /* Coperd: [1..nr_io_queues] are used as IO queues */
     n->sq = g_malloc0(sizeof(*n->sq) * (n->nr_io_queues + 1));
@@ -576,8 +614,11 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     nvme_init_ctrl(n);
     nvme_init_namespaces(n, errp);
 
-    nvme_register_extensions(n);
+    /* This call registers the appropriate extension (e.g. BBSSD, ZNS, etc.) */
+    nvme_register_extensions(n); 
 
+    /* This call initializes the extension (e.g. BBSSD, ZNS, etc.) 
+     * in the case of BBSSD, it calls the bb_init function. */
     if (n->ext_ops.init) {
         n->ext_ops.init(n, errp);
     }
@@ -695,6 +736,8 @@ static const Property femu_props[] = {
     DEFINE_PROP_INT32("ch_xfer_lat", FemuCtrl, bb_params.ch_xfer_lat, 0),
     DEFINE_PROP_INT32("gc_thres_pcent", FemuCtrl, bb_params.gc_thres_pcent, 75),
     DEFINE_PROP_INT32("gc_thres_pcent_high", FemuCtrl, bb_params.gc_thres_pcent_high, 95),
+    DEFINE_PROP_INT32("op_pct", FemuCtrl, bb_params.op_pct, 7), // The percentage of blocks that are overprovisioned. This should be in integer parameter.
+                                                                // The overprovisioning is per plane.
 };
 
 static const VMStateDescription femu_vmstate = {

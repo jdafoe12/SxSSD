@@ -269,7 +269,8 @@ uint16_t nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
     req->is_write = (rw->opcode == NVME_CMD_WRITE) ? 1 : 0;
 
     err = femu_nvme_rw_check_req(n, ns, cmd, req, slba, elba, nlb, ctrl,
-                                 data_size, meta_size);
+                                 data_size, meta_size); /* This call enforces that the request is within the LOGICAL capacity.
+                                                          * This logical capacity is defined as the namespace size. */
     if (err)
         return err;
 

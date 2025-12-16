@@ -7,11 +7,11 @@ int init_dram_backend(SsdDramBackend **mbe, int64_t nbytes)
     SsdDramBackend *b = *mbe = g_malloc0(sizeof(SsdDramBackend));
 
     b->size = nbytes;
-    b->logical_space = g_malloc0(nbytes);
+    b->backend_memory = g_malloc0(nbytes);
 
-    if (mlock(b->logical_space, nbytes) == -1) {
+    if (mlock(b->backend_memory, nbytes) == -1) {
         femu_err("Failed to pin the memory backend to the host DRAM\n");
-        g_free(b->logical_space);
+        g_free(b->backend_memory);
         abort();
     }
 
@@ -20,9 +20,9 @@ int init_dram_backend(SsdDramBackend **mbe, int64_t nbytes)
 
 void free_dram_backend(SsdDramBackend *b)
 {
-    if (b->logical_space) {
-        munlock(b->logical_space, b->size);
-        g_free(b->logical_space);
+    if (b->backend_memory) {
+        munlock(b->backend_memory, b->size);
+        g_free(b->backend_memory);
     }
 }
 
@@ -34,7 +34,7 @@ int backend_rw(SsdDramBackend *b, QEMUSGList *qsg, uint64_t *lbal,
     int sg_cur_index = 0;
     dma_addr_t sg_cur_byte = 0;
     dma_addr_t cur_addr, cur_len;
-    void *mb = b->logical_space;
+    void *mb = b->backend_memory;
 
     DMADirection dir = DMA_DIRECTION_FROM_DEVICE;
 

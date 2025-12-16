@@ -2,11 +2,13 @@
 #include <assert.h>
 #include <string.h>
 
-int ftl_backend_init(FtlBackend *fb, const BbCtrlParams *bbp)
+int ftl_backend_init(struct FtlBackend *fb, SsdDramBackend *mbe, const BbCtrlParams *bbp)
 {
     if (!fb || !bbp) {
         return -1;
     }
+
+    fb->mbe = mbe;
 
     struct ssdparams *spp = &fb->sp;
 
@@ -24,6 +26,11 @@ int ftl_backend_init(FtlBackend *fb, const BbCtrlParams *bbp)
     spp->pg_wr_lat   = bbp->pg_wr_lat;
     spp->blk_er_lat  = bbp->blk_er_lat;
     spp->ch_xfer_lat = bbp->ch_xfer_lat;
+
+    /* GC configuration */
+    spp->gc_thres_pcent = bbp->gc_thres_pcent / 100.0;
+    spp->gc_thres_pcent_high = bbp->gc_thres_pcent_high / 100.0;
+    spp->enable_gc_delay = true;
 
     /* derived geometry */
     spp->secs_per_blk = spp->secs_per_pg * spp->pgs_per_blk;
@@ -51,6 +58,10 @@ int ftl_backend_init(FtlBackend *fb, const BbCtrlParams *bbp)
     spp->secs_per_line = spp->pgs_per_line * spp->secs_per_pg;
     spp->tt_lines      = spp->blks_per_lun;
 
+    /* GC thresholds (based on physical geometry) */
+    spp->gc_thres_lines = (int)((1.0 - spp->gc_thres_pcent) * spp->tt_lines);
+    spp->gc_thres_lines_high = (int)((1.0 - spp->gc_thres_pcent_high) * spp->tt_lines);
+
     fb->erase_cnt = g_malloc0(sizeof(int) * spp->tt_blks);
 
     /* initialize timing metadata (per-LUN/channel availability & GC end times) */
@@ -72,7 +83,7 @@ static inline uint32_t ch_index(const struct ppa *ppa)
 }
 
 /* Timing-only scheduler using backend metadata (no FTL structs). */
-static uint64_t ssd_advance_status(FtlBackend *fb, const struct ppa *ppa,
+static uint64_t ssd_advance_status(struct FtlBackend *fb, const struct ppa *ppa,
                                    struct FtlBackendEvent *event)
 {
     const struct ssdparams *spp = &fb->sp;
@@ -106,7 +117,7 @@ static uint64_t ssd_advance_status(FtlBackend *fb, const struct ppa *ppa,
         break;
 
     default:
-        ftl_err("Unsupported backend command: 0x%x\n",
+        femu_err("Unsupported backend command: 0x%x\n",
                 event ? event->cmd : -1);
         break;
     }
@@ -121,7 +132,7 @@ static uint64_t ssd_advance_status(FtlBackend *fb, const struct ppa *ppa,
 }
 
 
-uint64_t ppa2pgidx(const struct ssdparams *spp, const struct ppa *ppa)
+static uint64_t ppa2pgidx(const struct ssdparams *spp, const struct ppa *ppa)
 {
     assert(spp);
     assert(ppa);
@@ -141,7 +152,7 @@ uint64_t ppa2pgidx(const struct ssdparams *spp, const struct ppa *ppa)
     return pgidx;
 }
 
-uint64_t pba2blkidx(const struct ssdparams *spp, const struct pba *pba)
+static uint64_t pba2blkidx(const struct ssdparams *spp, const struct pba *pba)
 {
     assert(spp);
     assert(pba);
@@ -159,16 +170,16 @@ uint64_t pba2blkidx(const struct ssdparams *spp, const struct pba *pba)
     return blkidx;
 }
 
-static uint64_t *build_offset_list(struct ppa *ppa_list, uint64_t ppa_count,
+static uint64_t *build_offset_list(const struct ssdparams *spp, struct ppa *ppa_list, uint64_t ppa_count,
                                    uint64_t page_size)
 {
-    if (!ppa_list || !ppa_count) {
+    if (!spp || !ppa_list || !ppa_count) {
         return NULL;
     }
 
     uint64_t *offset_list = g_malloc0(sizeof(uint64_t) * ppa_count);
     for (uint64_t i = 0; i < ppa_count; ++i) {
-        offset_list[i] = ppa2pgidx(ppa_list[i]) * page_size;
+        offset_list[i] = ppa2pgidx(spp, &ppa_list[i]) * page_size;
     }
 
     return offset_list;
@@ -198,24 +209,24 @@ static uint64_t calc_first_page_offset(NvmeRequest *req, uint64_t page_size)
     return sector_offset * secsz;
 }
 
-static int get_read_status(FtlBackend *fb, struct ppa page_addr)
+static int get_read_status(struct FtlBackend *fb, struct ppa page_addr)
 {
     return 0; // zero is success. other number is ecc error count.
 }
 
-static int get_write_status(FtlBackend *fb, struct ppa page_addr)
+static int get_write_status(struct FtlBackend *fb, struct ppa page_addr)
 {
     return 0; // zero is success. other number is failure.
 }
 
-static int get_erase_status(FtlBackend *fb, struct pba block_addr)
+static int get_erase_status(struct FtlBackend *fb, struct pba block_addr)
 {
     return 0; // zero is success. other number is failure.
 }
 
-static void fill_read_event(FtlBackend *fb, struct FtlBackendEvent *event, struct ppa *ppa_list, uint64_t count, int lat)
+static void fill_read_event(struct FtlBackend *fb, struct FtlBackendEvent *event, struct ppa *ppa_list, uint64_t count, int lat)
 {
-    event->type = FTL_BACKEND_EVENT_READ;
+    event->cmd = FTL_BACKEND_EVENT_READ;
     event->count = count;
     event->status_list = g_malloc0(sizeof(int) * count);
     for (uint64_t i = 0; i < count; ++i) {
@@ -224,20 +235,20 @@ static void fill_read_event(FtlBackend *fb, struct FtlBackendEvent *event, struc
     event->lat = lat;
 }
 
-static void fill_write_event(FtlBackend *fb, struct FtlBackendEvent *event, struct ppa *ppa_list, uint64_t count, int lat)
+static void fill_write_event(struct FtlBackend *fb, struct FtlBackendEvent *event, struct ppa *ppa_list, uint64_t count, int lat)
 {
-    event->type = FTL_BACKEND_EVENT_WRITE;
+    event->cmd = FTL_BACKEND_EVENT_WRITE;
     event->count = count;
     event->status_list = g_malloc0(sizeof(int) * count);
     for (uint64_t i = 0; i < count; ++i) {
-        event->status_list[i] = get_write_status(fb, offset_list[i]);
+        event->status_list[i] = get_write_status(fb, ppa_list[i]);
     }
     event->lat = lat;
 }
 
-static void fill_erase_event(FtlBackend *fb, struct FtlBackendEvent *event, struct pba *pba, uint64_t count, int lat)
+static void fill_erase_event(struct FtlBackend *fb, struct FtlBackendEvent *event, struct pba *pba, uint64_t count, int lat)
 {
-    event->type = FTL_BACKEND_EVENT_ERASE;
+    event->cmd = FTL_BACKEND_EVENT_ERASE;
     event->count = count;
     event->status_list = g_malloc0(sizeof(int) * count);
     for (uint64_t i = 0; i < count; ++i) {
@@ -246,10 +257,32 @@ static void fill_erase_event(FtlBackend *fb, struct FtlBackendEvent *event, stru
     event->lat = lat;
 }
 
-int ftl_backend_read(SsdDramBackend *mbe, NvmeRequest *req, struct ppa *ppa_list,
-                     uint64_t ppa_count, uint64_t page_size, struct FtlBackendEvent *event)
+static int ftl_backend_latency(struct FtlBackend *fb, struct ppa *ppa_list,
+                               uint64_t ppa_count, struct FtlBackendEvent *event)
 {
-    uint64_t *offset_list = build_offset_list(ppn_list, lpn_count, page_size);
+    if (!fb || !ppa_list || !ppa_count) {
+        return 0;
+    }
+
+    int max_lat = 0;
+    for (uint64_t i = 0; i < ppa_count; ++i) {
+        int lat = (int)ssd_advance_status(fb, &ppa_list[i], event);
+        if (lat > max_lat) {
+            max_lat = lat;
+        }
+    }
+    return max_lat;
+}
+
+int ftl_backend_read(struct FtlBackend *fb, NvmeRequest *req, struct ppa *ppa_list,
+                     uint64_t ppa_count, uint64_t page_size,
+                     struct FtlBackendEvent *event)
+{
+    if (!fb || !fb->mbe || !req || !ppa_list || !ppa_count || !page_size) {
+        return 0;
+    }
+
+    uint64_t *offset_list = build_offset_list(&fb->sp, ppa_list, ppa_count, page_size);
     uint64_t first_page_off = calc_first_page_offset(req, page_size);
 
     if (!offset_list) {
@@ -257,20 +290,27 @@ int ftl_backend_read(SsdDramBackend *mbe, NvmeRequest *req, struct ppa *ppa_list
         return 0;
     }
 
-    backend_rw(mbe, &req->qsg, offset_list, lpn_count, false, page_size,
+    backend_rw(fb->mbe, &req->qsg, offset_list, ppa_count, false, page_size,
                first_page_off);
-    
-    int lat = ssd_advance_status(fb, ppa, event);
-    fill_read_event(fb, event, offset_list, lpn_count, lat);
+
+    int lat = ftl_backend_latency(fb, ppa_list, ppa_count, event);
+    if (event) {
+        fill_read_event(fb, event, ppa_list, ppa_count, lat);
+    }
     g_free(offset_list);
 
     return 0;
 }
 
-int ftl_backend_write(SsdDramBackend *mbe, NvmeRequest *req, struct ppa *ppa_list,
-                      uint64_t ppa_count, uint64_t page_size, struct FtlBackendEvent *event)
+int ftl_backend_write(struct FtlBackend *fb, NvmeRequest *req, struct ppa *ppa_list,
+                      uint64_t ppa_count, uint64_t page_size,
+                      struct FtlBackendEvent *event)
 {
-    uint64_t *offset_list = build_offset_list(ppa_list, ppa_count, page_size);
+    if (!fb || !fb->mbe || !req || !ppa_list || !ppa_count || !page_size) {
+        return 0;
+    }
+
+    uint64_t *offset_list = build_offset_list(&fb->sp, ppa_list, ppa_count, page_size);
     uint64_t first_page_off = calc_first_page_offset(req, page_size);
 
     if (!offset_list) {
@@ -278,77 +318,107 @@ int ftl_backend_write(SsdDramBackend *mbe, NvmeRequest *req, struct ppa *ppa_lis
         return 0;
     }
 
-    backend_rw(mbe, &req->qsg, offset_list, ppa_count, true, page_size,
+    backend_rw(fb->mbe, &req->qsg, offset_list, ppa_count, true, page_size,
                first_page_off);
 
-    int lat = ssd_advance_status(fb, ppa, event);
-    fill_write_event(fb, event, offset_list, ppa_count, lat);
+    int lat = ftl_backend_latency(fb, ppa_list, ppa_count, event);
+    if (event) {
+        fill_write_event(fb, event, ppa_list, ppa_count, lat);
+    }
     g_free(offset_list);
     return 0;
 }
 
 // Raw operations
 
-int ftl_backend_raw_read(SsdDramBackend *mbe, uint8_t *buffer, struct ppa *ppa_list,
-                         uint64_t ppa_count, uint64_t page_size, struct FtlBackendEvent *event)
+int ftl_backend_raw_read(struct FtlBackend *fb, uint8_t *buffer, struct ppa *ppa_list,
+                         uint64_t ppa_count, uint64_t page_size,
+                         struct FtlBackendEvent *event)
 {
-    if (!buffer || !ppa_list || !ppa_count || !page_size) {
+    if (!fb || !fb->mbe || !buffer || !ppa_list || !ppa_count || !page_size) {
         return 0;
     }
 
-    uint64_t *offset_list = build_offset_list(ppa_list, ppa_count, page_size);
+    uint64_t *offset_list = build_offset_list(&fb->sp, ppa_list, ppa_count, page_size);
     if (!offset_list) {
         return 0;
     }
     for (uint64_t i = 0; i < ppa_count; ++i) {
-        memcpy(buffer + i * page_size, mbe->logical_space + offset_list[i], page_size);
+        memcpy(buffer + i * page_size, fb->mbe->backend_memory + offset_list[i],
+               page_size);
     }
 
-    int lat = ssd_advance_status(fb, ppa, event);
-    fill_read_event(fb, event, offset_list, ppa_count, lat);
+    int lat = ftl_backend_latency(fb, ppa_list, ppa_count, event);
+    if (event) {
+        fill_read_event(fb, event, ppa_list, ppa_count, lat);
+    }
     g_free(offset_list);
-
 
     return 0;
 }
 
-int ftl_backend_raw_write(SsdDramBackend *mbe, uint8_t *buffer, struct ppa *ppa_list,
-                          uint64_t ppa_count, uint64_t page_size, struct FtlBackendEvent *event)
+int ftl_backend_raw_write(struct FtlBackend *fb, uint8_t *buffer, struct ppa *ppa_list,
+                          uint64_t ppa_count, uint64_t page_size,
+                          struct FtlBackendEvent *event)
 {
-    if (!buffer || !ppa_list || !ppa_count || !page_size) {
+    if (!fb || !fb->mbe || !buffer || !ppa_list || !ppa_count || !page_size) {
         return 0;
     }
 
-    uint64_t *offset_list = build_offset_list(ppn_list, ppa_count, page_size);
+    uint64_t *offset_list = build_offset_list(&fb->sp, ppa_list, ppa_count, page_size);
     if (!offset_list) {
         return 0;
     }
     for (uint64_t i = 0; i < ppa_count; ++i) {
-        memcpy(mbe->logical_space + offset_list[i], buffer + i * page_size, page_size);
+        memcpy(fb->mbe->backend_memory + offset_list[i], buffer + i * page_size,
+               page_size);
     }
 
-    int lat = ssd_advance_status(fb, ppa, event);
-    fill_write_event(fb, event, offset_list, ppa_count, lat);
+    int lat = ftl_backend_latency(fb, ppa_list, ppa_count, event);
+    if (event) {
+        fill_write_event(fb, event, ppa_list, ppa_count, lat);
+    }
     g_free(offset_list);
 
     return 0;
 }
 
 // Note: this is the raw operation. The FTL will handle relevant metadata updates.
-int ftl_backend_raw_erase(SsdDramBackend *mbe, struct pba *pb, uint64_t block_size, struct FtlBackendEvent *event)
+int ftl_backend_raw_erase(struct FtlBackend *fb, struct pba *pba_list,
+                          uint64_t block_count, struct FtlBackendEvent *event)
 {
-    if (!pba || !block_size) {
+    if (!fb || !fb->mbe || !pba_list || !block_count) {
         return 0;
     }
 
-    for (uint64_t i = 0; i < block_size; ++i) {
-        // Erasure sets the block to all 1s.
-        memset(mbe->logical_space + pba[i] * block_size, 0xFF, block_size); 
+    const struct ssdparams *spp = &fb->sp;
+    uint64_t bytes_per_block =
+        (uint64_t)spp->secsz * spp->secs_per_pg * spp->pgs_per_blk;
+
+    for (uint64_t i = 0; i < block_count; ++i) {
+        uint64_t blkidx = pba2blkidx(spp, &pba_list[i]);
+        memset(fb->mbe->backend_memory + blkidx * bytes_per_block, 0xFF,
+               bytes_per_block);
     }
 
-    int lat = ssd_advance_status(fb, pba, event); 
-    fill_erase_event(fb, event, pba, block_size, lat);
-    g_free(offset_list);
+    /* Coarse timing: treat each block as one erase event at (ch,lun). */
+    int max_lat = 0;
+    for (uint64_t i = 0; i < block_count; ++i) {
+        struct ppa ppa = {0};
+        ppa.g.ch  = pba_list[i].g.ch;
+        ppa.g.lun = pba_list[i].g.lun;
+        ppa.g.pl  = pba_list[i].g.pl;
+        ppa.g.blk = pba_list[i].g.blk;
+        int lat = (int)ssd_advance_status(fb, &ppa, event);
+        if (lat > max_lat) {
+            max_lat = lat;
+        }
+    }
+
+    if (event) {
+        fill_erase_event(fb, event, pba_list, block_count, max_lat);
+    }
+
     return 0;
 }
 // TODO: a few existing problems. pba usage in advance_status.

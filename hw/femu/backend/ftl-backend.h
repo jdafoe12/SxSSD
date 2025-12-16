@@ -111,8 +111,8 @@ struct FtlBackendTiming {
 
 
 struct FtlBackendEvent {
-    FtlBackendEventCmd cmd; 
-    FtlBackendEventType type; // may not be important?
+    enum FtlBackendEventCmd cmd; 
+    enum FtlBackendEventType type; // may not be important?
     uint32_t count; 
     int *status_list; /* for read, status_list[i] = bit error count for page i */
                    /* for write, status_list[i] = 0/1 success for page i */
@@ -142,11 +142,12 @@ struct ssdparams {
                        * this defines the channel bandwith
                        */
 
-   // double gc_thres_pcent;
-   // int gc_thres_lines;
-   // double gc_thres_pcent_high;
-   // int gc_thres_lines_high;
-   // bool enable_gc_delay;
+    /* GC configuration. For now we can keep this, but it will be migrated to policy level. */
+    double gc_thres_pcent;
+    int gc_thres_lines;
+    double gc_thres_pcent_high;
+    int gc_thres_lines_high;
+    bool enable_gc_delay;
 
     /* below are all calculated values */
     int secs_per_blk; /* # of sectors per block */
@@ -180,13 +181,15 @@ struct ssdparams {
 
 
 struct FtlBackend {
+    /* Backing store for physical bytes (e.g., DRAM-backed). */
+    SsdDramBackend *mbe;
     int *erase_cnt; // indexed in bbm, by physical block number. 
                     // bbm should have a "getter" function for the "translated erase count" - given a pseudophysical block address.
     struct ssdparams sp;
     struct FtlBackendTiming bt; 
 };
 
-int ftl_backend_init(FtlBackend *fb, const BbCtrlParams *bbp);
+int ftl_backend_init(struct FtlBackend *fb, SsdDramBackend *mbe, const BbCtrlParams *bbp);
 
 // Note: the below functions should directly recieve PPA from bbm, not ppn_list.
 
@@ -195,17 +198,18 @@ int ftl_backend_init(FtlBackend *fb, const BbCtrlParams *bbp);
 // requests down. The usual communication paradigm is to pass requsets down
 // and responses up.
 
-int ftl_backend_read(SsdDramBackend *mbe, NvmeRequest *req, struct ppa *ppa_list,
+int ftl_backend_read(struct FtlBackend *fb, NvmeRequest *req, struct ppa *ppa_list,
                      uint64_t lpn_count, uint64_t page_size, struct FtlBackendEvent *event);
-int ftl_backend_write(SsdDramBackend *mbe, NvmeRequest *req, struct ppa *ppa_list,
+int ftl_backend_write(struct FtlBackend *fb, NvmeRequest *req, struct ppa *ppa_list,
                       uint64_t lpn_count, uint64_t page_size, struct FtlBackendEvent *event);
 
 /* These are for direct operations on the FTL backend, without involving the host. */
-int ftl_backend_raw_read(SsdDramBackend *mbe,uint8_t *buffer, struct ppa *ppa_list,
+int ftl_backend_raw_read(struct FtlBackend *fb, uint8_t *buffer, struct ppa *ppa_list,
                          uint64_t ppn_count, uint64_t page_size, struct FtlBackendEvent *event);
-int ftl_backend_raw_write(SsdDramBackend *mbe, uint8_t *buffer, struct ppa *ppa_list,
+int ftl_backend_raw_write(struct FtlBackend *fb, uint8_t *buffer, struct ppa *ppa_list,
                           uint64_t ppn_count, uint64_t page_size, struct FtlBackendEvent *event);
-int ftl_backend_raw_erase(SsdDramBackend *mbe, struct pba *pbn, uint64_t block_size, struct FtlBackendEvent *event);
+int ftl_backend_raw_erase(struct FtlBackend *fb, struct pba *pbn, uint64_t block_count,
+                          struct FtlBackendEvent *event);
 
 
 #endif

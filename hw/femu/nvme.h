@@ -1169,6 +1169,7 @@ typedef struct BbCtrlParams {
 
     int gc_thres_pcent;
     int gc_thres_pcent_high;
+    int op_pct; /* overprovision percentage (0-100), logical space excludes this */
 } BbCtrlParams;
 
 typedef struct ZNSCtrlParams {

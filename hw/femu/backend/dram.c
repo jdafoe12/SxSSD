@@ -10,7 +10,10 @@ int init_dram_backend(SsdDramBackend **mbe, int64_t nbytes)
     b->backend_memory = g_malloc0(nbytes);
 
     if (mlock(b->backend_memory, nbytes) == -1) {
-        femu_err("Failed to pin the memory backend to the host DRAM\n");
+        femu_err("Failed to pin the memory backend to the host DRAM: %s (errno=%d)\n",
+                 strerror(errno), errno);
+        femu_err("Attempted to lock %" PRId64 " bytes. Check ulimit -l and available memory.\n",
+                 nbytes);
         g_free(b->backend_memory);
         abort();
     }

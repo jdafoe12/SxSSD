@@ -377,7 +377,7 @@ static void ssd_init_rmap(struct ssd *ssd)
 void ssd_init(FemuCtrl *n)
 {
     struct ssd *ssd = n->ssd;
-    struct ssdparams *spp = &ssd->fb->sp;
+   // struct ssdparams *spp = &ssd->fb->sp;
 
     ftl_assert(ssd);
 
@@ -393,6 +393,7 @@ void ssd_init(FemuCtrl *n)
         ssd->bbm = g_malloc0(sizeof(*ssd->bbm));
     }
     bbm_init(ssd->bbm, &n->bb_params, &ssd->fb->sp);
+    struct ssdparams *spp = &ssd->fb->sp;
 
    // ssd_init_params(spp, n); // removed becuase it is handled in the backend. The ssdParams are relevant to hardware geometry. 
 

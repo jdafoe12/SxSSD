@@ -292,33 +292,92 @@ static const MemoryRegionOps nvme_mmio_ops = {
     },
 };
 
-static int nvme_check_constraints(FemuCtrl *n)
+static int nvme_check_constraints(FemuCtrl *n, Error **errp)
 {
-    if ((n->num_namespaces == 0 || n->num_namespaces > NVME_MAX_NUM_NAMESPACES)
-        || (n->nr_io_queues < 1 || n->nr_io_queues > NVME_MAX_QS) ||
-        (n->db_stride > NVME_MAX_STRIDE) ||
-        (n->max_q_ents < 1) ||
-        (n->max_sqes > NVME_MAX_QUEUE_ES || n->max_cqes > NVME_MAX_QUEUE_ES ||
-         n->max_sqes < NVME_MIN_SQUEUE_ES || n->max_cqes < NVME_MIN_CQUEUE_ES) ||
-        (n->vwc > 1 || n->intc > 1 || n->cqr > 1 || n->extended > 1) ||
-        (n->nlbaf > 16) ||
-        (n->lba_index >= n->nlbaf) ||
-        (n->meta && !n->mc) ||
-        (n->extended && !(NVME_ID_NS_MC_EXTENDED(n->mc))) ||
-        (!n->extended && n->meta && !(NVME_ID_NS_MC_SEPARATE(n->mc))) ||
-        (n->dps && n->meta < 8) ||
-        (n->dps && ((n->dps & DPS_FIRST_EIGHT) &&
-                    !NVME_ID_NS_DPC_FIRST_EIGHT(n->dpc))) ||
-        (n->dps && !(n->dps & DPS_FIRST_EIGHT) &&
-         !NVME_ID_NS_DPC_LAST_EIGHT(n->dpc)) ||
-        (n->dps & DPS_TYPE_MASK && !((n->dpc & NVME_ID_NS_DPC_TYPE_MASK) &
-                                     (1 << ((n->dps & DPS_TYPE_MASK) - 1)))) ||
-        (n->mpsmax > 0xf || n->mpsmax > n->mpsmin) ||
-        (n->oacs & ~(NVME_OACS_FORMAT)) ||
-        (n->oncs & ~(NVME_ONCS_COMPARE | NVME_ONCS_WRITE_UNCORR |
-                     NVME_ONCS_DSM | NVME_ONCS_WRITE_ZEROS))) {
-                         return -1;
-     }
+    if (n->num_namespaces == 0 || n->num_namespaces > NVME_MAX_NUM_NAMESPACES) {
+        error_setg(errp, "Invalid number of namespaces: %u (must be 1-%u)",
+                   n->num_namespaces, NVME_MAX_NUM_NAMESPACES);
+        return -1;
+    }
+    if (n->nr_io_queues < 1 || n->nr_io_queues > NVME_MAX_QS) {
+        error_setg(errp, "Invalid number of IO queues: %u (must be 1-%u)",
+                   n->nr_io_queues, NVME_MAX_QS);
+        return -1;
+    }
+    if (n->db_stride > NVME_MAX_STRIDE) {
+        error_setg(errp, "Invalid doorbell stride: %u (max %u)",
+                   n->db_stride, NVME_MAX_STRIDE);
+        return -1;
+    }
+    if (n->max_q_ents < 1) {
+        error_setg(errp, "Invalid max queue entries: %u (must be >= 1)",
+                   n->max_q_ents);
+        return -1;
+    }
+    if (n->max_sqes > NVME_MAX_QUEUE_ES || n->max_cqes > NVME_MAX_QUEUE_ES ||
+        n->max_sqes < NVME_MIN_SQUEUE_ES || n->max_cqes < NVME_MIN_CQUEUE_ES) {
+        error_setg(errp, "Invalid queue entry sizes: sqes=%u (min %u, max %u), cqes=%u (min %u, max %u)",
+                   n->max_sqes, NVME_MIN_SQUEUE_ES, NVME_MAX_QUEUE_ES,
+                   n->max_cqes, NVME_MIN_CQUEUE_ES, NVME_MAX_QUEUE_ES);
+        return -1;
+    }
+    if (n->vwc > 1 || n->intc > 1 || n->cqr > 1 || n->extended > 1) {
+        error_setg(errp, "Invalid boolean flags: vwc=%u, intc=%u, cqr=%u, extended=%u (must be 0 or 1)",
+                   n->vwc, n->intc, n->cqr, n->extended);
+        return -1;
+    }
+    if (n->nlbaf > 16) {
+        error_setg(errp, "Invalid number of LBA formats: %u (max 16)", n->nlbaf);
+        return -1;
+    }
+    if (n->lba_index >= n->nlbaf) {
+        error_setg(errp, "Invalid LBA index: %u (must be < %u)", n->lba_index, n->nlbaf);
+        return -1;
+    }
+    if (n->meta && !n->mc) {
+        error_setg(errp, "Metadata size specified but metadata capabilities not set");
+        return -1;
+    }
+    if (n->extended && !(NVME_ID_NS_MC_EXTENDED(n->mc))) {
+        error_setg(errp, "Extended format requested but not supported in metadata capabilities");
+        return -1;
+    }
+    if (!n->extended && n->meta && !(NVME_ID_NS_MC_SEPARATE(n->mc))) {
+        error_setg(errp, "Separate metadata requested but not supported in metadata capabilities");
+        return -1;
+    }
+    if (n->dps && n->meta < 8) {
+        error_setg(errp, "Data protection requires metadata size >= 8, got %u", n->meta);
+        return -1;
+    }
+    if (n->dps && ((n->dps & DPS_FIRST_EIGHT) &&
+                   !NVME_ID_NS_DPC_FIRST_EIGHT(n->dpc))) {
+        error_setg(errp, "Data protection first 8 bytes requested but not supported");
+        return -1;
+    }
+    if (n->dps && !(n->dps & DPS_FIRST_EIGHT) &&
+        !NVME_ID_NS_DPC_LAST_EIGHT(n->dpc)) {
+        error_setg(errp, "Data protection last 8 bytes requested but not supported");
+        return -1;
+    }
+    if (n->dps & DPS_TYPE_MASK && !((n->dpc & NVME_ID_NS_DPC_TYPE_MASK) &
+                                    (1 << ((n->dps & DPS_TYPE_MASK) - 1)))) {
+        error_setg(errp, "Data protection type not supported");
+        return -1;
+    }
+    if (n->mpsmax > 0xf || n->mpsmax > n->mpsmin) {
+        error_setg(errp, "Invalid memory page size: mpsmax=%u, mpsmin=%u", n->mpsmax, n->mpsmin);
+        return -1;
+    }
+    if (n->oacs & ~(NVME_OACS_FORMAT)) {
+        error_setg(errp, "Unsupported optional admin command support: 0x%x", n->oacs);
+        return -1;
+    }
+    if (n->oncs & ~(NVME_ONCS_COMPARE | NVME_ONCS_WRITE_UNCORR |
+                    NVME_ONCS_DSM | NVME_ONCS_WRITE_ZEROS)) {
+        error_setg(errp, "Unsupported optional NVM command support: 0x%x", n->oncs);
+        return -1;
+    }
 
     return 0;
 }
@@ -566,11 +625,24 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
                       * This is the logical
                       * capacity in bytes. */
 
+    /* Force output to stderr immediately to diagnose silent failures */
+    fprintf(stderr, "[FEMU] Starting device realization (mode=%d)\n", n->femu_mode);
+    fflush(stderr);
+
+    femu_debug("FEMU: Starting device realization (mode=%d)\n", n->femu_mode);
+
     nvme_check_size();
 
-    if (nvme_check_constraints(n)) {
+    if (nvme_check_constraints(n, errp)) {
+        fprintf(stderr, "[FEMU] ERROR: Constraint check failed\n");
+        fflush(stderr);
+        femu_err("FEMU: Constraint check failed\n");
         return;
     }
+
+    //fprintf(stderr, "[FEMU] Constraint check passed\n");
+    fflush(stderr);
+    femu_debug("FEMU: Constraint check passed\n");
 
     
     bs_size = ((int64_t)n->memsz) * 1024 * 1024;
@@ -588,7 +660,11 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
      * occupy the physical capacity of the SSD, not the logical
      * capacity!
      */
-    init_dram_backend(&n->mbe, bs_size); 
+    fprintf(stderr, "[FEMU] Allocating backend memory: %" PRId64 " bytes\n", bs_size);
+    fflush(stderr);
+    init_dram_backend(&n->mbe, bs_size);
+    fprintf(stderr, "[FEMU] Backend memory allocated successfully\n");
+    fflush(stderr); 
     n->mbe->femu_mode = n->femu_mode;
 
     n->completed = 0;
@@ -610,18 +686,45 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     n->aer_reqs = g_malloc0(sizeof(*n->aer_reqs) * (n->aerl + 1));
     n->features.int_vector_config = g_malloc0(sizeof(*n->features.int_vector_config) * (n->nr_io_queues + 1));
 
+    //fprintf(stderr, "[FEMU] Initializing PCI...\n");
+   // fflush(stderr);
     nvme_init_pci(n);
+   // fprintf(stderr, "[FEMU] Initializing controller...\n");
+   // fflush(stderr);
     nvme_init_ctrl(n);
+    //fprintf(stderr, "[FEMU] Initializing namespaces...\n");
+   // fflush(stderr);
     nvme_init_namespaces(n, errp);
+    if (*errp) {
+        fprintf(stderr, "[FEMU] ERROR: Namespace initialization failed\n");
+        fflush(stderr);
+        return;
+    }
+   // fprintf(stderr, "[FEMU] Namespace initialization completed\n");
+    //fflush(stderr);
 
     /* This call registers the appropriate extension (e.g. BBSSD, ZNS, etc.) */
+   // fprintf(stderr, "[FEMU] Registering extensions...\n");
+  //  fflush(stderr);
     nvme_register_extensions(n); 
 
     /* This call initializes the extension (e.g. BBSSD, ZNS, etc.) 
      * in the case of BBSSD, it calls the bb_init function. */
     if (n->ext_ops.init) {
+      //  fprintf(stderr, "[FEMU] Initializing extension (mode=%d)...\n", n->femu_mode);
+      //  fflush(stderr);
         n->ext_ops.init(n, errp);
+     //   if (*errp) {
+     //       fprintf(stderr, "[FEMU] ERROR: Extension initialization failed\n");
+    //        fflush(stderr);
+    //        return;
+    //    }
+     //   fprintf(stderr, "[FEMU] Extension initialization completed\n");
+    //    fflush(stderr);
     }
+    
+   // fprintf(stderr, "[FEMU] Device realization completed successfully\n");
+   // fflush(stderr);
 }
 
 static void nvme_destroy_poller(FemuCtrl *n)

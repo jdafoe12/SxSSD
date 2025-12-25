@@ -228,9 +228,11 @@ static void fill_read_event(struct FtlBackend *fb, struct FtlBackendEvent *event
 {
     event->cmd = FTL_BACKEND_EVENT_READ;
     event->count = count;
-    event->status_list = g_malloc0(sizeof(int) * count);
-    for (uint64_t i = 0; i < count; ++i) {
-        event->status_list[i] = get_read_status(fb, ppa_list[i]);
+    /* Ownership: upper layer allocates/frees status_list. Backend only fills it. */
+    if (event->status_list) {
+        for (uint64_t i = 0; i < count; ++i) {
+            event->status_list[i] = get_read_status(fb, ppa_list[i]);
+        }
     }
     event->lat = lat;
 }
@@ -239,22 +241,62 @@ static void fill_write_event(struct FtlBackend *fb, struct FtlBackendEvent *even
 {
     event->cmd = FTL_BACKEND_EVENT_WRITE;
     event->count = count;
-    event->status_list = g_malloc0(sizeof(int) * count);
-    for (uint64_t i = 0; i < count; ++i) {
-        event->status_list[i] = get_write_status(fb, ppa_list[i]);
+    /* Ownership: upper layer allocates/frees status_list. Backend only fills it. */
+    if (event->status_list) {
+        for (uint64_t i = 0; i < count; ++i) {
+            event->status_list[i] = get_write_status(fb, ppa_list[i]);
+        }
     }
     event->lat = lat;
 }
 
 static void fill_erase_event(struct FtlBackend *fb, struct FtlBackendEvent *event, struct pba *pba, uint64_t count, int lat)
 {
+    const struct ssdparams *spp = &fb->sp;
     event->cmd = FTL_BACKEND_EVENT_ERASE;
     event->count = count;
-    event->status_list = g_malloc0(sizeof(int) * count);
+    /* Ownership: upper layer allocates/frees status_list. Backend only fills it. */
     for (uint64_t i = 0; i < count; ++i) {
-        event->status_list[i] = get_erase_status(fb, pba[i]);
+        const int st = get_erase_status(fb, pba[i]);
+        const uint64_t blkidx = pba2blkidx(spp, &pba[i]);
+
+        if (event->status_list) {
+            event->status_list[i] = st;
+        }
+
+        /* Update persistent physical erase counters on successful erase. */
+        if (st == 0 && fb->erase_cnt) {
+            fb->erase_cnt[blkidx]++;
+        }
     }
     event->lat = lat;
+}
+
+int ftl_backend_get_erase_cnt(const struct FtlBackend *fb, const struct pba *pba)
+{
+    if (!fb || !pba || !fb->erase_cnt) {
+        return -1;
+    }
+
+    const struct ssdparams *spp = &fb->sp;
+    if (pba->g.ch  >= (uint64_t)spp->nchs ||
+        pba->g.lun >= (uint64_t)spp->luns_per_ch ||
+        pba->g.pl  >= (uint64_t)spp->pls_per_lun ||
+        pba->g.blk >= (uint64_t)spp->blks_per_pl) {
+        return -1;
+    }
+
+    const uint64_t blkidx =
+        (uint64_t)pba->g.ch  * (uint64_t)spp->blks_per_ch +
+        (uint64_t)pba->g.lun * (uint64_t)spp->blks_per_lun +
+        (uint64_t)pba->g.pl  * (uint64_t)spp->blks_per_pl +
+        (uint64_t)pba->g.blk;
+
+    if (blkidx >= (uint64_t)spp->tt_blks) {
+        return -1;
+    }
+
+    return fb->erase_cnt[blkidx];
 }
 
 static int ftl_backend_latency(struct FtlBackend *fb, struct ppa *ppa_list,
@@ -424,3 +466,53 @@ int ftl_backend_raw_erase(struct FtlBackend *fb, struct pba *pba_list,
 // TODO: a few existing problems. pba usage in advance_status.
 // the correct passing of fb throughout the project/layers needs to be addressed
 // need to add the lat parameter to fill event functions
+
+
+/* OOB management */
+int ftl_backend_register_oob_policy(struct FtlBackend *fb, 
+                                     const char *policy_name,
+                                     size_t required_size,
+                                     int *policy_handle_out)
+{
+    
+    if (fb->oob_policy_count >= MAX_OOB_POLICIES) {
+        return -1;  /* too many policies */
+    }
+
+    if (fb->oob_used_per_page + required_size > fb->oob_size_per_page) {
+        return -2;  /* OOB space exhausted */
+    }
+    
+    int handle = fb->oob_policy_count;
+    struct OobPolicyRegistration *reg = &fb->oob_policies[handle];
+    
+    reg->policy_name = strdup(policy_name);
+    reg->required_size = required_size;
+    reg->offset = fb->oob_used_per_page;  /* assign next available offset */
+    reg->active = true;
+    
+    fb->oob_used_per_page += required_size;
+    fb->oob_policy_count++;
+    
+    *policy_handle_out = handle;
+    return 0;
+}
+
+void* ftl_backend_get_oob_for_policy(struct FtlBackend *fb, 
+                                      struct ppa *ppa,
+                                      int policy_handle)
+{
+    if (policy_handle < 0 || policy_handle >= fb->oob_policy_count) {
+        return NULL;
+    }
+    
+    struct OobPolicyRegistration *reg = &fb->oob_policies[policy_handle];
+    if (!reg->active) {
+        return NULL;
+    }
+    
+    uint64_t page_idx = ppa2pgidx(&fb->sp, ppa);
+    size_t base = page_idx * fb->oob_size_per_page;
+    
+    return &fb->oob_buf[base + reg->offset];
+}

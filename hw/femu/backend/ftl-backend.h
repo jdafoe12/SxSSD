@@ -56,6 +56,8 @@
 #define LUN_BITS    (8)
 #define CH_BITS     (7)
 
+#define MAX_OOB_POLICIES (16)
+
 
 /* describe a physical page addr */
 struct ppa { // ppa shoudl be moved to backend / BBM mapping engine layer.
@@ -177,12 +179,26 @@ struct ssdparams {
 };
 
 
-
+struct OobPolicyRegistration {
+    const char *policy_name;
+    size_t required_size;
+    size_t offset;
+    bool active;
+};
 
 
 struct FtlBackend {
     /* Backing store for physical bytes (e.g., DRAM-backed). */
     SsdDramBackend *mbe;
+
+    /* OOB management */
+    uint8_t *oob_buf;
+    size_t oob_size_per_page;        /* total bytes per page */
+    size_t oob_used_per_page;        /* bytes currently allocated to policies */
+    
+    struct OobPolicyRegistration oob_policies[MAX_OOB_POLICIES];
+    int oob_policy_count;
+
     int *erase_cnt; // indexed in bbm, by physical block number. 
                     // bbm should have a "getter" function for the "translated erase count" - given a pseudophysical block address.
     struct ssdparams sp;
@@ -211,5 +227,22 @@ int ftl_backend_raw_write(struct FtlBackend *fb, uint8_t *buffer, struct ppa *pp
 int ftl_backend_raw_erase(struct FtlBackend *fb, struct pba *pbn, uint64_t block_count,
                           struct FtlBackendEvent *event);
 
+/*
+ * Query physical erase count for a physical block address (PBA).
+ * Returns >= 0 on success, -1 on invalid input/out-of-range/uninitialized.
+ */
+int ftl_backend_get_erase_cnt(const struct FtlBackend *fb, const struct pba *pba);
+
+/* OOB management */
+/* Policies call this during initialization to reserve OOB space */
+int ftl_backend_register_oob_policy(struct FtlBackend *fb, 
+    const char *policy_name,
+    size_t required_size,
+    int *policy_handle_out);
+
+/* Policies use this to access their OOB section */
+void* ftl_backend_get_oob_for_policy(struct FtlBackend *fb, 
+     struct ppa *ppa,
+     int policy_handle);
 
 #endif

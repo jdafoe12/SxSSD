@@ -660,9 +660,9 @@ static void gc_read_page(struct ssd *ssd, PseudoPpa *ppa)
 {
     /* Read page for GC operation */
     if (ssd->fb->sp.enable_gc_delay) {
-        struct FtlBackendEvent event;
-        event.cmd = FTL_BACKEND_EVENT_READ;
-        event.type = POLICY_IO;
+        struct BbmEvent event;
+        event.cmd = BBM_EVENT_READ;
+        event.type = BBM_EVENT_POLICY_IO;
         event.count = 1;
         event.status_list = NULL;
         event.stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
@@ -671,6 +671,7 @@ static void gc_read_page(struct ssd *ssd, PseudoPpa *ppa)
         uint64_t page_size = ssd->fb->sp.secs_per_pg * ssd->fb->sp.secsz;
         /* We don't actually need the data in a buffer for GC, just simulate timing */
         bbm_raw_read(ssd->fb, ssd->bbm, NULL, ppa, 1, page_size, &event);
+        //bbm_event_handle();
     }
 }
 
@@ -695,9 +696,9 @@ static uint64_t gc_write_page(struct ssd *ssd, PseudoPpa *old_ppa)
 
     /* Write page for GC operation */
     if (ssd->fb->sp.enable_gc_delay) {
-        struct FtlBackendEvent event;
-        event.cmd = FTL_BACKEND_EVENT_WRITE;
-        event.type = POLICY_IO;
+        struct BbmEvent event;
+        event.cmd = BBM_EVENT_WRITE;
+        event.type = BBM_EVENT_POLICY_IO;
         event.count = 1;
         event.status_list = NULL;
         event.stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
@@ -706,6 +707,7 @@ static uint64_t gc_write_page(struct ssd *ssd, PseudoPpa *old_ppa)
         uint64_t page_size = ssd->fb->sp.secs_per_pg * ssd->fb->sp.secsz;
         /* We don't actually need to provide data buffer for GC write, just simulate timing */
         bbm_raw_write(ssd->fb, ssd->bbm, NULL, &new_ppa, 1, page_size, &event);
+       // bbm_event_handle();
 
         /* advance per-ch gc_endtime as well */
         new_lun = get_lun(ssd, &new_ppa);
@@ -803,9 +805,9 @@ static int do_gc(struct ssd *ssd, bool force)
 
             /* Erase block for GC operation */
             if (spp->enable_gc_delay) {
-                struct FtlBackendEvent event;
-                event.cmd = FTL_BACKEND_EVENT_ERASE;
-                event.type = POLICY_IO;
+                struct BbmEvent event;
+                event.cmd = BBM_EVENT_ERASE;
+                event.type = BBM_EVENT_POLICY_IO;
                 event.count = 1;
                 event.status_list = NULL;
                 event.stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
@@ -819,6 +821,7 @@ static int do_gc(struct ssd *ssd, bool force)
                 ppba.g.blk = ppa.g.blk;
 
                 bbm_raw_erase(ssd->fb, ssd->bbm, &ppba, 1, &event);
+               // bbm_event_handle();
 
                 lunp->gc_endtime = lunp->next_lun_avail_time;
             }
@@ -833,6 +836,11 @@ static int do_gc(struct ssd *ssd, bool force)
 
 static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 {
+
+
+  //  FTLEvent *event = gen_ftl_read_event(ssd, req);
+   // ftl_read_event_handle(event);
+
     struct ssdparams *spp = &ssd->fb->sp; 
     const struct bbm_geom *geom = ssd->bbm->geom;
     uint64_t lba = req->slba;
@@ -862,24 +870,40 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         ppa_list[ppa_idx++] = ppa;
     }
 
-    /* Create backend event to track latency */
-    struct FtlBackendEvent event;
-    event.cmd = FTL_BACKEND_EVENT_READ;
-    event.type = USER_IO;
+    /* Create BBM event to track latency */
+    struct BbmEvent event;
+    event.cmd = BBM_EVENT_READ;
+    event.type = BBM_EVENT_USER_IO;
     event.count = ppa_idx;
-    event.status_list = NULL;  /* Can be allocated if error tracking is needed */
+    /* FTL owns status_list: allocate if you want per-page status, free after call. */
+    event.status_list = (ppa_idx > 0) ? g_malloc0(sizeof(int) * ppa_idx) : NULL;
     event.stime = req->stime;
     event.lat = 0;
 
     uint64_t page_size = spp->secs_per_pg * spp->secsz;
     bbm_read(ssd->fb, ssd->bbm, req, ppa_list, ppa_idx, page_size, &event);
+ //  bbm_event_handle();
+    g_free(event.status_list);
+    event.status_list = NULL;
     g_free(ppa_list);
 
     return event.lat;
 }
 
+
+
 static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 {
+    ftl_debug("ssd_write called\n");
+
+    // As an always existing policy, I need 
+    // something which checks if the request is for specific locations
+    // related to the exensiblity design itself.
+    // especially, there should be a location whose semantics are
+    // the command to LOAD policies into relevant tables. 
+   // FTLEvent *event = gen_ftl_write_event(ssd, req);
+  //  ftl_write_event_handle(event);
+    
     uint64_t lba = req->slba;
     const struct bbm_geom *geom = ssd->bbm->geom;
     const struct ssdparams *spp = &ssd->fb->sp;
@@ -890,6 +914,8 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     PseudoPpa ppa;
     uint64_t lpn;
     int r;
+    ftl_debug("start_lpn=%"PRIu64",end_lpn=%"PRIu64"\n", start_lpn, end_lpn);
+    ftl_debug("lpn_cnt=%"PRIu64"\n", lpn_cnt);
 
 
     PseudoPpa *ppa_list = g_malloc0(sizeof(PseudoPpa) * lpn_cnt);
@@ -899,15 +925,27 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%"PRIu64"\n", start_lpn, (uint64_t)geom->tt_pgs_log);
     }
 
-    while (should_gc_high(ssd)) {
-        /* perform GC here until !should_gc(ssd) */
-        r = do_gc(ssd, true);
-        if (r == -1)
-            break;
-    }
+    // TODO: GC should be a policy attached to the write "event".
+    // Or at least, checking if GC needs to be done.
+
+
+//    while (should_gc_high(ssd)) {
+//        /* perform GC here until !should_gc(ssd) */
+//        r = do_gc(ssd, true);
+//        if (r == -1)
+//            break;
+//    }
 
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-        ppa = get_maptbl_ent(ssd, lpn);
+        ppa = get_maptbl_ent(ssd, lpn); /* TODO: This gets the ppa for the given lpn.
+                                           Notably, this is the ppa before the write occurs.
+                                           This is useful for any versioning system. 
+                                           This code is where the mapping explicitly changes.
+                                           This is an event that we can attach a policy to. 
+                                           The policy can be to keep track of the previous 
+                                           mapping! (it is certainly possible
+                                           to create a traversable linked list here!) */
+                                      
         if (mapped_ppa(&ppa)) {
             /* update old page information first */
             mark_page_invalid(ssd, &ppa);
@@ -917,30 +955,48 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         /* new write */
         ppa = get_new_page(ssd);
         /* update maptbl */
-        set_maptbl_ent(ssd, lpn, &ppa);
+        set_maptbl_ent(ssd, lpn, &ppa); /* TODO: This is a change in fundamental metadata. 
+                                           It should be propigated as an event? with
+                                           something something previous mapping attached
+                                           to it? */
         /* update rmap */
-        set_rmap_ent(ssd, lpn, &ppa);
+        set_rmap_ent(ssd, lpn, &ppa); /* This seems like internal bookkeeping? probably does
+                                        not need to be exposed to the upper layer. */
 
-        mark_page_valid(ssd, &ppa);
+        mark_page_valid(ssd, &ppa);  // TODO: what does this do? 
+                                     // It marks a newly allocated pseudophysical page
+                                     // as containing live data.
+                                     // PG_FREE to PG_VALID.
+                                     // So this is needed here, and it is different from
+                                     // marking a page FREE. 
+                                     // Note that this is internal bookkeeping,
+                                     // and I think it should not be tied to an event.
 
         ppa_list[ppa_idx++] = ppa;
 
         /* need to advance the write pointer here */
-        ssd_advance_write_pointer(ssd);
+        ssd_advance_write_pointer(ssd); // TODO: The construction of the
+                                        // write pointer linked list needs to be customizable.
+                                        // This is fundamenally a policy decision. 
+                                        // Can this fit into the event system?
     }
 
-    /* Create backend event to track latency */
-    struct FtlBackendEvent event;
-    event.cmd = FTL_BACKEND_EVENT_WRITE;
-    event.type = USER_IO;
+    /* Create BBM event */
+    struct BbmEvent event;
+    event.cmd = BBM_EVENT_WRITE;
+    event.type = BBM_EVENT_USER_IO;
     event.count = ppa_idx;
-    event.status_list = NULL;  /* Can be allocated if error tracking is needed */
+    /* FTL owns status_list: allocate if you want per-page status, free after call. */
+    event.status_list = (ppa_idx > 0) ? g_malloc0(sizeof(int) * ppa_idx) : NULL;
     event.stime = req->stime;
     event.lat = 0;
 
     /* Call backend to move data. */
     uint64_t page_size = (uint64_t)spp->secs_per_pg * spp->secsz;
     bbm_write(ssd->fb, ssd->bbm, req, ppa_list, ppa_idx, page_size, &event);
+ //   bbm_event_handle();
+    g_free(event.status_list);
+    event.status_list = NULL;
     g_free(ppa_list);
 
     return event.lat;

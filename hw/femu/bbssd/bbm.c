@@ -74,6 +74,23 @@ int bbm_init(struct bbm *ctx, const BbCtrlParams *bbp, const struct ssdparams *p
         ctx->hooks[i].context = NULL;
     }
 
+    /* Initialize BBM Policy API */
+    ctx->policy_api = g_malloc0(sizeof(struct BbmPolicyAPI));
+    ctx->policy_api->version = 1;
+    
+    /* Populate function pointers */
+    ctx->policy_api->get_maptbl_entry = bbm_get_maptbl_entry;
+    ctx->policy_api->is_reserved_blk = bbm_is_reserved_blk;
+    ctx->policy_api->read = bbm_read;
+    ctx->policy_api->write = bbm_write;
+    ctx->policy_api->raw_read = bbm_raw_read;
+    ctx->policy_api->raw_write = bbm_raw_write;
+    ctx->policy_api->raw_erase = bbm_raw_erase;
+    ctx->policy_api->get_erase_cnt = bbm_get_erase_cnt;
+    ctx->policy_api->mark_block_bad = bbm_mark_block_bad;
+    ctx->policy_api->sanitize_block = bbm_sanitize_block;
+    ctx->policy_api->remap_block = bbm_remap_block;
+
     return 0;
 }
 
@@ -358,13 +375,13 @@ int backend_event_handle(struct FtlBackend *fb, struct bbm *ctx,
             /* No condition specified - always fire */
             should_fire = true;
         } else {
-            /* Call the condition function */
-            should_fire = hook->condition(fb, ctx, event, hook->context);
+            /* Call the condition function with API */
+            should_fire = hook->condition(event, ctx->policy_api, hook->context);
         }
         
-        /* If condition is met, invoke the policy callback */
+        /* If condition is met, invoke the policy callback with API */
         if (should_fire) {
-            hook->callback(fb, ctx, event, hook->context);
+            hook->callback(fb, ctx, event, ctx->policy_api, hook->context);
         }
     }
 

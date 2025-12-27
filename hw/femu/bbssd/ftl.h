@@ -348,6 +348,14 @@ struct FtlPolicyAPI {
     uint64_t (*default_read)(struct ssd *ssd, NvmeRequest *req);
     uint64_t (*default_write)(struct ssd *ssd, NvmeRequest *req);
     
+    uint64_t (*get_total_logical_pages)(struct ssd *ssd);
+
+    /* Hook registration */
+    int (*register_hook)(struct ssd *ssd,
+                         FtlEventHookCondition condition,
+                         FtlEventHookCallback callback,
+                         void *context);
+
     /* BBM API pass-through (for convenience) */
     struct BbmPolicyAPI *bbm_api;
 };
@@ -404,6 +412,7 @@ void ftl_fill_write_event(struct ssd *ssd, NvmeRequest *req, struct FtlEvent *ev
 /* Mapping table operations */
 PseudoPpa get_maptbl_ent(struct ssd *ssd, uint64_t lpn);
 void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, PseudoPpa *ppa);
+uint64_t get_total_logical_pages(struct ssd *ssd);
 uint64_t get_rmap_ent(struct ssd *ssd, PseudoPpa *ppa);
 void set_rmap_ent(struct ssd *ssd, uint64_t lpn, PseudoPpa *ppa);
 

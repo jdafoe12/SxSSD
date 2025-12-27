@@ -9,9 +9,10 @@
 #include <errno.h>      /* For errno */
 
 /* Policy storage layout in reserved LPN range */
-#define POLICY_METADATA_LPN_OFFSET 0        /* LPN 0: metadata page */
-#define POLICY_INIT_TRIGGER_LPN_OFFSET 1    /* LPN 1: write here to trigger init */
-#define POLICY_STORAGE_START_OFFSET 16      /* LPN 16+: actual .so files */
+//#define POLICY_METADATA_LPN_OFFSET 0        /* LPN 0: metadata page */
+//#define POLICY_INIT_TRIGGER_LPN_OFFSET 1    /* LPN 1: write here to trigger init */
+//#define POLICY_STORAGE_START_OFFSET 16      /* LPN 16+: actual .so files */
+//#define POLICY_STORAGE_END_OFFSET 255      /* LPN 255 */
 #define MAX_POLICIES 20
 
 /* Metadata structure stored at first LPN of reserved area */
@@ -29,6 +30,10 @@ struct policy_context {
     uint8_t shared_key[16];
     uint64_t start_reserved_lpn;
     uint64_t end_reserved_lpn;
+    uint64_t policy_metadata_lpn_offset;
+    uint64_t policy_init_trigger_lpn_offset;
+    uint64_t policy_storage_start_offset;
+    uint64_t policy_storage_end_offset;
     bool is_initialized;
 };
 
@@ -59,9 +64,13 @@ int init_policy(struct ssd *ssd)
     
     /* Set up reserved LPN range (last 256 pages reserved for policy storage) */
     const struct bbm_geom *geom = ssd->bbm->geom;
-    ctx->start_reserved_lpn = geom->tt_pgs_log - 256;
+    ctx->start_reserved_lpn = geom->tt_pgs_log - 2048;
     ctx->end_reserved_lpn = geom->tt_pgs_log - 1;
-    
+
+    ctx->policy_metadata_lpn_offset = 0;
+    ctx->policy_init_trigger_lpn_offset = 1;
+    ctx->policy_storage_start_offset = 2;
+    ctx->policy_storage_end_offset = 255;
     ctx->is_initialized = true;
     
     printf("[Bootstrap] Initialized with reserved range: LPN %lu-%lu\n",
@@ -125,6 +134,8 @@ static bool default_ftl_write_condition(struct ssd *ssd, struct FtlEvent *event,
 static uint64_t default_ftl_write_callback(struct ssd *ssd, struct FtlEvent *event,
                                            struct FtlPolicyAPI *api, void *context)
 {
+    printf("[Bootstrap] Default write callback\n");
+    printf("Number of logical pages: %lu\n", ssd->bbm->geom->tt_pgs_log);
     return api->default_write(ssd, event->req);
 }
 
@@ -135,18 +146,20 @@ static bool policy_load_condition(struct ssd *ssd, struct FtlEvent *event,
 {
     struct policy_context *ctx = (struct policy_context *)context;
     
-    /* Handle writes to the reserved range (but not the init trigger LPN) */
+    /* Handle writes to the policy storage area (offset 2-255) */
     if (event->cmd != FTL_WRITE_EVENT) {
         return false;
     }
     
-    uint64_t trigger_lpn = ctx->start_reserved_lpn + POLICY_INIT_TRIGGER_LPN_OFFSET;
+    /* Calculate the policy storage area LPN range */
+    uint64_t policy_start_lpn = ctx->start_reserved_lpn + ctx->policy_storage_start_offset;
+    uint64_t policy_end_lpn = ctx->start_reserved_lpn + ctx->policy_storage_end_offset;
     
-    /* Allow writes to reserved area for storing .so files and metadata */
-    bool in_reserved = is_event_in_reserved_range(ctx, event);
-    bool is_trigger = (event->start_lpn == trigger_lpn);
+    /* Check if the event is within the policy storage area */
+    bool in_policy_area = (event->start_lpn >= policy_start_lpn && event->start_lpn <= policy_end_lpn)
+                       || (event->end_lpn >= policy_start_lpn && event->end_lpn <= policy_end_lpn);
     
-    return in_reserved && !is_trigger;
+    return in_policy_area;
 }
 
 static uint64_t policy_load_callback(struct ssd *ssd, struct FtlEvent *event,
@@ -172,7 +185,7 @@ static bool policy_init_condition(struct ssd *ssd, struct FtlEvent *event,
         return false;
     }
     
-    uint64_t trigger_lpn = ctx->start_reserved_lpn + POLICY_INIT_TRIGGER_LPN_OFFSET;
+    uint64_t trigger_lpn = ctx->start_reserved_lpn + ctx->policy_init_trigger_lpn_offset;
     return (event->start_lpn == trigger_lpn);
 }
 
@@ -184,7 +197,7 @@ static uint64_t policy_init_callback(struct ssd *ssd, struct FtlEvent *event,
     printf("[Bootstrap] Policy initialization triggered!\n");
     
     /* Step 1: Read the metadata to find all stored policies */
-    uint64_t metadata_lpn = ctx->start_reserved_lpn + POLICY_METADATA_LPN_OFFSET;
+    uint64_t metadata_lpn = ctx->start_reserved_lpn + ctx->policy_metadata_lpn_offset;
     const struct bbm_geom *geom = ssd->bbm->geom;
     const struct ssdparams *sp = &ssd->fb->sp;
     size_t page_size = geom->secs_per_pg * sp->secsz;

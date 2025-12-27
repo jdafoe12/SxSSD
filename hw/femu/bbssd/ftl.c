@@ -364,6 +364,11 @@ PseudoPpa get_maptbl_ent(struct ssd *ssd, uint64_t lpn)
     return ssd->maptbl[lpn];
 }
 
+uint64_t get_total_logical_pages(struct ssd *ssd)
+{
+    return ssd->bbm->geom->tt_pgs_log;
+}
+
 void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, PseudoPpa *ppa)
 {
     ftl_assert(lpn < ssd->bbm->geom->tt_pgs_log);
@@ -814,6 +819,12 @@ void ssd_init(FemuCtrl *n)
     /* Default FTL implementations (for policies to call or wrap) */
     ssd->policy_api->default_read = ssd_read;
     ssd->policy_api->default_write = ssd_write;
+    
+    /* Geometry information */
+    ssd->policy_api->get_total_logical_pages = get_total_logical_pages;
+    
+    /* Hook registration */
+    ssd->policy_api->register_hook = ftl_register_hook;
     
     /* BBM API pass-through */
     ssd->policy_api->bbm_api = ssd->bbm->policy_api;

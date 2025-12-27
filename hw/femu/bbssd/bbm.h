@@ -138,6 +138,9 @@ struct bbm_geom {
     uint32_t secsz;
 };
 
+/* Forward declarations */
+struct BbmEvent;
+
 /*
  * BBM Policy API - Function pointer table for BBM operations
  * 

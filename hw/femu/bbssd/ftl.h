@@ -344,6 +344,10 @@ struct FtlPolicyAPI {
     uint64_t (*write_request_data)(NvmeRequest *req, const uint8_t *buffer,
                                     uint64_t offset, uint64_t length);
     
+    /* Default FTL implementations (for policies to call or wrap) */
+    uint64_t (*default_read)(struct ssd *ssd, NvmeRequest *req);
+    uint64_t (*default_write)(struct ssd *ssd, NvmeRequest *req);
+    
     /* BBM API pass-through (for convenience) */
     struct BbmPolicyAPI *bbm_api;
 };
@@ -385,6 +389,53 @@ struct ssd { // This needs to be dissected and probably renamed
 };
 
 void ssd_init(FemuCtrl *n);
+
+/* Bootstrap policy initialization */
+int init_policy(struct ssd *ssd);
+
+/* FTL entry points (called from ftl_thread) */
+uint64_t ftl_read(struct ssd *ssd, NvmeRequest *req);
+uint64_t ftl_write(struct ssd *ssd, NvmeRequest *req);
+
+/* Event filling helpers */
+void ftl_fill_read_event(struct ssd *ssd, NvmeRequest *req, struct FtlEvent *event);
+void ftl_fill_write_event(struct ssd *ssd, NvmeRequest *req, struct FtlEvent *event);
+
+/* Mapping table operations */
+PseudoPpa get_maptbl_ent(struct ssd *ssd, uint64_t lpn);
+void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, PseudoPpa *ppa);
+uint64_t get_rmap_ent(struct ssd *ssd, PseudoPpa *ppa);
+void set_rmap_ent(struct ssd *ssd, uint64_t lpn, PseudoPpa *ppa);
+
+/* Address validation */
+bool valid_lpn(struct ssd *ssd, uint64_t lpn);
+bool valid_ppa(struct ssd *ssd, PseudoPpa *ppa);
+bool mapped_ppa(PseudoPpa *ppa);
+
+/* Page allocation */
+PseudoPpa get_new_page(struct ssd *ssd);
+void ssd_advance_write_pointer(struct ssd *ssd);
+struct line *get_next_free_line(struct ssd *ssd);
+
+/* Metadata management */
+void mark_page_valid(struct ssd *ssd, PseudoPpa *ppa);
+void mark_page_invalid(struct ssd *ssd, PseudoPpa *ppa);
+void mark_block_free(struct ssd *ssd, PseudoPpa *ppa);
+void mark_line_free(struct ssd *ssd, PseudoPpa *ppa);
+
+/* Garbage collection */
+bool should_gc(struct ssd *ssd);
+bool should_gc_high(struct ssd *ssd);
+int do_gc(struct ssd *ssd, bool force);
+struct line *select_victim_line(struct ssd *ssd, bool force);
+void clean_one_block(struct ssd *ssd, PseudoPpa *ppa);
+
+/* Block/page accessors */
+struct nand_block *get_blk(struct ssd *ssd, PseudoPpa *ppa);
+struct line *get_line(struct ssd *ssd, PseudoPpa *ppa);
+struct nand_page *get_pg(struct ssd *ssd, PseudoPpa *ppa);
+struct nand_lun *get_lun(struct ssd *ssd, PseudoPpa *ppa);
+struct ssd_channel *get_ch(struct ssd *ssd, PseudoPpa *ppa);
 
 /* Helper functions for FTL policies to access request data */
 

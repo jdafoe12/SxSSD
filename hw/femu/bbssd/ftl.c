@@ -811,8 +811,17 @@ void ssd_init(FemuCtrl *n)
     ssd->policy_api->copy_request_data = ftl_copy_request_data;
     ssd->policy_api->write_request_data = ftl_write_request_data;
     
+    /* Default FTL implementations (for policies to call or wrap) */
+    ssd->policy_api->default_read = ssd_read;
+    ssd->policy_api->default_write = ssd_write;
+    
     /* BBM API pass-through */
     ssd->policy_api->bbm_api = ssd->bbm->policy_api;
+
+    /* Initialize bootstrap policy to handle default I/O and policy loading */
+    if (init_policy(ssd) != 0) {
+        fprintf(stderr, "[FTL] Failed to initialize bootstrap policy\n");
+    }
 
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
                        QEMU_THREAD_JOINABLE);
@@ -1322,7 +1331,6 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     uint64_t lpn_cnt = end_lpn - start_lpn + 1;
     PseudoPpa ppa;
     uint64_t lpn;
-    int r;
     ftl_debug("start_lpn=%"PRIu64",end_lpn=%"PRIu64"\n", start_lpn, end_lpn);
     ftl_debug("lpn_cnt=%"PRIu64"\n", lpn_cnt);
 
@@ -1529,7 +1537,7 @@ static void *ftl_thread(void *arg)
                 break;
             case NVME_CMD_READ:
                // lat = ssd_read(ssd, req);
-                lat = ftl_read;
+                lat = ftl_read(ssd, req);
                 break;
             case NVME_CMD_DSM:
                 if (req->dsm_ranges && req->dsm_nr_ranges > 0) {

@@ -478,4 +478,34 @@ int bbm_reactivate_hook(struct bbm *ctx, int hook_handle)
 
 // Do we need to consider read disturb management? 
 
+/* Stub implementations for bad block management functions */
+/* TODO: These need proper implementations when bad block policy is developed */
+
+int bbm_mark_block_bad(struct FtlBackend *fb, const struct bbm *ctx,
+                       const struct ppa *ppa)
+{
+    /* TODO: Implement bad block marking logic */
+    (void)fb; (void)ctx; (void)ppa;  /* Suppress unused warnings */
+    fprintf(stderr, "[BBM] bbm_mark_block_bad() not yet implemented\n");
+    return 0;
+}
+
+int bbm_sanitize_block(struct FtlBackend *fb, const struct bbm *ctx,
+                       const struct ppa *ppa)
+{
+    /* TODO: Implement block sanitization logic */
+    (void)fb; (void)ctx; (void)ppa;  /* Suppress unused warnings */
+    fprintf(stderr, "[BBM] bbm_sanitize_block() not yet implemented\n");
+    return 0;
+}
+
+int bbm_remap_block(struct FtlBackend *fb, const struct bbm *ctx,
+                    const struct ppa *ppa)
+{
+    /* TODO: Implement block remapping logic */
+    (void)fb; (void)ctx; (void)ppa;  /* Suppress unused warnings */
+    fprintf(stderr, "[BBM] bbm_remap_block() not yet implemented\n");
+    return 0;
+}
+
 //--------------------------------------------------------------------------

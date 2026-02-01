@@ -1,5 +1,6 @@
 // Bad block manager mapping (simple OP-aware placeholder)
 #include "./bbm.h"
+#include "./policy-engine.h"
 #include <assert.h>
 
 int bbm_init(struct bbm *ctx, const BbCtrlParams *bbp, const struct ssdparams *phys)
@@ -64,15 +65,7 @@ int bbm_init(struct bbm *ctx, const BbCtrlParams *bbp, const struct ssdparams *p
         }
     }
 
-    /* Initialize all hooks as inactive. Initially, there are no policies. For now, this is a quirk of simulating this in FEMU, 
-     * as there is no persistant data storage. After loading the policies onto flash storage, they will have to be manually loaded
-     * via a RPC call. TODO: implement the RPC engine. I */
-    for (int i = 0; i < MAX_BACKEND_EVENT_HOOKS; ++i) {
-        ctx->hooks[i].active = false;
-        ctx->hooks[i].condition = NULL;
-        ctx->hooks[i].callback = NULL;
-        ctx->hooks[i].context = NULL;
-    }
+    ctx->policy_engine = NULL;  /* FTL sets this after policy_engine_create */
 
     /* Initialize BBM Policy API */
     ctx->policy_api = g_malloc0(sizeof(struct BbmPolicyAPI));
@@ -90,6 +83,11 @@ int bbm_init(struct bbm *ctx, const BbCtrlParams *bbp, const struct ssdparams *p
     ctx->policy_api->mark_block_bad = bbm_mark_block_bad;
     ctx->policy_api->sanitize_block = bbm_sanitize_block;
     ctx->policy_api->remap_block = bbm_remap_block;
+    ctx->policy_api->mark_page_valid = bbm_mark_page_valid;
+    ctx->policy_api->mark_page_invalid = bbm_mark_page_invalid;
+    ctx->policy_api->mark_block_free = bbm_mark_block_free;
+    ctx->policy_api->get_page_status = bbm_get_page_status;
+    ctx->policy_api->get_block_vpc_ipc = bbm_get_block_vpc_ipc;
 
     return 0;
 }
@@ -191,7 +189,9 @@ int bbm_read(struct FtlBackend *fb, const struct bbm *ctx,
 
     int rc = ftl_backend_read(fb, req, phys, ppa_count, page_size, event ? &bev : NULL);
     if (event) {
-        backend_event_handle(fb, (struct bbm *)ctx, &bev);
+        if (ctx->policy_engine) {
+            policy_engine_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
+        }
         event->lat = bev.lat;
         event->count = bev.count;
     }
@@ -227,7 +227,9 @@ int bbm_write(struct FtlBackend *fb, const struct bbm *ctx,
 
     int rc = ftl_backend_write(fb, req, phys, ppa_count, page_size, event ? &bev : NULL);
     if (event) {
-        backend_event_handle(fb, (struct bbm *)ctx, &bev);
+        if (ctx->policy_engine) {
+            policy_engine_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
+        }
         event->lat = bev.lat;
         event->count = bev.count;
     }
@@ -262,7 +264,9 @@ int bbm_raw_read(struct FtlBackend *fb, const struct bbm *ctx,
 
     int rc = ftl_backend_raw_read(fb, buffer, phys, ppa_count, page_size, event ? &bev : NULL);
     if (event) {
-        backend_event_handle(fb, (struct bbm *)ctx, &bev);
+        if (ctx->policy_engine) {
+            policy_engine_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
+        }
         event->lat = bev.lat;
         event->count = bev.count;
     }
@@ -297,7 +301,9 @@ int bbm_raw_write(struct FtlBackend *fb, const struct bbm *ctx,
 
     int rc = ftl_backend_raw_write(fb, buffer, phys, ppa_count, page_size, event ? &bev : NULL);
     if (event) {
-        backend_event_handle(fb, (struct bbm *)ctx, &bev);
+        if (ctx->policy_engine) {
+            policy_engine_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
+        }
         event->lat = bev.lat;
         event->count = bev.count;
     }
@@ -331,7 +337,9 @@ int bbm_raw_erase(struct FtlBackend *fb, const struct bbm *ctx,
 
     int rc = ftl_backend_raw_erase(fb, phys, blk_count, event ? &bev : NULL);
     if (event) {
-        backend_event_handle(fb, (struct bbm *)ctx, &bev);
+        if (ctx->policy_engine) {
+            policy_engine_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
+        }
         event->lat = bev.lat;
         event->count = bev.count;
     }
@@ -352,98 +360,58 @@ int bbm_get_erase_cnt(const struct FtlBackend *fb, const struct bbm *ctx,
     return ftl_backend_get_erase_cnt(fb, &phys);
 }
 
-
-int backend_event_handle(struct FtlBackend *fb, struct bbm *ctx,
-                     struct FtlBackendEvent *event)
+void bbm_mark_page_valid(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa)
 {
-    if (!fb || !ctx || !event) {
-        return -1;
+    if (!fb || !ctx || !ppa) {
+        return;
     }
-
-    /* Iterate through all registered hooks and invoke those whose conditions are met */
-    for (int i = 0; i < MAX_BACKEND_EVENT_HOOKS; ++i) {
-        struct BackendEventHook *hook = &ctx->hooks[i];
-        
-        /* Skip inactive hooks */
-        if (!hook->active || !hook->callback) {
-            continue;
-        }
-        
-        /* Evaluate the condition function to determine if hook should fire */
-        bool should_fire = false;
-        if (hook->condition == NULL) {
-            /* No condition specified - always fire */
-            should_fire = true;
-        } else {
-            /* Call the condition function with API */
-            should_fire = hook->condition(event, ctx->policy_api, hook->context);
-        }
-        
-        /* If condition is met, invoke the policy callback with API */
-        if (should_fire) {
-            hook->callback(fb, ctx, event, ctx->policy_api, hook->context);
-        }
-    }
-
-    return 0;
+    struct ppa phys = bbm_translate_pseudo_ppa(ctx, ppa);
+    ftl_backend_mark_page_valid(fb, &phys);
 }
 
-int bbm_register_hook(struct bbm *ctx,
-                      BackendEventHookCondition condition,
-                      BackendEventHookCallback callback,
-                      void *context)
+void bbm_mark_page_invalid(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa)
 {
-    if (!ctx || !callback) {
-        return -1;
+    if (!fb || !ctx || !ppa) {
+        return;
     }
-
-    /* Find an available hook slot */
-    for (int i = 0; i < MAX_BACKEND_EVENT_HOOKS; ++i) {
-        if (!ctx->hooks[i].callback) {
-            ctx->hooks[i].condition = condition;  /* Can be NULL for "always trigger" */
-            ctx->hooks[i].callback = callback;
-            ctx->hooks[i].context = context;
-            ctx->hooks[i].active = true;
-            return i; /* Return hook handle */
-        }
-    }
-
-    /* No slots available */
-    return -1;
+    struct ppa phys = bbm_translate_pseudo_ppa(ctx, ppa);
+    ftl_backend_mark_page_invalid(fb, &phys);
 }
 
-int bbm_unregister_hook(struct bbm *ctx, int hook_handle)
+void bbm_mark_block_free(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa)
 {
-    if (!ctx || hook_handle < 0 || hook_handle >= MAX_BACKEND_EVENT_HOOKS) {
-        return -1;
+    if (!fb || !ctx || !ppa) {
+        return;
     }
-
-    /* Mark the hook as inactive */
-    ctx->hooks[hook_handle].active = false;
-    ctx->hooks[hook_handle].condition = NULL;
-    ctx->hooks[hook_handle].callback = NULL;
-    ctx->hooks[hook_handle].context = NULL;
-
-    return 0;
+    PseudoPba ppba = pseudo_ppa_to_pseudo_pba(ppa);
+    struct pba phys = bbm_get_maptbl_entry(ctx, &ppba);
+    ftl_backend_mark_block_free(fb, &phys);
 }
 
-/* the idea of these two funcions is that RPCs can activate or inactivate policies? I am thinking of the cloud storage project. */
-int bbm_inactivate_hook(struct bbm *ctx, int hook_handle)
+int bbm_get_page_status(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa)
 {
-    if (!ctx || hook_handle < 0 || hook_handle >= MAX_BACKEND_EVENT_HOOKS) {
+    if (!fb || !ctx || !ppa) {
         return -1;
     }
-    ctx->hooks[hook_handle].active = false;
-    return 0;
+    struct ppa phys = bbm_translate_pseudo_ppa(ctx, ppa);
+    return ftl_backend_get_page_status(fb, &phys);
 }
 
-int bbm_reactivate_hook(struct bbm *ctx, int hook_handle)
+void bbm_get_block_vpc_ipc(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa, int *vpc, int *ipc)
 {
-    if (!ctx || hook_handle < 0 || hook_handle >= MAX_BACKEND_EVENT_HOOKS) {
-        return -1;
+    if (!fb || !ctx || !ppa || !vpc || !ipc) {
+        return;
     }
-    ctx->hooks[hook_handle].active = true;
-    return 0;
+    PseudoPba ppba = pseudo_ppa_to_pseudo_pba(ppa);
+    struct pba phys = bbm_get_maptbl_entry(ctx, &ppba);
+    ftl_backend_get_block_vpc_ipc(fb, &phys, vpc, ipc);
+}
+
+void bbm_set_policy_engine(struct bbm *ctx, struct policy_engine *pe)
+{
+    if (ctx) {
+        ctx->policy_engine = pe;
+    }
 }
 
 // TODO: Add bad block checking before performing requests from the backend.

@@ -90,6 +90,45 @@ struct pba {
     };
 };
 
+/* Page validity status (per-page in each pSWD block). */
+enum backend_page_status {
+    PG_FREE = 0,
+    PG_INVALID = 1,
+    PG_VALID = 2
+};
+
+/* pSWD (per-block sequential write) state machine; owned exclusively by raw flash layer. */
+enum pswd_block_state {
+    PSWD_FREE,
+    PSWD_OPEN,
+    PSWD_CLOSED,
+    PSWD_BAD
+};
+
+struct pswd_block_ctx {
+    enum pswd_block_state state;
+    int wp;         /* current write pointer (next page to write) */
+    int erase_cnt;  /* erase count for this block */
+    int vpc;        /* valid page count in this block */
+    int ipc;        /* invalid page count in this block */
+};
+
+/* pSWD state transition event: filled and passed to notify callback (policy-facing; pba only). */
+struct PswdStateTransitionEvent {
+    enum pswd_block_state old_state;
+    enum pswd_block_state new_state;
+    struct pba pba;
+    int erase_cnt;
+    int wp;
+};
+
+struct FtlBackend;  /* forward declaration for callback typedef below */
+
+/* Notify callback: backend calls this after performing a pSWD state transition. */
+typedef void (*PswdTransitionNotifyFn)(struct FtlBackend *fb,
+                                       const struct PswdStateTransitionEvent *event,
+                                       void *notify_ctx);
+
 enum FtlBackendEventCmd {
     FTL_BACKEND_EVENT_READ,
     FTL_BACKEND_EVENT_WRITE,
@@ -199,8 +238,15 @@ struct FtlBackend {
     struct OobPolicyRegistration oob_policies[MAX_OOB_POLICIES];
     int oob_policy_count;
 
-    int *erase_cnt; // indexed in bbm, by physical block number. 
-                    // bbm should have a "getter" function for the "translated erase count" - given a pseudophysical block address.
+    /* pSWD state per physical block (state, wp, erase_cnt, vpc, ipc); length sp.tt_blks */
+    struct pswd_block_ctx *pswd_state;
+    /* Per-page validity: index [blkidx * pgs_per_blk + pg]; values enum backend_page_status */
+    uint8_t *page_validity;
+
+    /* pSWD transition notify: called after each state transition (policy-engine sets this). */
+    PswdTransitionNotifyFn pswd_transition_notify;
+    void *pswd_transition_notify_ctx;
+
     struct ssdparams sp;
     struct FtlBackendTiming bt; 
 };
@@ -244,5 +290,15 @@ int ftl_backend_register_oob_policy(struct FtlBackend *fb,
 void* ftl_backend_get_oob_for_policy(struct FtlBackend *fb, 
      struct ppa *ppa,
      int policy_handle);
+
+/* Page validity (per pSWD block); physical addresses. */
+void ftl_backend_mark_page_valid(struct FtlBackend *fb, const struct ppa *ppa);
+void ftl_backend_mark_page_invalid(struct FtlBackend *fb, const struct ppa *ppa);
+void ftl_backend_mark_block_free(struct FtlBackend *fb, const struct pba *pba);
+int ftl_backend_get_page_status(const struct FtlBackend *fb, const struct ppa *ppa);
+void ftl_backend_get_block_vpc_ipc(const struct FtlBackend *fb, const struct pba *pba, int *vpc, int *ipc);
+
+/* Set callback and context for pSWD state transition notifications (policy-engine / FTL init). */
+void ftl_backend_set_pswd_transition_notify(struct FtlBackend *fb, PswdTransitionNotifyFn notify, void *notify_ctx);
 
 #endif

@@ -141,3 +141,50 @@ out:
 
     return 0;
 }
+
+/* Copy len bytes from qsg at byte offset start_off into buf. Does not destroy qsg. */
+int backend_sglist_read(QEMUSGList *qsg, uint8_t *buf, uint64_t len, uint64_t start_off)
+{
+    if (!qsg || !buf || qsg->nsg == 0 || len == 0) {
+        return -1;
+    }
+
+    uint64_t copied = 0;
+    uint64_t sg_byte = 0;
+    int sg_idx = 0;
+
+    /* Skip to start_off */
+    while (sg_idx < qsg->nsg && start_off > 0) {
+        uint64_t seg_len = qsg->sg[sg_idx].len;
+        if (start_off >= seg_len) {
+            start_off -= seg_len;
+            sg_idx++;
+        } else {
+            sg_byte = start_off;
+            start_off = 0;
+            break;
+        }
+    }
+
+    while (sg_idx < qsg->nsg && copied < len) {
+        dma_addr_t cur_addr = qsg->sg[sg_idx].base + sg_byte;
+        uint64_t sg_remaining = qsg->sg[sg_idx].len - sg_byte;
+        uint64_t to_copy = len - copied;
+        if (to_copy > sg_remaining) {
+            to_copy = sg_remaining;
+        }
+
+        if (dma_memory_read(qsg->as, cur_addr, buf + copied, to_copy,
+                            MEMTXATTRS_UNSPECIFIED)) {
+            return -1;
+        }
+        copied += to_copy;
+        sg_byte += to_copy;
+        if (sg_byte >= qsg->sg[sg_idx].len) {
+            sg_byte = 0;
+            sg_idx++;
+        }
+    }
+
+    return (copied == len) ? 0 : -1;
+}

@@ -3,8 +3,7 @@
 
 #include "../nvme.h"
 #include "../backend/ftl-backend.h"
-
-#define MAX_BACKEND_EVENT_HOOKS (256) // Quite large for now. Probably can be much smaller.
+#include "policy-engine-types.h"
 
 // The essense of this layer is to 
 // provide a pseudophysical block address layer
@@ -47,66 +46,8 @@ typedef struct ppa PseudoPpa;
 typedef struct pba PseudoPba;
 
 struct bbm;
-struct BbmPolicyAPI;  
-
-/*
- * Event condition function type - determines if an event should trigger a hook.
- * Policies implement this to specify complex event matching criteria.
- * 
- * Parameters:
- *   - event: the backend event to evaluate
- *   - api: pointer to BBM policy API (if needed for condition evaluation)
- *   - context: opaque policy-specific data passed during registration
- * 
- * Returns: true if the hook should fire for this event, false otherwise
- * 
- * Example conditions:
- *   - Reads with bit error count > threshold
- *   - Writes that failed
- *   - Erases on blocks with high erase count
- *   - Any arbitrary function of event->status_list, event->cmd, etc.
- */
-typedef bool (*BackendEventHookCondition)(struct FtlBackendEvent *event,
-                                   struct BbmPolicyAPI *api,
-                                   void *context);
-
-/* 
- * BBM Event hook callback function type.
- * Policies implement this callback to handle backend events at the BBM level.
- * Parameters:
- *   - fb: pointer to the FTL backend
- *   - ctx: pointer to the BBM context
- *   - event: the backend event that triggered this hook
- *   - context: opaque policy-specific data passed during registration
- *   - api: the api available for policies to call.
- *   JOSH: Do we need this (context - maybe this can contain some kind of
-                            data structures persistant across hooks/calls)? 
- */
-typedef void (*BackendEventHookCallback)(struct FtlBackend *fb,
-                                      const struct bbm *ctx,
-                                      struct FtlBackendEvent *event,
-                                      struct BbmPolicyAPI *api,
-                                      void *context);
-
-/*
- * Event hook structure for extensible BBM policy attachment.
- * Policies register hooks during initialization, specifying:
- *   - An condition function (when to trigger)
- *   - What function to call (action)
- *   - Any policy-specific data needed (context) TODO: i'm not sure this is needed. Maybe? 
- * 
- * The condition function allows arbitrary complexity in event matching.
- * If condition is NULL, the hook fires for all events.
- */
-struct BackendEventHook {
-    BackendEventHookCondition condition;   /* Optional: when should this hook fire? */
-    BackendEventHookCallback callback; /* What function to call on event */
-    void *context;                 /* Opaque policy-specific data */
-    bool active;                   /* Is this hook slot in use? This is 
-                                      important so that policies can be turned on and off
-                                      at runtime. This is relevant especially in the decentralized cloud storage paper! */
-                                                                 
-};
+struct BbmPolicyAPI;
+struct policy_engine;
 
 /* Logical geometry (after OP/bad-block) maintained by BBM. */
 struct bbm_geom {
@@ -188,6 +129,13 @@ struct BbmPolicyAPI {
                           const struct ppa *ppa);
     int (*remap_block)(struct FtlBackend *fb, const struct bbm *ctx,
                        const struct ppa *ppa);
+
+    /* Page validity (backend-owned; BBM translates pseudo -> physical) */
+    void (*mark_page_valid)(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
+    void (*mark_page_invalid)(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
+    void (*mark_block_free)(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
+    int (*get_page_status)(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
+    void (*get_block_vpc_ipc)(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa, int *vpc, int *ipc);
 };
 
 /* Simple BBM context tracking reserved (OP) blocks per LUN. */
@@ -204,13 +152,8 @@ struct bbm {
     /* Logical geometry (after overprovisioning) */
     struct bbm_geom *geom;
 
-    /* 
-     * Event hook registry for BBM policy extensibility.
-     * Policies register hooks during initialization to respond to backend events.
-     * When backend operations complete, backend_event_handle() iterates through
-     * this array and invokes active hooks whose event_type matches the event.
-     */
-    struct BackendEventHook hooks[MAX_BACKEND_EVENT_HOOKS];
+    /* Policy engine (set by FTL at init); backend and pSWD hooks live there */
+    struct policy_engine *policy_engine;
     
     /*
      * BBM Policy API - function pointer table for policies.
@@ -281,56 +224,19 @@ int bbm_raw_erase(struct FtlBackend *fb, const struct bbm *ctx,
 int bbm_get_erase_cnt(const struct FtlBackend *fb, const struct bbm *ctx,
                       const PseudoPba *ppba);
 
+/* Page validity: BBM translates PseudoPpa -> ppa/pba and calls backend. */
+void bbm_mark_page_valid(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
+void bbm_mark_page_invalid(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
+void bbm_mark_block_free(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
+int bbm_get_page_status(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
+void bbm_get_block_vpc_ipc(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa, int *vpc, int *ipc);
+
 /* Josh: Now, need to present an interface to the upper layer in order
  * to implement the bbm policy layer. This interface needs to be general enouph 
  * to support any concievable bbm policy.*/
 
 
- /* BBM policy interface */
- /* This interface can be extended by the host, by
-    writing a .so file that implements the extended interface to the 
-    SSD. This is done by the host, and loaded into the SSD at runtime. */
-int backend_event_handle(struct FtlBackend *fb, struct bbm *ctx,
-                     struct FtlBackendEvent *event);
-
-/* BBM Event hook management */
-/*
- * Register a BBM event hook for a policy.
- * Policies call this during initialization to attach handlers to backend events.
- * 
- * Parameters:
- *   - ctx: BBM context
- *   - condition: function that determines if event should trigger hook (NULL = always trigger)
- *   - callback: function to invoke when event condition is met
- *   - context: opaque policy-specific data passed to both condition and callback
- * 
- * Returns: hook handle (>= 0) on success, -1 on failure (e.g., no slots available)
- * 
- * Example usage:
- *   // Hook that fires on reads with > 50 bit errors
- *   bool high_ber_condition(struct FtlBackend *fb, const struct bbm *ctx,
- *                           struct FtlBackendEvent *event, void *context) {
- *       if (event->cmd != FTL_BACKEND_EVENT_READ) return false;
- *       for (int i = 0; i < event->count; i++) {
- *           if (event->status_list[i] > 50) return true;
- *       }
- *       return false;
- *   }
- *   bbm_register_hook(ctx, high_ber_condition, my_callback, my_context);
- */
-int bbm_register_hook(struct bbm *ctx,
-                      BackendEventHookCondition condition,
-                      BackendEventHookCallback callback,
-                      void *context);
-
-/*
- * Unregister a BBM event hook.
- * Returns: 0 on success, -1 on failure
- */
-int bbm_unregister_hook(struct bbm *ctx, int hook_handle);
-
-int bbm_inactivate_hook(struct bbm *ctx, int hook_handle);
-int bbm_reactivate_hook(struct bbm *ctx, int hook_handle);
+void bbm_set_policy_engine(struct bbm *ctx, struct policy_engine *pe);
 
 int bbm_mark_block_bad(struct FtlBackend *fb, const struct bbm *ctx,
                    const struct ppa *ppa);

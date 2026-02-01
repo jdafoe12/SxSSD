@@ -839,8 +839,8 @@ static const Property femu_props[] = {
     DEFINE_PROP_INT32("ch_xfer_lat", FemuCtrl, bb_params.ch_xfer_lat, 0),
     DEFINE_PROP_INT32("gc_thres_pcent", FemuCtrl, bb_params.gc_thres_pcent, 75),
     DEFINE_PROP_INT32("gc_thres_pcent_high", FemuCtrl, bb_params.gc_thres_pcent_high, 95),
-    DEFINE_PROP_INT32("op_pct", FemuCtrl, bb_params.op_pct, 7), // The percentage of blocks that are overprovisioned. This should be in integer parameter.
-                                                                // The overprovisioning is per plane.
+    DEFINE_PROP_INT32("op_pct", FemuCtrl, bb_params.op_pct, 7), // The percentage of blocks that are overprovisioned (0 = none). Default 7% per plane.
+                                                                // Logical capacity = physical minus OP; backend and BBM use physical for storage.
 };
 
 static const VMStateDescription femu_vmstate = {

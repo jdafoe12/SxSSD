@@ -3,6 +3,10 @@
 
 #include "../nvme.h"
 #include "./bbm.h" // we have access to PseudoPpa and PseudoPba through this.
+#include "eswd-config.h"
+#include "eswd-layout.h"
+
+struct policy_engine;
 
 struct FtlBackend;
 struct FtlPolicyAPI;  /* Forward declaration */
@@ -12,6 +16,7 @@ struct FtlPolicyAPI;  /* Forward declaration */
 #define UNMAPPED_PPA    (~(0ULL))
 
 #define MAX_FTL_EVENT_HOOKS (256)
+#define MAX_NVME_HOOKS (256)
 
 enum FtlEventCmd {
     FTL_WRITE_EVENT,
@@ -35,6 +40,22 @@ struct FtlEvent {
     /* Timing information Josh: TODO: Do we need this in the event info? */
     uint64_t stime;         /* Start time of the operation */
     uint64_t lat;           /* Latency to be filled in by handler */
+};
+
+/*
+ * NVMe command event: same semantic info as FtlEvent plus opcode.
+ * Used by policy engine for opcode-keyed hooks (condition + callback).
+ */
+struct NvmeCommandEvent {
+    uint8_t opcode;         /* NVMe command opcode (e.g. NVME_CMD_READ, NVME_CMD_WRITE) */
+    uint64_t lba;
+    uint64_t nsecs;
+    uint64_t start_lpn;
+    uint64_t end_lpn;
+    uint64_t lpn_cnt;
+    NvmeRequest *req;
+    uint64_t stime;
+    uint64_t lat;
 };
 
 struct ssd; /* Forward declaration */
@@ -99,6 +120,34 @@ struct FtlEventHook {
     bool active;                       /* Is this hook slot in use? */
 };
 
+/*
+ * NVMe hook: condition + callback keyed by opcode. Same design as FTL event hooks.
+ * Condition/callback receive NvmeCommandEvent (same info as FtlEvent plus opcode).
+ */
+typedef bool (*NvmeHookCondition)(struct ssd *ssd,
+                                  struct NvmeCommandEvent *event,
+                                  struct FtlPolicyAPI *api,
+                                  void *context);
+typedef uint64_t (*NvmeHookCallback)(struct ssd *ssd,
+                                     struct NvmeCommandEvent *event,
+                                     struct FtlPolicyAPI *api,
+                                     void *context);
+struct NvmeHook {
+    uint8_t opcode;
+    NvmeHookCondition condition;
+    NvmeHookCallback callback;
+    void *context;
+    bool active;
+};
+
+/*
+ * Read PPA resolver: policy provides this so the FTL can perform a user read
+ * through BBM. For each LPN in the request range, the resolver returns true
+ * and fills *out with a valid mapped PPA to read, or false to skip that LPN.
+ * Used by read_user_request() to build the PPA list and call BBM read.
+ */
+typedef bool (*ReadPpaResolver)(void *ctx, struct ssd *ssd, uint64_t lpn, PseudoPpa *out);
+
 // enum {
 //     NAND_READ =  0,
 //     NAND_WRITE = 1,
@@ -114,15 +163,7 @@ struct FtlEventHook {
     GC_IO = 1,
 };*/
 
-enum {
-    SEC_FREE = 0,
-    SEC_INVALID = 1,
-    SEC_VALID = 2,
-
-    PG_FREE = 0,
-    PG_INVALID = 1,
-    PG_VALID = 2
-};
+/* Page/sector status: use backend enum (PG_FREE, PG_INVALID, PG_VALID from ftl-backend.h via bbm.h). */
 
 enum { // these things should be done in backend, or no? may be policy level.? TODO: Remove. It definitely seems this information is policy level.
        // GC_DELAY is always enabled ipmplicitly. 
@@ -163,32 +204,10 @@ enum { // these things should be done in backend, or no? may be policy level.? T
 //     };
 // };
 
-typedef int nand_sec_status_t;
-
-struct nand_page { // the nand_page, nand_block and such shoudl stay in the ftl. This is becuase they purely track the metadata at different granularities.
-                   // the geometry needed by the backend is mostly the things currently in the ssd struct.
-    nand_sec_status_t *sec;
-    int nsecs;
-    int status;
-};
-
-struct nand_block {
-    struct nand_page *pg;
-    int npgs;
-    int ipc; /* invalid page count */
-    int vpc; /* valid page count */
-   // int erase_cnt;
-    int wp; /* current write pointer */
-};
-
-struct nand_plane {
-    struct nand_block *blk;
-    int nblks;
-};
+/* Per-page validity and block vpc/ipc live in the backend. FTL keeps line-level vpc/ipc for victim selection. */
 
 struct nand_lun {
-    struct nand_plane *pl;
-    int npls;
+    /* Timing only; no pl/blk/pg arrays - validity is in backend. */
     uint64_t next_lun_avail_time;
     bool busy;
     uint64_t gc_endtime;
@@ -251,36 +270,14 @@ struct ssd_channel {
 //     int tt_luns;      /* total # of LUNs in the SSD */
 // };
 
-typedef struct line {
-    int id;  /* line id, the same as corresponding block id */
-    int ipc; /* invalid page count in this line */
-    int vpc; /* valid page count in this line */
-    QTAILQ_ENTRY(line) entry; /* in either {free,victim,full} list */
-    /* position in the priority queue for victim lines */
-    size_t                  pos;
-} line;
-
-/* wp: record next write addr */
-struct write_pointer {
-    struct line *curline;
-    int ch;
-    int lun;
-    int pg;
-    int blk;
-    int pl;
-};
-
-struct line_mgmt {
-    struct line *lines;
-    /* free line list, we only need to maintain a list of blk numbers */
-    QTAILQ_HEAD(free_line_list, line) free_line_list;
-    pqueue_t *victim_line_pq;
-    //QTAILQ_HEAD(victim_line_list, line) victim_line_list;
-    QTAILQ_HEAD(full_line_list, line) full_line_list;
-    int tt_lines;
-    int free_line_cnt;
-    int victim_line_cnt;
-    int full_line_cnt;
+/*
+ * eSWD (exposed SWD): mechanism only. No list/queue membership—queues are policy, built on top.
+ */
+struct eswd {
+    uint32_t id;
+    int vpc;           /* valid page count in this eSWD */
+    int ipc;           /* invalid page count in this eSWD */
+    uint32_t wp_page_index;  /* next page to write in this eSWD (0..pgs_per_eswd-1) */
 };
 
 /*struct nand_cmd {
@@ -290,73 +287,168 @@ struct line_mgmt {
 };*/
 
 /*
- * FTL Policy API - Function pointer table for FTL operations
- * 
- * This structure provides a stable interface for policies to interact with
- * the FTL layer without requiring access to internal implementation details.
- * Plugins receive this API at runtime and use it to perform FTL operations.
+ * Migration validity callback: policy decides if a page should be migrated.
+ * Returns true if the page at (src_eswd_id, page_index) should be copied.
  */
-  /* TODO: I need to more carefully define what is exposed via this API. 
-          Some of these functions should be internal! (i.e. only exposed internally to ftl.c) */
+typedef bool (*MigrationValidityCallback)(uint32_t src_eswd_id, uint32_t page_index, 
+                                          PseudoPpa *src_ppa, void *context);
+
+/*
+ * Migration result callback: called for each successfully migrated page.
+ * Provides old and new PPAs so policy can update its mapping table.
+ */
+typedef void (*MigrationResultCallback)(uint64_t lpn, PseudoPpa *old_ppa, 
+                                        PseudoPpa *new_ppa, void *context);
+
+/*
+ * ============================================================================
+ * GENERIC MIGRATION FRAMEWORK
+ * ============================================================================
+ * Callbacks structure for generic migration operations (GC, wear leveling, 
+ * compaction, refresh, etc.). Provides a unified interface for any space
+ * management operation that needs to move data.
+ */
+struct FtlMigrationCallbacks {
+    /* Required: Check if migration should proceed */
+    bool (*should_migrate)(void *policy_ctx, bool force);
+    
+    /* Required: Select victim for migration */
+    int (*select_victim)(void *policy_ctx, bool force, uint32_t *victim_id);
+    
+    /* Required: Get destination for migrated data */
+    int (*get_destination)(void *policy_ctx, uint32_t *dest_id);
+    
+    /* Optional: Check if a specific page should be migrated */
+    bool (*is_page_valid)(uint32_t src_id, uint32_t page_idx, 
+                          PseudoPpa *src_ppa, void *policy_ctx);
+    
+    /* Optional: Notify policy after successful page migration */
+    void (*on_page_migrated)(uint64_t lpn, PseudoPpa *old_ppa, 
+                            PseudoPpa *new_ppa, void *policy_ctx);
+    
+    /* Optional: Notify policy after complete migration */
+    void (*on_complete)(void *policy_ctx, uint32_t victim_id, int pages_moved);
+    
+    /* Optional: Notify policy of failure */
+    void (*on_failed)(void *policy_ctx, uint32_t victim_id, int error_code);
+
+    /* Optional: Destination eSWD is full (wp at pgs_per_eswd). Policy moves it to
+     * full_list or victim_pq, switches to next free eSWD, sets *new_dest_id, returns 0.
+     * Must not increment wp (mechanism already did). Return -1 if no free eSWD. */
+    int (*on_destination_full)(void *policy_ctx, uint32_t current_dest_id, uint32_t *new_dest_id);
+};
+
+/*
+ * FTL Policy API - Mechanism-level primitives for policies
+ * 
+ * This structure provides ONLY mechanism operations: eSWD primitives, migration,
+ * validity tracking, and hook registration. Policies implement their own mapping
+ * layer, I/O handlers, GC logic, and allocation strategy on top of these primitives.
+ * 
+ * Mechanism = eSWD + migration infrastructure (stable, reusable)
+ * Policy = translation layer + I/O + GC + allocation (pluggable, varied)
+ */
 struct FtlPolicyAPI {
     uint32_t version;  /* API version for compatibility checking */
     
-    /* Mapping operations */
-    PseudoPpa (*get_maptbl_ent)(struct ssd *ssd, uint64_t lpn);
-    void (*set_maptbl_ent)(struct ssd *ssd, uint64_t lpn, PseudoPpa *ppa);
-    uint64_t (*get_rmap_ent)(struct ssd *ssd, PseudoPpa *ppa);
-    void (*set_rmap_ent)(struct ssd *ssd, uint64_t lpn, PseudoPpa *ppa);
+    /* eSWD query operations (mechanism exposes eSWD state, policy decides how to use) */
+    struct eswd *(*get_eswd_by_id)(struct ssd *ssd, uint32_t eswd_id);
+    struct eswd *(*get_eswd_by_ppa)(struct ssd *ssd, PseudoPpa *ppa);
+    void (*get_eswd_vpc_ipc)(struct ssd *ssd, uint32_t eswd_id, int *vpc, int *ipc);
+    uint32_t (*get_eswd_wp_index)(struct ssd *ssd, uint32_t eswd_id);
+    uint32_t (*get_total_eswds)(struct ssd *ssd);
+    uint64_t (*get_total_logical_pages)(struct ssd *ssd);
     
-    /* Address validation */
-    bool (*valid_lpn)(struct ssd *ssd, uint64_t lpn);
-    bool (*valid_ppa)(struct ssd *ssd, PseudoPpa *ppa);
-    bool (*mapped_ppa)(PseudoPpa *ppa);
+    /* eSWD state modification (mechanism updates eSWD struct, policy tracks queues) */
+    void (*eswd_set_vpc_ipc)(struct ssd *ssd, uint32_t eswd_id, int vpc, int ipc);
+    void (*eswd_increment_wp)(struct ssd *ssd, uint32_t eswd_id);
+    void (*eswd_reset)(struct ssd *ssd, uint32_t eswd_id);  /* Reset to initial state (for free) */
     
-    /* Page allocation */
-    PseudoPpa (*get_new_page)(struct ssd *ssd);
-    void (*advance_write_pointer)(struct ssd *ssd);
-    struct line *(*get_next_free_line)(struct ssd *ssd);
+    /* eSWD layout query (mechanism owns layout, policy uses for translation) */
+    int (*eswd_id_to_ppa)(struct ssd *ssd, uint32_t eswd_id, uint32_t page_index, PseudoPpa *ppa);
+    int (*ppa_to_eswd_id)(struct ssd *ssd, const PseudoPpa *ppa, uint32_t *eswd_id, uint32_t *page_index);
+    int (*eswd_block_to_ppa)(struct ssd *ssd, uint32_t eswd_id, uint32_t block_index, PseudoPpa *ppa);
     
-    /* Metadata management */
+    /* Migration API (mechanism performs copy, policy decides when/which/validity).
+     * callbacks and policy_ctx may be NULL; if set, on_destination_full used when dest full. */
+    int (*migrate_eswd_pages)(struct ssd *ssd,
+                              uint32_t src_eswd_id,
+                              uint32_t dst_eswd_id,
+                              MigrationValidityCallback is_valid,
+                              MigrationResultCallback on_migrated,
+                              void *context,
+                              struct FtlMigrationCallbacks *callbacks,
+                              void *policy_ctx);
+    
+    /* Remapping API (mechanism updates eSWD→physical mapping for wear leveling) */
+    int (*remap_eswd_to_physical)(struct ssd *ssd,
+                                  uint32_t eswd_id,
+                                  uint8_t target_ch,
+                                  uint8_t target_lun,
+                                  uint8_t target_pl,
+                                  uint16_t target_blk_start);
+    
+    /* Validity tracking (mechanism updates backend validity, policy calls these) */
     void (*mark_page_valid)(struct ssd *ssd, PseudoPpa *ppa);
     void (*mark_page_invalid)(struct ssd *ssd, PseudoPpa *ppa);
     void (*mark_block_free)(struct ssd *ssd, PseudoPpa *ppa);
-    void (*mark_line_free)(struct ssd *ssd, PseudoPpa *ppa);
     
-    /* Garbage collection */
-    bool (*should_gc)(struct ssd *ssd);
-    bool (*should_gc_high)(struct ssd *ssd);
-    int (*do_gc)(struct ssd *ssd, bool force);
-    struct line *(*select_victim_line)(struct ssd *ssd, bool force);
-    void (*clean_one_block)(struct ssd *ssd, PseudoPpa *ppa);
+    /* Address validation (mechanism checks PPA against geometry) */
+    bool (*valid_ppa)(struct ssd *ssd, PseudoPpa *ppa);
+    bool (*mapped_ppa)(PseudoPpa *ppa);
     
-    /* Block/page accessors */
-    struct nand_block *(*get_blk)(struct ssd *ssd, PseudoPpa *ppa);
-    struct line *(*get_line)(struct ssd *ssd, PseudoPpa *ppa);
-    struct nand_page *(*get_pg)(struct ssd *ssd, PseudoPpa *ppa);
+    /* Hardware accessors (mechanism provides access to channels/LUNs) */
     struct nand_lun *(*get_lun)(struct ssd *ssd, PseudoPpa *ppa);
     struct ssd_channel *(*get_ch)(struct ssd *ssd, PseudoPpa *ppa);
     
-    /* Buffer helpers (from request) */
+    /* Buffer helpers (mechanism provides request data access) */
     uint64_t (*get_request_buffer_size)(NvmeRequest *req);
     uint8_t *(*copy_request_data)(NvmeRequest *req, uint64_t offset, 
                                    uint64_t length, uint64_t *out_size);
     uint64_t (*write_request_data)(NvmeRequest *req, const uint8_t *buffer,
                                     uint64_t offset, uint64_t length);
-    
-    /* Default FTL implementations (for policies to call or wrap) */
-    uint64_t (*default_read)(struct ssd *ssd, NvmeRequest *req);
-    uint64_t (*default_write)(struct ssd *ssd, NvmeRequest *req);
-    
-    uint64_t (*get_total_logical_pages)(struct ssd *ssd);
 
-    /* Hook registration */
-    int (*register_hook)(struct ssd *ssd,
-                         FtlEventHookCondition condition,
-                         FtlEventHookCallback callback,
-                         void *context);
+    /* Hook registration (mechanism provides event system, policy attaches handlers) */
+    int (*register_nvme_hook)(struct ssd *ssd, uint8_t opcode,
+                             NvmeHookCondition condition,
+                             NvmeHookCallback callback,
+                             void *context);
+    int (*unregister_nvme_hook)(struct ssd *ssd, int hook_handle);
+    int (*inactivate_nvme_hook)(struct ssd *ssd, int hook_handle);
+    int (*reactivate_nvme_hook)(struct ssd *ssd, int hook_handle);
+    int (*register_backend_hook)(struct ssd *ssd, BackendEventHookCondition condition,
+                                 BackendEventHookCallback callback, void *context);
+    int (*unregister_backend_hook)(struct ssd *ssd, int hook_handle);
+    int (*inactivate_backend_hook)(struct ssd *ssd, int hook_handle);
+    int (*reactivate_backend_hook)(struct ssd *ssd, int hook_handle);
+    int (*register_pswd_transition_hook)(struct ssd *ssd, PswdTransitionHookCondition condition,
+                                         PswdTransitionHookCallback callback, void *context);
+    int (*unregister_pswd_transition_hook)(struct ssd *ssd, int hook_handle);
+    int (*inactivate_pswd_transition_hook)(struct ssd *ssd, int hook_handle);
+    int (*reactivate_pswd_transition_hook)(struct ssd *ssd, int hook_handle);
+    int (*register_background_hook)(struct ssd *ssd, BackgroundHookCondition condition,
+                                    BackgroundHookCallback callback, void *context);
+    int (*unregister_background_hook)(struct ssd *ssd, int hook_handle);
+    int (*inactivate_background_hook)(struct ssd *ssd, int hook_handle);
+    int (*reactivate_background_hook)(struct ssd *ssd, int hook_handle);
 
-    /* BBM API pass-through (for convenience) */
+    /* eSWD config (policy sets at init to define striping and layout) */
+    void (*set_eswd_config)(struct ssd *ssd, const struct eswd_config *config);
+
+    /* GC mapping update (policy provides; mechanism calls when migrating a page in legacy GC path) */
+    void (*gc_update_mapping)(struct ssd *ssd, PseudoPpa *old_ppa, PseudoPpa *new_ppa);
+
+    /*
+     * User read through BBM: builds PPA list from event LPN range using the policy's
+     * resolve callback, performs BBM read (pseudo→physical, backend I/O, event dispatch),
+     * and returns latency. The event is passed in so stime/lat and policy context are used.
+     */
+    uint64_t (*read_user_request)(struct ssd *ssd, struct NvmeCommandEvent *event,
+                                  ReadPpaResolver resolve_ppa, void *resolve_ctx);
+    uint64_t (*write_user_request)(struct ssd *ssd, NvmeRequest *req,
+                                  PseudoPpa *ppa_list, uint64_t ppa_cnt);
+
+    /* BBM API pass-through (mechanism provides backend I/O and validity operations) */
     struct BbmPolicyAPI *bbm_api;
 };
 
@@ -366,10 +458,23 @@ struct ssd { // This needs to be dissected and probably renamed
     struct bbm *bbm;     /* bad block manager / OP mapping context */
    // struct ssdparams sp;
     struct ssd_channel *ch;
+    
+    /* Policy-owned context (opaque to mechanism) */
+    void *policy_private;
+    
+    /* DEPRECATED: These will be moved to policy context */
     PseudoPpa *maptbl; /* page level mapping table */
-    uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
-    struct write_pointer wp;
-    struct line_mgmt lm;
+
+    /* eSWD state (mechanism owns eSWD structs and layout) */
+    struct eswd *eswds;
+    uint32_t tt_eswds;
+    struct eswd_config eswd_config;
+    struct eswd_layout eswd_layout;
+    bool eswd_config_set;
+    
+    /* DEPRECATED: Policy-level fields, will be moved to policy_private */
+    struct eswd *cur_eswd;
+    void *eswd_policy_ctx;  /* opaque; policy may use for its own context */
 
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;
@@ -377,16 +482,8 @@ struct ssd { // This needs to be dissected and probably renamed
     bool *dataplane_started_ptr;
     QemuThread ftl_thread;
 
-    /* 
-     * Event hook registry for FTL policy extensibility.
-     * Policies register hooks during initialization to intercept I/O events.
-     * When I/O operations arrive, ftl_event_handle() iterates through
-     * this array and invokes active hooks whose conditions match the event.
-     * 
-     * Note: Single unified array for all event types (read/write/trim).
-     * The condition function filters events by type (event->cmd) and other criteria.
-     */
-    struct FtlEventHook hooks[MAX_FTL_EVENT_HOOKS];
+    /* Policy engine (holds FTL/backend/pSWD hook arrays; dispatch runs there) */
+    struct policy_engine *policy_engine;
     
     /*
      * FTL Policy API - function pointer table for policies.
@@ -398,51 +495,89 @@ struct ssd { // This needs to be dissected and probably renamed
 
 void ssd_init(FemuCtrl *n);
 
-/* Bootstrap policy initialization */
-int init_policy(struct ssd *ssd);
+/* Block interface policy: apply eSWD config (call before eswd_layout_compute) */
+void block_interface_policy_apply_eswd_config(struct ssd *ssd);
 
-/* FTL entry points (called from ftl_thread) */
-uint64_t ftl_read(struct ssd *ssd, NvmeRequest *req);
-uint64_t ftl_write(struct ssd *ssd, NvmeRequest *req);
+/* Block interface policy initialization */
+int init_block_interface_policy(struct ssd *ssd);
+
+/* eSWD config – call from init_policy to define striping and size before lines/wp are inited */
+void set_eswd_config(struct ssd *ssd, const struct eswd_config *config);
 
 /* Event filling helpers */
-void ftl_fill_read_event(struct ssd *ssd, NvmeRequest *req, struct FtlEvent *event);
-void ftl_fill_write_event(struct ssd *ssd, NvmeRequest *req, struct FtlEvent *event);
+void ftl_fill_nvme_event(struct ssd *ssd, NvmeRequest *req, struct NvmeCommandEvent *event);
+uint64_t ftl_read_user_request(struct ssd *ssd, struct NvmeCommandEvent *event,
+                               ReadPpaResolver resolve_ppa, void *resolve_ctx);
+uint64_t ftl_write_user_request(struct ssd *ssd, NvmeRequest *req,
+                                PseudoPpa *ppa_list, uint64_t ppa_cnt);
 
+/* ========== Mechanism API: eSWD query and state operations ========== */
+struct eswd *get_eswd_by_id(struct ssd *ssd, uint32_t eswd_id);
+struct eswd *get_eswd_by_ppa(struct ssd *ssd, PseudoPpa *ppa);
+void get_eswd_vpc_ipc(struct ssd *ssd, uint32_t eswd_id, int *vpc, int *ipc);
+uint32_t get_eswd_wp_index(struct ssd *ssd, uint32_t eswd_id);
+uint32_t get_total_eswds(struct ssd *ssd);
+void eswd_set_vpc_ipc(struct ssd *ssd, uint32_t eswd_id, int vpc, int ipc);
+void eswd_increment_wp(struct ssd *ssd, uint32_t eswd_id);
+void eswd_reset(struct ssd *ssd, uint32_t eswd_id);
+
+/* eSWD layout query wrappers */
+int eswd_id_to_ppa_wrapper(struct ssd *ssd, uint32_t eswd_id, uint32_t page_index, PseudoPpa *ppa);
+int ppa_to_eswd_id_wrapper(struct ssd *ssd, const PseudoPpa *ppa, uint32_t *eswd_id, uint32_t *page_index);
+int eswd_block_to_ppa_wrapper(struct ssd *ssd, uint32_t eswd_id, uint32_t block_index, PseudoPpa *ppa);
+
+/* eSWD migration and remapping.
+ * If callbacks and policy_ctx are non-NULL, on_destination_full may be used when
+ * destination runs out of space; otherwise migration fails when destination is full. */
+int migrate_eswd_pages(struct ssd *ssd,
+                       uint32_t src_eswd_id,
+                       uint32_t dst_eswd_id,
+                       MigrationValidityCallback is_valid,
+                       MigrationResultCallback on_migrated,
+                       void *context,
+                       struct FtlMigrationCallbacks *callbacks,
+                       void *policy_ctx);
+
+/* Generic migration framework (high-level orchestration) */
+int ftl_run_migration(struct ssd *ssd,
+                      struct FtlMigrationCallbacks *callbacks,
+                      void *policy_ctx,
+                      bool force);
+
+int ftl_run_migration_loop(struct ssd *ssd,
+                           struct FtlMigrationCallbacks *callbacks,
+                           void *policy_ctx,
+                           bool force,
+                           int max_iterations);
+
+int remap_eswd_to_physical(struct ssd *ssd,
+                           uint32_t eswd_id,
+                           uint8_t target_ch,
+                           uint8_t target_lun,
+                           uint8_t target_pl,
+                           uint16_t target_blk_start);
+
+/* PPA to physical page index (for policy rmap; index in [0, tt_pgs_log)) */
+uint64_t ppa_to_pgidx(struct ssd *ssd, PseudoPpa *ppa);
+
+/* ========== DEPRECATED: Policy-level operations (will be removed) ========== */
 /* Mapping table operations */
 PseudoPpa get_maptbl_ent(struct ssd *ssd, uint64_t lpn);
 void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, PseudoPpa *ppa);
 uint64_t get_total_logical_pages(struct ssd *ssd);
-uint64_t get_rmap_ent(struct ssd *ssd, PseudoPpa *ppa);
-void set_rmap_ent(struct ssd *ssd, uint64_t lpn, PseudoPpa *ppa);
 
 /* Address validation */
 bool valid_lpn(struct ssd *ssd, uint64_t lpn);
 bool valid_ppa(struct ssd *ssd, PseudoPpa *ppa);
 bool mapped_ppa(PseudoPpa *ppa);
 
-/* Page allocation */
-PseudoPpa get_new_page(struct ssd *ssd);
-void ssd_advance_write_pointer(struct ssd *ssd);
-struct line *get_next_free_line(struct ssd *ssd);
-
 /* Metadata management */
 void mark_page_valid(struct ssd *ssd, PseudoPpa *ppa);
 void mark_page_invalid(struct ssd *ssd, PseudoPpa *ppa);
 void mark_block_free(struct ssd *ssd, PseudoPpa *ppa);
-void mark_line_free(struct ssd *ssd, PseudoPpa *ppa);
 
-/* Garbage collection */
-bool should_gc(struct ssd *ssd);
-bool should_gc_high(struct ssd *ssd);
-int do_gc(struct ssd *ssd, bool force);
-struct line *select_victim_line(struct ssd *ssd, bool force);
-void clean_one_block(struct ssd *ssd, PseudoPpa *ppa);
-
-/* Block/page accessors */
-struct nand_block *get_blk(struct ssd *ssd, PseudoPpa *ppa);
-struct line *get_line(struct ssd *ssd, PseudoPpa *ppa);
-struct nand_page *get_pg(struct ssd *ssd, PseudoPpa *ppa);
+/* eSWD/channel accessors (page/block validity via BBM API: bbm_api->get_page_status, bbm_api->get_block_vpc_ipc) */
+struct eswd *get_eswd(struct ssd *ssd, PseudoPpa *ppa);
 struct nand_lun *get_lun(struct ssd *ssd, PseudoPpa *ppa);
 struct ssd_channel *get_ch(struct ssd *ssd, PseudoPpa *ppa);
 
@@ -488,68 +623,21 @@ uint8_t *ftl_copy_request_data(NvmeRequest *req, uint64_t offset,
 uint64_t ftl_write_request_data(NvmeRequest *req, const uint8_t *buffer,
                                  uint64_t offset, uint64_t length);
 
-/* FTL Event Handling and Policy Infrastructure */
-
-/**
- * ftl_event_handle - Dispatch an FTL event to registered policy hooks
- * @ssd: SSD/FTL context
- * @event: The FTL event (read/write) to process
- * 
- * Iterates through registered hooks for the event type (read or write),
- * evaluates their conditions, and invokes matching callbacks.
- * If no hooks handle the event, falls back to default behavior.
- * 
- * Returns: Latency in nanoseconds for the operation
- * 
- * Note: Passing the entire SSD struct conforms with Bell-LaPadula as policies
- * are trusted code running at the FTL level. TODO: Make sure we can enforce Bell-LaPadula throughout the design???? maybe? 
- */
-uint64_t ftl_event_handle(struct ssd *ssd, struct FtlEvent *event);
-
-/* FTL Event hook management */
-
-/**
- * ftl_register_hook - Register a policy hook for read events
- * @ssd: SSD/FTL context
- * @condition: function that determines if event should trigger hook (NULL = always trigger)
- * @callback: function to invoke when event condition is met
- * @context: opaque policy-specific data passed to both condition and callback
- * 
- * Returns: hook handle (>= 0) on success, -1 on failure (e.g., no slots available)
- * 
- * Example usage:
- *   // Hook that fires on reads spanning multiple pages
- *   bool multi_page_condition(struct ssd *ssd, struct FtlEvent *event, void *ctx) {
- *       return event->lpn_cnt > 1;
- *   }
- *   ftl_register_hook(ssd, multi_page_condition, my_callback, my_context);
- */
-int ftl_register_hook(struct ssd *ssd,
-                           FtlEventHookCondition condition,
-                           FtlEventHookCallback callback,
+/* NVMe hook management (opcode-keyed, condition + callback) */
+int ftl_register_nvme_hook(struct ssd *ssd, uint8_t opcode,
+                           NvmeHookCondition condition,
+                           NvmeHookCallback callback,
                            void *context);
+int ftl_unregister_nvme_hook(struct ssd *ssd, int hook_handle);
+int ftl_inactivate_nvme_hook(struct ssd *ssd, int hook_handle);
+int ftl_reactivate_nvme_hook(struct ssd *ssd, int hook_handle);
 
-
-/**
- * ftl_unregister_read_hook - Unregister a hook
- * @ssd: SSD/FTL context
- * @hook_handle: handle returned by ftl_register_hook
- * 
- * Returns: 0 on success, -1 on failure
- */
-int ftl_unregister_hook(struct ssd *ssd, int hook_handle);
-
-/**
- * ftl_inactivate_hook - Temporarily disable a hook
- * @ssd: SSD/FTL context
- * @hook_handle: handle returned by ftl_register_hook
- * 
- * Returns: 0 on success, -1 on failure
- */
-int ftl_inactivate_hook(struct ssd *ssd, int hook_handle);
-
-int ftl_reactivate_hook(struct ssd *ssd, int hook_handle);
-
+/* Background hook management */
+int ftl_register_background_hook(struct ssd *ssd, BackgroundHookCondition condition,
+                                 BackgroundHookCallback callback, void *context);
+int ftl_unregister_background_hook(struct ssd *ssd, int hook_handle);
+int ftl_inactivate_background_hook(struct ssd *ssd, int hook_handle);
+int ftl_reactivate_background_hook(struct ssd *ssd, int hook_handle);
 
 #ifdef FEMU_DEBUG_FTL
 #define ftl_debug(fmt, ...) \
@@ -660,9 +748,9 @@ int ftl_reactivate_hook(struct ssd *ssd, int hook_handle);
  *     struct PermutationContext *ctx = g_malloc0(sizeof(struct PermutationContext));
  *     ctx->seed = 0x12345;
  *     
- *     // Register the hook - condition function will filter for read events
- *     int handle = ftl_register_hook(ssd, permutation_condition, 
- *                                    permutation_read_policy, ctx);
+ *     // Register NVMe opcode hook for reads
+ *     int handle = ftl_register_nvme_hook(ssd, NVME_CMD_READ, permutation_condition,
+ *                                         permutation_read_policy, ctx);
  *     if (handle < 0) {
  *         ftl_err("Failed to register permutation policy\n");
  *         g_free(ctx);

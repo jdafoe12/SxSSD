@@ -1,16 +1,18 @@
 #include "ftl.h"
 #include "bbm.h"
+#include "policy-engine.h"
+#include "eswd-config.h"
+#include "eswd-layout.h"
+#include <errno.h>
 //#include "../backend/ftl-backend.h"
 
 //#define FEMU_DEBUG_FTL
 
 static void *ftl_thread(void *arg);
 
-/* Forward declarations for default FTL handlers */
-static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req);
-static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req);
-
-/* Helper functions for FTL policies to access request data */
+/* ======================================================== */
+/* FTL API functions for FTL policies to access NVMe request data */
+/* ======================================================== */
 
 uint64_t ftl_get_request_buffer_size(NvmeRequest *req)
 {
@@ -164,218 +166,261 @@ uint64_t ftl_write_request_data(NvmeRequest *req, const uint8_t *buffer,
     return written;
 }
 
-/* FTL Event Handling and Hook Management */
+/* ======================================================== */
+/* FTL API functions for FTL policies to interact with NVMe event hooks */
+/* ======================================================== */
 
-uint64_t ftl_event_handle(struct ssd *ssd, struct FtlEvent *event)
-{
-    if (!ssd || !event) {
-        return 0;
-    }
-
-    /* Select the appropriate hook array based on event type */
-    struct FtlEventHook *hooks = NULL;
-    int max_hooks = MAX_FTL_EVENT_HOOKS;
-
-
-    hooks = ssd->hooks;
-
-
-    /* Iterate through registered hooks and invoke those whose conditions are met */
-    uint64_t latency = 0;
-    bool handled = false;
-
-    for (int i = 0; i < max_hooks; ++i) {
-        struct FtlEventHook *hook = &hooks[i];
-        
-        /* Skip inactive hooks */
-        if (!hook->active || !hook->callback) {
-            continue;
-        }
-        
-        /* Evaluate the condition function to determine if hook should fire */
-        bool should_fire = false;
-        if (hook->condition == NULL) {
-            /* No condition specified - always fire */
-            should_fire = true;
-        } else {
-            /* Call the condition function with API */
-            should_fire = hook->condition(ssd, event, ssd->policy_api, hook->context);
-        }
-        
-        /* If condition is met, invoke the policy callback */
-        if (should_fire) {
-            latency = hook->callback(ssd, event, ssd->policy_api, hook->context); 
-            /* Note: Josh: TOOD: here we realize that havint latency in the 
-               event is good? */
-            handled = true;
-            /* only invoke the first matching hook 
-               Josh: TODO: Is this sensible? only one policy per
-               upper layer request. (it does kind of make sense,
-               as we do not want to duplicate functionality? 
-               all should ultumately invocke the read or write???)*/
-            break;
-        }
-    }
-
-    /* If no hooks handled the event, fall back to default behavior */
-    if (!handled) {
-        if (event->cmd == FTL_READ_EVENT) {
-            latency = ssd_read(ssd, event->req);
-        } else if (event->cmd == FTL_WRITE_EVENT) {
-            latency = ssd_write(ssd, event->req);
-        }
-    }
-
-    event->lat = latency;
-    return latency;
-}
-
-int ftl_register_hook(struct ssd *ssd,
-                           FtlEventHookCondition condition,
-                           FtlEventHookCallback callback,
+int ftl_register_nvme_hook(struct ssd *ssd, uint8_t opcode,
+                           NvmeHookCondition condition,
+                           NvmeHookCallback callback,
                            void *context)
 {
-    if (!ssd || !callback) {
+    if (!ssd || !callback || !ssd->policy_engine) {
         return -1;
     }
+    return policy_engine_register_nvme_hook(ssd->policy_engine, opcode, condition, callback, context);
+}
 
-    /* Find an available hook slot */
-    for (int i = 0; i < MAX_FTL_EVENT_HOOKS; ++i) {
-        if (!ssd->hooks[i].active && !ssd->hooks[i].callback) {
-            ssd->hooks[i].condition = condition;
-            ssd->hooks[i].callback = callback;
-            ssd->hooks[i].context = context;
-            ssd->hooks[i].active = true;
-            return i; /* Return hook handle */
+int ftl_unregister_nvme_hook(struct ssd *ssd, int hook_handle)
+{
+    if (!ssd || !ssd->policy_engine) {
+        return -1;
+    }
+    return policy_engine_unregister_nvme_hook(ssd->policy_engine, hook_handle);
+}
+
+int ftl_inactivate_nvme_hook(struct ssd *ssd, int hook_handle)
+{
+    if (!ssd || !ssd->policy_engine) {
+        return -1;
+    }
+    return policy_engine_inactivate_nvme_hook(ssd->policy_engine, hook_handle);
+}
+
+int ftl_reactivate_nvme_hook(struct ssd *ssd, int hook_handle)
+{
+    if (!ssd || !ssd->policy_engine) {
+        return -1;
+    }
+    return policy_engine_reactivate_nvme_hook(ssd->policy_engine, hook_handle);
+}
+
+/* ======================================================== */
+/* FTL API functions for FTL policies to interact with background event hooks */
+/* ======================================================== */
+
+int ftl_register_background_hook(struct ssd *ssd, BackgroundHookCondition condition,
+                                 BackgroundHookCallback callback, void *context)
+{
+    if (!ssd || !callback || !ssd->policy_engine) {
+        return -1;
+    }
+    return policy_engine_register_background_hook(ssd->policy_engine, condition, callback, context);
+}
+
+int ftl_unregister_background_hook(struct ssd *ssd, int hook_handle)
+{
+    if (!ssd || !ssd->policy_engine) {
+        return -1;
+    }
+    return policy_engine_unregister_background_hook(ssd->policy_engine, hook_handle);
+}
+
+int ftl_inactivate_background_hook(struct ssd *ssd, int hook_handle)
+{
+    if (!ssd || !ssd->policy_engine) {
+        return -1;
+    }
+    return policy_engine_inactivate_background_hook(ssd->policy_engine, hook_handle);
+}
+
+int ftl_reactivate_background_hook(struct ssd *ssd, int hook_handle)
+{
+    if (!ssd || !ssd->policy_engine) {
+        return -1;
+    }
+    return policy_engine_reactivate_background_hook(ssd->policy_engine, hook_handle);
+}
+
+/* ======================================================== */
+/* FTL API functions for FTL policies to interact with backend fail status event hooks */
+/* ======================================================== */
+static int ftl_register_backend_hook(struct ssd *ssd, BackendEventHookCondition condition,
+                                     BackendEventHookCallback callback, void *context)
+{
+    if (!ssd || !callback || !ssd->policy_engine) {
+        return -1;
+    }
+    return policy_engine_register_backend_hook(ssd->policy_engine, condition, callback, context);
+}
+
+static int ftl_unregister_backend_hook(struct ssd *ssd, int hook_handle)
+{
+    if (!ssd || !ssd->policy_engine) {
+        return -1;
+    }
+    return policy_engine_unregister_backend_hook(ssd->policy_engine, hook_handle);
+}
+
+static int ftl_inactivate_backend_hook(struct ssd *ssd, int hook_handle)
+{
+    if (!ssd || !ssd->policy_engine) {
+        return -1;
+    }
+    return policy_engine_inactivate_backend_hook(ssd->policy_engine, hook_handle);
+}
+
+static int ftl_reactivate_backend_hook(struct ssd *ssd, int hook_handle)
+{
+    if (!ssd || !ssd->policy_engine) {
+        return -1;
+    }
+    return policy_engine_reactivate_backend_hook(ssd->policy_engine, hook_handle);
+}
+
+/* ======================================================== */
+/* FTL API functions for FTL policies to interact with pSWD transition event hooks */
+/* ======================================================== */
+static int ftl_register_pswd_transition_hook(struct ssd *ssd, PswdTransitionHookCondition condition,
+                                            PswdTransitionHookCallback callback, void *context)
+{
+    if (!ssd || !callback || !ssd->policy_engine) {
+        return -1;
+    }
+    return policy_engine_register_pswd_transition_hook(ssd->policy_engine, condition, callback, context);
+}
+
+static int ftl_unregister_pswd_transition_hook(struct ssd *ssd, int hook_handle)
+{
+    if (!ssd || !ssd->policy_engine) {
+        return -1;
+    }
+    return policy_engine_unregister_pswd_transition_hook(ssd->policy_engine, hook_handle);
+}
+
+static int ftl_inactivate_pswd_transition_hook(struct ssd *ssd, int hook_handle)
+{
+    if (!ssd || !ssd->policy_engine) {
+        return -1;
+    }
+    return policy_engine_inactivate_pswd_transition_hook(ssd->policy_engine, hook_handle);
+}
+
+static int ftl_reactivate_pswd_transition_hook(struct ssd *ssd, int hook_handle)
+{
+    if (!ssd || !ssd->policy_engine) {
+        return -1;
+    }
+    return policy_engine_reactivate_pswd_transition_hook(ssd->policy_engine, hook_handle);
+}
+
+void ftl_fill_nvme_event(struct ssd *ssd, NvmeRequest *req, struct NvmeCommandEvent *event)
+{
+    if (!ssd || !req || !event) {
+        return;
+    }
+    const struct bbm_geom *geom = ssd->bbm->geom;
+
+    event->opcode = req->cmd.opcode;
+    event->lba = req->slba;
+    event->nsecs = req->nlb;
+    event->start_lpn = req->slba / geom->secs_per_pg;
+    event->end_lpn = (req->slba + req->nlb - 1) / geom->secs_per_pg;
+    event->lpn_cnt = event->end_lpn - event->start_lpn + 1;
+    event->req = req;
+    event->stime = req->stime;
+    event->lat = 0;
+}
+
+/*
+ * Perform a user read through BBM: resolve LPNs to PPAs via the policy callback,
+ * then call BBM read (pseudo→physical, backend I/O, event dispatch).
+ * event is used for LPN range, req, stime; lat is set on return.
+ */
+uint64_t ftl_read_user_request(struct ssd *ssd, struct NvmeCommandEvent *event,
+                               ReadPpaResolver resolve_ppa, void *resolve_ctx)
+{
+    if (!ssd || !event || !event->req || !resolve_ppa) {
+        return 0;
+    }
+    const struct ssdparams *spp = &ssd->fb->sp;
+    uint64_t page_size = (uint64_t)spp->secs_per_pg * spp->secsz;
+    uint64_t start_lpn = event->start_lpn;
+    uint64_t end_lpn = event->end_lpn;
+
+    PseudoPpa *ppa_list = g_malloc0(sizeof(PseudoPpa) * event->lpn_cnt);
+    int ppa_idx = 0;
+    for (uint64_t lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        PseudoPpa ppa;
+        if (resolve_ppa(resolve_ctx, ssd, lpn, &ppa)) {
+            ppa_list[ppa_idx++] = ppa;
         }
     }
 
-    /* No slots available */
-    ftl_err("No available read hook slots\n");
-    return -1;
-}
-
-int ftl_unregister_hook(struct ssd *ssd, int hook_handle)
-{
-    if (!ssd || hook_handle < 0 || hook_handle >= MAX_FTL_EVENT_HOOKS) {
-        return -1;
-    }
-
-    /* Mark the hook as inactive and clear it */
-    ssd->hooks[hook_handle].active = false;
-    ssd->hooks[hook_handle].condition = NULL;
-    ssd->hooks[hook_handle].callback = NULL;
-    ssd->hooks[hook_handle].context = NULL;
-
-    return 0;
-}
-
-int ftl_inactivate_hook(struct ssd *ssd, int hook_handle)
-{
-    if (!ssd || hook_handle < 0 || hook_handle >= MAX_FTL_EVENT_HOOKS) {
-        return -1;
-    }
-    ssd->hooks[hook_handle].active = false;
-    return 0;
-}
-
-int ftl_reactivate_hook(struct ssd *ssd, int hook_handle)
-{
-    if (!ssd || hook_handle < 0 || hook_handle >= MAX_FTL_EVENT_HOOKS) {
-        return -1;
-    }
-    if (ssd->hooks[hook_handle].callback) {
-        ssd->hooks[hook_handle].active = true;
+    if (ppa_idx == 0) {
+        g_free(ppa_list);
+        event->lat = 0;
         return 0;
     }
-    return -1; /* Hook doesn't exist */
+
+    struct BbmEvent bbm_ev = {
+        .cmd = BBM_EVENT_READ,
+        .type = BBM_EVENT_USER_IO,
+        .count = (uint32_t)ppa_idx,
+        .status_list = g_malloc0(sizeof(int) * (size_t)ppa_idx),
+        .stime = (int64_t)event->stime,
+        .lat = 0,
+    };
+
+    ssd->policy_api->bbm_api->read(ssd->fb, ssd->bbm, event->req,
+                                  ppa_list, (uint64_t)ppa_idx, page_size, &bbm_ev);
+
+    event->lat = (uint64_t)bbm_ev.lat;
+    g_free(bbm_ev.status_list);
+    g_free(ppa_list);
+    return (uint64_t)bbm_ev.lat;
 }
 
-/* Event creation helpers for FTL policies */
-
-void ftl_fill_read_event(struct ssd *ssd, NvmeRequest *req, struct FtlEvent *event)
+/*
+ * Perform a user write through BBM: call BBM write (pseudo→physical, backend I/O,
+ * event dispatch) for the policy-supplied PPA list. Policy owns ppa_list and may free
+ * it after return. Returns latency.
+ */
+uint64_t ftl_write_user_request(struct ssd *ssd, NvmeRequest *req,
+                                PseudoPpa *ppa_list, uint64_t ppa_cnt)
 {
-    if (!ssd || !req || !event) {
-        return;
+    if (!ssd || !req || !ppa_list || ppa_cnt == 0) {
+        return 0;
     }
+    const struct ssdparams *spp = &ssd->fb->sp;
+    uint64_t page_size = (uint64_t)spp->secs_per_pg * spp->secsz;
 
-    const struct bbm_geom *geom = ssd->bbm->geom;
-    
-    /* Set command type */
-    event->cmd = FTL_READ_EVENT;
-    
-    /* Extract address information */
-    event->lba = req->slba;
-    event->nsecs = req->nlb;
-    
-    /* Calculate logical page number range */
-    event->start_lpn = event->lba / geom->secs_per_pg;
-    event->end_lpn = (event->lba + event->nsecs - 1) / geom->secs_per_pg;
-    event->lpn_cnt = event->end_lpn - event->start_lpn + 1;
-    
-    /* Store request pointer for buffer access */
-    event->req = req;
-    
-    /* Set timing information */
-    event->stime = req->stime;
-    event->lat = 0;  /* To be filled by handler */
+    struct BbmEvent bbm_ev = {
+        .cmd = BBM_EVENT_WRITE,
+        .type = BBM_EVENT_USER_IO,
+        .count = (uint32_t)ppa_cnt,
+        .status_list = g_malloc0(sizeof(int) * (size_t)ppa_cnt),
+        .stime = (int64_t)req->stime,
+        .lat = 0,
+    };
+
+    ssd->policy_api->bbm_api->write(ssd->fb, ssd->bbm, req,
+                                   ppa_list, ppa_cnt, page_size, &bbm_ev);
+
+    g_free(bbm_ev.status_list);
+    return (uint64_t)bbm_ev.lat;
 }
 
-void ftl_fill_write_event(struct ssd *ssd, NvmeRequest *req, struct FtlEvent *event)
-{
-    if (!ssd || !req || !event) {
-        return;
-    }
+/* ======================================================== */
 
-    const struct bbm_geom *geom = ssd->bbm->geom;
-    
-    /* Set command type */
-    event->cmd = FTL_WRITE_EVENT;
-    
-    /* Extract address information */
-    event->lba = req->slba;
-    event->nsecs = req->nlb;
-    
-    /* Calculate logical page number range */
-    event->start_lpn = event->lba / geom->secs_per_pg;
-    event->end_lpn = (event->lba + event->nsecs - 1) / geom->secs_per_pg;
-    event->lpn_cnt = event->end_lpn - event->start_lpn + 1;
-    
-    /* Store request pointer for buffer access */
-    event->req = req;
-    
-    /* Set timing information */
-    event->stime = req->stime;
-    event->lat = 0;  /* To be filled by handler */
-}
-
-bool should_gc(struct ssd *ssd)
-{
-    return (ssd->lm.free_line_cnt <= ssd->fb->sp.gc_thres_lines);
-}
-
-bool should_gc_high(struct ssd *ssd)
-{
-    return (ssd->lm.free_line_cnt <= ssd->fb->sp.gc_thres_lines_high);
-}
-
-PseudoPpa get_maptbl_ent(struct ssd *ssd, uint64_t lpn)
-{
-    return ssd->maptbl[lpn];
-}
 
 uint64_t get_total_logical_pages(struct ssd *ssd)
 {
     return ssd->bbm->geom->tt_pgs_log;
 }
 
-void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, PseudoPpa *ppa)
-{
-    ftl_assert(lpn < ssd->bbm->geom->tt_pgs_log);
-    ssd->maptbl[lpn] = *ppa;
-}
 
-static uint64_t pseudo_ppa2pgidx(struct ssd *ssd, PseudoPpa *ppa)
+uint64_t ppa_to_pgidx(struct ssd *ssd, PseudoPpa *ppa)
 {
     const struct bbm_geom *geom = ssd->bbm->geom;
     uint64_t pgidx;
@@ -391,302 +436,506 @@ static uint64_t pseudo_ppa2pgidx(struct ssd *ssd, PseudoPpa *ppa)
     return pgidx;
 }
 
-uint64_t get_rmap_ent(struct ssd *ssd, PseudoPpa *ppa)
+/* ======================================================== 
+ * --- eSWD: configuration. This is to set eswd size and striping level. Should be called by policy_init for 
+ * exactly one policy.
+ * ======================================================== */
+void set_eswd_config(struct ssd *ssd, const struct eswd_config *config)
 {
-    uint64_t pgidx = pseudo_ppa2pgidx(ssd, ppa);
-
-    return ssd->rmap[pgidx];
-}
-
-/* set rmap[page_no(ppa)] -> lpn */
-void set_rmap_ent(struct ssd *ssd, uint64_t lpn, PseudoPpa *ppa)
-{
-    uint64_t pgidx = pseudo_ppa2pgidx(ssd, ppa);
-
-    ssd->rmap[pgidx] = lpn;
-}
-
-static inline int victim_line_cmp_pri(pqueue_pri_t next, pqueue_pri_t curr)
-{
-    return (next > curr);
-}
-
-static inline pqueue_pri_t victim_line_get_pri(void *a)
-{
-    return ((struct line *)a)->vpc;
-}
-
-static inline void victim_line_set_pri(void *a, pqueue_pri_t pri)
-{
-    ((struct line *)a)->vpc = pri;
-}
-
-static inline size_t victim_line_get_pos(void *a)
-{
-    return ((struct line *)a)->pos;
-}
-
-static inline void victim_line_set_pos(void *a, size_t pos)
-{
-    ((struct line *)a)->pos = pos;
-}
-
-static void ssd_init_lines(struct ssd *ssd)
-{
-    const struct bbm_geom *geom = ssd->bbm->geom;
-    struct line_mgmt *lm = &ssd->lm;
-    struct line *line;
-
-    lm->tt_lines = geom->blks_per_pl_log;
-    ftl_assert(lm->tt_lines == geom->tt_lines);
-    lm->lines = g_malloc0(sizeof(struct line) * lm->tt_lines);
-
-    QTAILQ_INIT(&lm->free_line_list);
-    lm->victim_line_pq = pqueue_init(geom->tt_lines, victim_line_cmp_pri,
-                                     victim_line_get_pri, victim_line_set_pri,
-                                     victim_line_get_pos, victim_line_set_pos);
-    QTAILQ_INIT(&lm->full_line_list);
-
-    lm->free_line_cnt = 0;
-    for (int i = 0; i < geom->tt_lines; i++) {
-        line = &lm->lines[i];
-        line->id = i;
-        line->ipc = 0;
-        line->vpc = 0;
-        line->pos = 0;
-        /* initialize all the lines as free lines */
-        QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
-        lm->free_line_cnt++;
+    if (!ssd || !config || !ssd->bbm || !ssd->bbm->geom) {
+        return;
     }
-
-    ftl_assert(lm->free_line_cnt == lm->tt_lines);
-    lm->victim_line_cnt = 0;
-    lm->full_line_cnt = 0;
+    const struct bbm_geom *geom = ssd->bbm->geom;
+    if (!eswd_config_valid(config, geom->nchs, geom->luns_per_ch,
+                           geom->pls_per_lun, geom->blks_per_lun_log)) {
+        ftl_err("[FTL] set_eswd_config: invalid config for geometry\n");
+        return;
+    }
+    ssd->eswd_config = *config;
+    ssd->eswd_config_set = true;
 }
 
-static void ssd_init_write_pointer(struct ssd *ssd)
+static void ssd_init_eswds(struct ssd *ssd)
 {
-    struct write_pointer *wpp = &ssd->wp;
-    struct line_mgmt *lm = &ssd->lm;
-    struct line *curline = NULL;
+    const struct eswd_layout *layout = &ssd->eswd_layout;
+    uint32_t tt = layout->tt_eswds;
 
-    curline = QTAILQ_FIRST(&lm->free_line_list);
-    QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
-    lm->free_line_cnt--;
-
-    /* wpp->curline is always our next-to-write super-block */
-    wpp->curline = curline;
-    wpp->ch = 0;
-    wpp->lun = 0;
-    wpp->pg = 0;
-    wpp->blk = 0;
-    wpp->pl = 0;
+    ssd->tt_eswds = tt;
+    ssd->eswds = g_malloc0(sizeof(struct eswd) * tt);
+    for (uint32_t i = 0; i < tt; i++) {
+        ssd->eswds[i].id = i;
+        ssd->eswds[i].ipc = 0;
+        ssd->eswds[i].vpc = 0;
+        ssd->eswds[i].wp_page_index = 0;
+    }
 }
 
-static inline void check_addr(int a, int max)
+/* --- eSWD: lookup --- Definitely mechanism level! */
+struct eswd *get_eswd(struct ssd *ssd, PseudoPpa *ppa)
 {
-    ftl_assert(a >= 0 && a < max);
-}
-
-struct line *get_next_free_line(struct ssd *ssd)
-{
-    struct line_mgmt *lm = &ssd->lm;
-    struct line *curline = NULL;
-
-    curline = QTAILQ_FIRST(&lm->free_line_list);
-    if (!curline) {
-        ftl_err("No free lines left in [%s] !!!!\n", ssd->ssdname);
+    uint32_t eswd_id;
+    uint32_t page_index; /* Need to provide this - eswd_ppa_to_page requires it */
+    if (eswd_ppa_to_page(&ssd->eswd_layout, ssd->bbm->geom, ppa, &eswd_id, &page_index) != 0) {
         return NULL;
     }
-
-    QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
-    lm->free_line_cnt--;
-    return curline;
+    if (eswd_id >= ssd->tt_eswds) {
+        return NULL;
+    }
+    return &ssd->eswds[eswd_id];
 }
 
-void ssd_advance_write_pointer(struct ssd *ssd)
+/* --- eSWD: state updates (validity, free) --- Seems like this is part mechanism level and part policy level? */
+/* Backend validity via BBM; FTL updates eSWD vpc/ipc and policy victim list. */
+void mark_page_invalid(struct ssd *ssd, PseudoPpa *ppa)
 {
-    const struct bbm_geom *geom = ssd->bbm->geom;
-    struct write_pointer *wpp = &ssd->wp;
-    struct line_mgmt *lm = &ssd->lm;
+    struct eswd *e = get_eswd(ssd, ppa);
 
-    check_addr(wpp->ch, geom->nchs);
-    wpp->ch++;
-    if (wpp->ch == geom->nchs) {
-        wpp->ch = 0;
-        check_addr(wpp->lun, geom->luns_per_ch);
-        wpp->lun++;
-        /* in this case, we should go to next lun */
-        if (wpp->lun == geom->luns_per_ch) {
-            wpp->lun = 0;
-            /* go to next page in the block */
-            check_addr(wpp->pg, geom->pgs_per_blk);
-            wpp->pg++;
-            if (wpp->pg == geom->pgs_per_blk) {
-                wpp->pg = 0;
-                /* move current line to {victim,full} line list */
-                if (wpp->curline->vpc == geom->pgs_per_line) {
-                    /* all pgs are still valid, move to full line list */
-                    ftl_assert(wpp->curline->ipc == 0);
-                    QTAILQ_INSERT_TAIL(&lm->full_line_list, wpp->curline, entry);
-                    lm->full_line_cnt++;
-                } else {
-                    ftl_assert(wpp->curline->vpc >= 0 && wpp->curline->vpc < geom->pgs_per_line);
-                    /* there must be some invalid pages in this line */
-                    ftl_assert(wpp->curline->ipc > 0);
-                    pqueue_insert(lm->victim_line_pq, wpp->curline);
-                    lm->victim_line_cnt++;
+    ssd->policy_api->bbm_api->mark_page_invalid(ssd->fb, ssd->bbm, ppa);
+    if (!e) {
+        ftl_err("BUG: mark_page_invalid: get_eswd returned NULL for ppa (ch=%d,lun=%d,pl=%d,blk=%d,pg=%d)\n",
+                ppa->g.ch, ppa->g.lun, ppa->g.pl, ppa->g.blk, ppa->g.pg);
+        return;
+    }
+
+    /* Mechanism-level: update eSWD vpc/ipc. Policy handles its own full/victim lists. */
+    ftl_assert(e->ipc >= 0 && e->ipc < (int)ssd->eswd_layout.pgs_per_eswd);
+    ftl_assert(e->vpc > 0 && e->vpc <= (int)ssd->eswd_layout.pgs_per_eswd);
+    e->ipc++;
+    e->vpc--;
+}
+
+/* Backend validity via BBM; FTL updates eSWD vpc. This is mechanism level for sure */
+void mark_page_valid(struct ssd *ssd, PseudoPpa *ppa)
+{
+    struct eswd *e = get_eswd(ssd, ppa);
+
+    ssd->policy_api->bbm_api->mark_page_valid(ssd->fb, ssd->bbm, ppa);
+    if (!e) {
+        ftl_err("BUG: mark_page_valid: get_eswd returned NULL for ppa (ch=%d,lun=%d,pl=%d,blk=%d,pg=%d)\n",
+                ppa->g.ch, ppa->g.lun, ppa->g.pl, ppa->g.blk, ppa->g.pg);
+        return;
+    }
+    ftl_assert(e->vpc >= 0 && e->vpc < (int)ssd->eswd_layout.pgs_per_eswd);
+    e->vpc++;
+}
+
+/* ======================================================== 
+ * --- Mechanism API: eSWD query and state operations ---
+ * These expose eSWD primitives to policies without making policy decisions.
+ * ======================================================== */
+
+struct eswd *get_eswd_by_id(struct ssd *ssd, uint32_t eswd_id)
+{
+    if (eswd_id >= ssd->tt_eswds) {
+        return NULL;
+    }
+    return &ssd->eswds[eswd_id];
+}
+
+struct eswd *get_eswd_by_ppa(struct ssd *ssd, PseudoPpa *ppa)
+{
+    return get_eswd(ssd, ppa);
+}
+
+void get_eswd_vpc_ipc(struct ssd *ssd, uint32_t eswd_id, int *vpc, int *ipc)
+{
+    if (eswd_id >= ssd->tt_eswds) {
+        if (vpc) *vpc = 0;
+        if (ipc) *ipc = 0;
+        return;
+    }
+    struct eswd *e = &ssd->eswds[eswd_id];
+    if (vpc) *vpc = e->vpc;
+    if (ipc) *ipc = e->ipc;
+}
+
+uint32_t get_eswd_wp_index(struct ssd *ssd, uint32_t eswd_id)
+{
+    if (eswd_id >= ssd->tt_eswds) {
+        return 0;
+    }
+    return ssd->eswds[eswd_id].wp_page_index;
+}
+
+uint32_t get_total_eswds(struct ssd *ssd)
+{
+    return ssd->tt_eswds;
+}
+
+void eswd_set_vpc_ipc(struct ssd *ssd, uint32_t eswd_id, int vpc, int ipc)
+{
+    if (eswd_id >= ssd->tt_eswds) {
+        return;
+    }
+    struct eswd *e = &ssd->eswds[eswd_id];
+    e->vpc = vpc;
+    e->ipc = ipc;
+}
+
+void eswd_increment_wp(struct ssd *ssd, uint32_t eswd_id)
+{
+    if (eswd_id >= ssd->tt_eswds) {
+        return;
+    }
+    ssd->eswds[eswd_id].wp_page_index++;
+}
+
+void eswd_reset(struct ssd *ssd, uint32_t eswd_id)
+{
+    if (eswd_id >= ssd->tt_eswds) {
+        return;
+    }
+    struct eswd *e = &ssd->eswds[eswd_id];
+    e->ipc = 0;
+    e->vpc = 0;
+    e->wp_page_index = 0;
+}
+
+/* eSWD layout query wrappers */
+int eswd_id_to_ppa_wrapper(struct ssd *ssd, uint32_t eswd_id, uint32_t page_index, PseudoPpa *ppa)
+{
+    return eswd_page_to_ppa(&ssd->eswd_layout, ssd->bbm->geom, eswd_id, page_index, ppa);
+}
+
+int ppa_to_eswd_id_wrapper(struct ssd *ssd, const PseudoPpa *ppa, uint32_t *eswd_id, uint32_t *page_index)
+{
+    return eswd_ppa_to_page(&ssd->eswd_layout, ssd->bbm->geom, ppa, eswd_id, page_index);
+}
+
+int eswd_block_to_ppa_wrapper(struct ssd *ssd, uint32_t eswd_id, uint32_t block_index, PseudoPpa *ppa)
+{
+    return eswd_block_to_ppa(&ssd->eswd_layout, ssd->bbm->geom, eswd_id, block_index, ppa);
+}
+
+/* ======================================================== 
+ * --- Mechanism API: eSWD Migration ---
+ * Mechanism performs the actual page copy; policy decides validity and updates mapping.
+ * ======================================================== */
+
+int migrate_eswd_pages(struct ssd *ssd,
+                       uint32_t src_eswd_id,
+                       uint32_t dst_eswd_id,
+                       MigrationValidityCallback is_valid,
+                       MigrationResultCallback on_migrated,
+                       void *context,
+                       struct FtlMigrationCallbacks *callbacks,
+                       void *policy_ctx)
+{
+    assert(ssd);
+    assert(src_eswd_id < ssd->tt_eswds);
+    assert(dst_eswd_id < ssd->tt_eswds);
+    assert(is_valid);
+    assert(on_migrated);
+    assert(context);
+    
+    const struct eswd_layout *layout = &ssd->eswd_layout;
+    const struct bbm_geom *geom = ssd->bbm->geom;
+    struct eswd *src_eswd = get_eswd_by_id(ssd, src_eswd_id);
+    struct eswd *dst_eswd = get_eswd_by_id(ssd, dst_eswd_id);
+    int migrated_count = 0;
+
+    if (!src_eswd || !dst_eswd || !is_valid) {
+        return -1;
+    }
+
+    if (src_eswd_id == dst_eswd_id) {
+        ftl_err("BUG: migrate from eSWD %u to itself\n", src_eswd_id);
+    }
+
+    /* Iterate through all pages in source eSWD */
+    for (uint32_t page_idx = 0; page_idx < layout->pgs_per_eswd; page_idx++) {
+        PseudoPpa src_ppa, dst_ppa;
+        
+        /* Get source PPA */
+        if (eswd_page_to_ppa(layout, geom, src_eswd_id, page_idx, &src_ppa) != 0) {
+            continue;
+        }
+        
+        /* Ask policy if this page should be migrated */
+        if (!is_valid(src_eswd_id, page_idx, &src_ppa, context)) {
+            continue;
+        }
+        
+        /* Destination full: ask policy to switch to next eSWD (no wp increment) */
+        if (dst_eswd->wp_page_index >= layout->pgs_per_eswd) {
+            if (callbacks && callbacks->on_destination_full && policy_ctx) {
+                uint32_t new_dest_id = 0;
+                int rc = callbacks->on_destination_full(policy_ctx, dst_eswd_id, &new_dest_id);
+                if (rc < 0) {
+                    ftl_err("Migration failed: destination full and on_destination_full returned %d\n", rc);
+                    return -1;
                 }
-                /* current line is used up, pick another empty line */
-                check_addr(wpp->blk, geom->blks_per_pl_log);
-                wpp->curline = NULL;
-                wpp->curline = get_next_free_line(ssd);
-                if (!wpp->curline) {
-                    /* TODO */
-                    abort();
+                dst_eswd_id = new_dest_id;
+                dst_eswd = get_eswd_by_id(ssd, dst_eswd_id);
+                if (!dst_eswd) {
+                    ftl_err("Migration failed: invalid new destination %u\n", dst_eswd_id);
+                    return -1;
                 }
-                wpp->blk = wpp->curline->id;
-                check_addr(wpp->blk, geom->blks_per_pl_log);
-                /* make sure we are starting from page 0 in the super block */
-                ftl_assert(wpp->pg == 0);
-                ftl_assert(wpp->lun == 0);
-                ftl_assert(wpp->ch == 0);
-                /* TODO: assume # of pl_per_lun is 1, fix later */
-                ftl_assert(wpp->pl == 0);
+            } else {
+                ftl_err("Migration failed: dst_eswd %u wp_index %u invalid (no on_destination_full)\n",
+                        dst_eswd_id, dst_eswd->wp_page_index);
+                return -1;
             }
         }
+        
+        /* Get destination PPA (at current wp_index of dst_eswd) */
+        if (eswd_page_to_ppa(layout, geom, dst_eswd_id, dst_eswd->wp_page_index, &dst_ppa) != 0) {
+            ftl_err("Migration failed: dst_eswd %u wp_index %u invalid\n", 
+                    dst_eswd_id, dst_eswd->wp_page_index);
+            return -1;
+        }
+        
+        /* Perform the actual migration (read + write) with timing simulation */
+
+        struct BbmEvent read_event, write_event;
+        uint64_t page_size = ssd->fb->sp.secs_per_pg * ssd->fb->sp.secsz;
+            
+        /* Read from source */
+        read_event.cmd = BBM_EVENT_READ;
+        read_event.type = BBM_EVENT_POLICY_IO;
+        read_event.count = 1;
+        read_event.status_list = NULL;
+        read_event.stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        read_event.lat = 0;
+        bbm_raw_read(ssd->fb, ssd->bbm, NULL, &src_ppa, 1, page_size, &read_event);
+            
+        /* Write to destination */
+        write_event.cmd = BBM_EVENT_WRITE;
+        write_event.type = BBM_EVENT_POLICY_IO;
+        write_event.count = 1;
+        write_event.status_list = NULL;
+        write_event.stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        write_event.lat = 0;
+        bbm_raw_write(ssd->fb, ssd->bbm, NULL, &dst_ppa, 1, page_size, &write_event);
+            
+        /* Update LUN gc_endtime */
+        struct nand_lun *dst_lun = get_lun(ssd, &dst_ppa);
+        dst_lun->gc_endtime = dst_lun->next_lun_avail_time;
+        
+        
+        /* Update eSWD vpc/ipc (mechanism owns this) */
+        src_eswd->vpc--;
+        src_eswd->ipc++;
+        dst_eswd->vpc++;
+        
+        /* Update backend validity (mechanism owns this) */
+        ssd->policy_api->bbm_api->mark_page_invalid(ssd->fb, ssd->bbm, &src_ppa);
+        ssd->policy_api->bbm_api->mark_page_valid(ssd->fb, ssd->bbm, &dst_ppa);
+        
+        /* Advance destination write pointer */
+        dst_eswd->wp_page_index++;
+        
+        /* Notify policy of migration (policy updates maptbl) */
+        if (on_migrated) {
+            /* Policy needs to look up LPN via its rmap and update maptbl */
+            on_migrated(0, &src_ppa, &dst_ppa, context);
+        }
+        
+        migrated_count++;
     }
-}
 
-PseudoPpa get_new_page(struct ssd *ssd)
-{
-    struct write_pointer *wpp = &ssd->wp;
-    PseudoPpa ppa;
-    ppa.g.ch = wpp->ch;
-    ppa.g.lun = wpp->lun;
-    ppa.g.pl = wpp->pl;
-    ppa.g.blk = wpp->blk;
-    ppa.g.pg = wpp->pg;
-    ftl_assert(ppa.g.pl == 0);
-
-    return ppa;
-}
-
-/* Commented out - no longer needed with refactored backend
-static void check_params(struct ssdparams *spp)
-{
-    // we are using a general write pointer increment method now, no need to
-    // force luns_per_ch and nchs to be power of 2
-    //ftl_assert(is_power_of_2(spp->luns_per_ch));
-    //ftl_assert(is_power_of_2(spp->nchs));
-}
-*/
-
-// static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
-// {
-//     const BbCtrlParams *bbp = &n->bb_params;
-//     spp->secsz = bbp->secsz; // 512
-//     spp->secs_per_pg = bbp->secs_per_pg; // 8
-//     spp->pgs_per_blk = bbp->pgs_per_blk; //256
-
-//     int blks_per_pl_phys = bbp->blks_per_pl; /* physical blocks per plane */
-//     int reserved_blks = (blks_per_pl_phys * bbp->op_pct) / 100;
-//     if (reserved_blks >= blks_per_pl_phys && blks_per_pl_phys > 0) {
-//         reserved_blks = blks_per_pl_phys - 1; /* keep at least one logical block */
-//     }
-//     int blks_per_pl_log = blks_per_pl_phys - reserved_blks;
-
-//     spp->blks_per_pl = blks_per_pl_log; /* logical blocks per plane */
-//     spp->pls_per_lun = bbp->pls_per_lun; // 1
-//     spp->luns_per_ch = bbp->luns_per_ch; // 8
-//     spp->nchs = bbp->nchs; // 8
-
-//     spp->pg_rd_lat = bbp->pg_rd_lat;
-//     spp->pg_wr_lat = bbp->pg_wr_lat;
-//     spp->blk_er_lat = bbp->blk_er_lat;
-//     spp->ch_xfer_lat = bbp->ch_xfer_lat;
-
-//     /* calculated values */
-//     spp->secs_per_blk = spp->secs_per_pg * spp->pgs_per_blk;
-//     spp->secs_per_pl = spp->secs_per_blk * spp->blks_per_pl;
-//     spp->secs_per_lun = spp->secs_per_pl * spp->pls_per_lun;
-//     spp->secs_per_ch = spp->secs_per_lun * spp->luns_per_ch;
-//     spp->tt_secs = spp->secs_per_ch * spp->nchs;
-
-//     spp->pgs_per_pl = spp->pgs_per_blk * spp->blks_per_pl;
-//     spp->pgs_per_lun = spp->pgs_per_pl * spp->pls_per_lun;
-//     spp->pgs_per_ch = spp->pgs_per_lun * spp->luns_per_ch;
-//     spp->tt_pgs = spp->pgs_per_ch * spp->nchs;
-
-//     spp->blks_per_lun = spp->blks_per_pl * spp->pls_per_lun; /* logical */
-//     spp->blks_per_ch = spp->blks_per_lun * spp->luns_per_ch;
-//     spp->tt_blks = spp->blks_per_ch * spp->nchs;
-
-//     spp->pls_per_ch =  spp->pls_per_lun * spp->luns_per_ch;
-//     spp->tt_pls = spp->pls_per_ch * spp->nchs;
-
-//     spp->tt_luns = spp->luns_per_ch * spp->nchs;
-
-//     /* line is special, put it at the end */
-//     spp->blks_per_line = spp->tt_luns; /* TODO: to fix under multiplanes */
-//     spp->pgs_per_line = spp->blks_per_line * spp->pgs_per_blk;
-//     spp->secs_per_line = spp->pgs_per_line * spp->secs_per_pg;
-//     spp->tt_lines = spp->blks_per_lun; /* TODO: to fix under multiplanes */
-
-//     spp->gc_thres_pcent = n->bb_params.gc_thres_pcent/100.0;
-//     spp->gc_thres_lines = (int)((1 - spp->gc_thres_pcent) * spp->tt_lines);
-//     spp->gc_thres_pcent_high = n->bb_params.gc_thres_pcent_high/100.0;
-//     spp->gc_thres_lines_high = (int)((1 - spp->gc_thres_pcent_high) * spp->tt_lines);
-//     spp->enable_gc_delay = true;
-
-
-//     check_params(spp);
-// }
-
-static void ssd_init_nand_page(struct nand_page *pg, const struct bbm_geom *geom)
-{
-    pg->nsecs = geom->secs_per_pg;
-    pg->sec = g_malloc0(sizeof(nand_sec_status_t) * pg->nsecs);
-    for (int i = 0; i < pg->nsecs; i++) {
-        pg->sec[i] = SEC_FREE;
+    /* After migrating valid pages, erase the source eSWD blocks (mechanism completes the migration) */
+    const struct ssdparams *spp = &ssd->fb->sp;
+    
+    for (uint32_t block_idx = 0; block_idx < layout->blks_per_eswd; block_idx++) {
+        PseudoPpa ppa;
+        if (eswd_block_to_ppa(layout, ssd->bbm->geom, src_eswd_id, block_idx, &ppa) != 0) {
+            continue;
+        }
+        
+        /* Mark block as free in backend */
+        ssd->policy_api->bbm_api->mark_block_free(ssd->fb, ssd->bbm, &ppa);
+        
+        /* Simulate erase latency (critical for accurate GC performance) */
+        if (spp->enable_gc_delay) {
+            struct BbmEvent event;
+            event.cmd = BBM_EVENT_ERASE;
+            event.type = BBM_EVENT_POLICY_IO;
+            event.count = 1;
+            event.status_list = NULL;
+            event.stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            event.lat = 0;
+            
+            PseudoPba ppba;
+            ppba.g.ch = ppa.g.ch;
+            ppba.g.lun = ppa.g.lun;
+            ppba.g.pl = ppa.g.pl;
+            ppba.g.blk = ppa.g.blk;
+            
+            ssd->policy_api->bbm_api->raw_erase(ssd->fb, ssd->bbm, &ppba, 1, &event);
+            
+            /* Update LUN gc_endtime */
+            struct nand_lun *src_lun = get_lun(ssd, &ppa);
+            src_lun->gc_endtime = src_lun->next_lun_avail_time;
+        }
     }
-    pg->status = PG_FREE;
+
+    return migrated_count;
 }
 
-static void ssd_init_nand_blk(struct nand_block *blk, const struct bbm_geom *geom)
+/* ============================================================================
+ * GENERIC MIGRATION FRAMEWORK
+ * ============================================================================
+ * High-level orchestration for data migration operations (GC, wear leveling, 
+ * compaction, refresh, etc.). Uses callbacks to remain policy-agnostic while
+ * coordinating the complete migration workflow.
+ */
+
+
+int ftl_run_migration(struct ssd *ssd,
+                      struct FtlMigrationCallbacks *callbacks,
+                      void *policy_ctx,
+                      bool force)
 {
-    blk->npgs = geom->pgs_per_blk;
-    blk->pg = g_malloc0(sizeof(struct nand_page) * blk->npgs);
-    for (int i = 0; i < blk->npgs; i++) {
-        ssd_init_nand_page(&blk->pg[i], geom);
+    assert(callbacks);
+    assert(policy_ctx);
+    assert(ssd);
+    
+    /* Validate required callbacks */
+    if (!callbacks->select_victim || !callbacks->get_destination) {
+        ftl_err("ftl_run_migration: missing required callbacks\n");
+        return -EINVAL;
     }
-    blk->ipc = 0;
-    blk->vpc = 0;
- //   blk->erase_cnt = 0;
-    blk->wp = 0;
+    
+    /* Check if migration is needed (optional callback) */
+    if (callbacks->should_migrate && !callbacks->should_migrate(policy_ctx, force)) {
+        return 0;  /* Migration not needed */
+    }
+    
+    /* Select victim eSWD */
+    uint32_t victim_eswd_id = 0;
+    int rc = callbacks->select_victim(policy_ctx, force, &victim_eswd_id);
+    if (rc < 0) {
+        /* No suitable victim */
+        if (callbacks->on_failed) {
+            callbacks->on_failed(policy_ctx, ~0U, rc);
+        }
+        return -1;
+    }
+    
+    /* Get destination for data migration */
+    uint32_t dest_eswd_id = 0;
+    rc = callbacks->get_destination(policy_ctx, &dest_eswd_id);
+    if (rc < 0) {
+        /* No destination available */
+        if (callbacks->on_failed) {
+            callbacks->on_failed(policy_ctx, victim_eswd_id, rc);
+        }
+        return -1;
+    }
+    
+    
+    int pages_moved = migrate_eswd_pages(ssd, victim_eswd_id, dest_eswd_id,
+                                        callbacks->is_page_valid,
+                                        callbacks->on_page_migrated,
+                                        policy_ctx,
+                                        callbacks,
+                                        policy_ctx);
+    
+    if (pages_moved < 0) {
+        if (callbacks->on_failed) {
+            callbacks->on_failed(policy_ctx, victim_eswd_id, pages_moved);
+        }
+        return -1;
+    }
+    
+    if (callbacks->on_complete) {
+        callbacks->on_complete(policy_ctx, victim_eswd_id, pages_moved);
+    }
+    return pages_moved;
 }
 
-static void ssd_init_nand_plane(struct ssd *ssd, struct nand_plane *pl)
+/**
+ * ftl_run_migration_loop - Execute multiple migration cycles
+ * @ssd: SSD device
+ * @callbacks: Migration callback structure
+ * @policy_ctx: Policy-specific context
+ * @force: Force migration even if thresholds not met
+ * @max_iterations: Maximum number of iterations (0 = unlimited)
+ * 
+ * Runs migration cycles until should_migrate returns false or max_iterations reached.
+ * 
+ * Returns: Total pages moved on success, negative on error
+ */
+int ftl_run_migration_loop(struct ssd *ssd,
+                           struct FtlMigrationCallbacks *callbacks,
+                           void *policy_ctx,
+                           bool force,
+                           int max_iterations)
 {
-    /* BBSSD: model only the logical block address space (exclude OP/reserved). */
-    const struct bbm_geom *geom = ssd->bbm->geom;
-    pl->nblks = geom->blks_per_pl_log;
-    pl->blk = g_malloc0(sizeof(struct nand_block) * pl->nblks);
-    for (int i = 0; i < pl->nblks; i++) {
-        ssd_init_nand_blk(&pl->blk[i], geom);
+    assert(ssd);
+    assert(callbacks);
+    assert(policy_ctx);
+    
+    int total_pages_moved = 0;
+    int iterations = 0;
+    
+    /* Run migration until should_migrate returns false or max iterations reached */
+    while (max_iterations == 0 || iterations < max_iterations) {
+        /* Check if migration is still needed */
+        if (callbacks->should_migrate && !callbacks->should_migrate(policy_ctx, force)) {
+            break;
+        }
+        
+        /* Run one migration cycle */
+        int pages_moved = ftl_run_migration(ssd, callbacks, policy_ctx, force);
+        if (pages_moved < 0) {
+            /* Migration failed - stop loop */
+            ftl_err("ftl_run_migration_loop: Migration failed\n");
+            return (total_pages_moved > 0) ? total_pages_moved : -1;
+        }
+        
+        total_pages_moved += pages_moved;
+        iterations++;
+        
+        /* If no pages were moved, stop to avoid infinite loop */
+        if (pages_moved == 0) {
+            break;
+        }
     }
+    
+    return total_pages_moved;
 }
+
+/* ======================================================== 
+ * --- Mechanism API: eSWD Remapping ---
+ * Allow policy to remap eSWDs to different physical blocks for wear leveling.
+ * ======================================================== */
+
+int remap_eswd_to_physical(struct ssd *ssd,
+                           uint32_t eswd_id,
+                           uint8_t target_ch,
+                           uint8_t target_lun,
+                           uint8_t target_pl,
+                           uint16_t target_blk_start)
+{
+    /* TODO: This requires coordination with BBM layer.
+     * For now, return not implemented. This would allow policies to:
+     * - Move eSWDs to different planes for wear leveling
+     * - Remap eSWDs away from bad blocks
+     * The mechanism validates the target is in valid range and updates the mapping.
+     */
+    (void)ssd;
+    (void)eswd_id;
+    (void)target_ch;
+    (void)target_lun;
+    (void)target_pl;
+    (void)target_blk_start;
+    
+    ftl_err("remap_eswd_to_physical not yet implemented\n");
+    return -1;
+}
+
+/* ======================================================== */
+/* SSD init and address validation / accessors              */
+/* ======================================================== */
 
 static void ssd_init_nand_lun(struct ssd *ssd, struct nand_lun *lun)
 {
-    const struct bbm_geom *geom = ssd->bbm->geom;
-    lun->npls = geom->pls_per_lun;
-    lun->pl = g_malloc0(sizeof(struct nand_plane) * lun->npls);
-    for (int i = 0; i < lun->npls; i++) {
-        ssd_init_nand_plane(ssd, &lun->pl[i]);
-    }
+    (void)ssd;
     lun->next_lun_avail_time = 0;
     lun->busy = false;
+    lun->gc_endtime = 0;
 }
 
 static void ssd_init_ch(struct ssd *ssd, struct ssd_channel *ch)
@@ -701,27 +950,7 @@ static void ssd_init_ch(struct ssd *ssd, struct ssd_channel *ch)
     ch->busy = 0;
 }
 
-static void ssd_init_maptbl(struct ssd *ssd)
-{
-    struct bbm_geom *geom = ssd->bbm->geom;
 
-    ssd->maptbl = g_malloc0(sizeof(PseudoPpa) * geom->tt_pgs_log);
-    for (int i = 0; i < geom->tt_pgs_log; i++) {
-        ssd->maptbl[i].ppa = UNMAPPED_PPA; // The mapping table is fairly simple. Just a list of ppa, indexed by lpn.
-    }
-}
-
-static void ssd_init_rmap(struct ssd *ssd)
-{
-    const struct bbm_geom *geom = ssd->bbm->geom;
-
-    ssd->rmap = g_malloc0(sizeof(uint64_t) * geom->tt_pgs_log);
-    for (int i = 0; i < geom->tt_pgs_log; i++) {
-        ssd->rmap[i] = INVALID_LPN;
-    }
-}
-
-/* TODO: I think this does not belong in ftl.c? */
 void ssd_init(FemuCtrl *n)
 {
     struct ssd *ssd = n->ssd;
@@ -751,94 +980,108 @@ void ssd_init(FemuCtrl *n)
         ssd_init_ch(ssd, &ssd->ch[i]); 
     }
 
-    /* initialize pseudophysical maptbl */
-    ssd_init_maptbl(ssd); 
+    /* Create policy engine (holds FTL, backend, pSWD hook arrays) and wire to BBM and backend */
+    ssd->policy_engine = policy_engine_create();
+    bbm_set_policy_engine(ssd->bbm, ssd->policy_engine);
+    policy_engine_set_bbm(ssd->policy_engine, ssd->bbm);
+    ftl_backend_set_pswd_transition_notify(ssd->fb, policy_engine_dispatch_pswd_transition, ssd->policy_engine);
 
-    /* initialize pseudophysical rmap */
-    ssd_init_rmap(ssd); 
-
-    /* initialize all the pseudophysical lines */
-    ssd_init_lines(ssd); 
-
-    /* initialize write pointer, this is how we allocate new pages for writes */
-    ssd_init_write_pointer(ssd); 
-
-    /* Initialize FTL event hooks as inactive */
-    for (int i = 0; i < MAX_FTL_EVENT_HOOKS; ++i) {
-        ssd->hooks[i].active = false;
-        ssd->hooks[i].condition = NULL;
-        ssd->hooks[i].callback = NULL;
-        ssd->hooks[i].context = NULL;
-    }
-
-    /* Initialize FTL Policy API */
+    /* Initialize FTL Policy API (mechanism primitives only) */
     ssd->policy_api = g_malloc0(sizeof(struct FtlPolicyAPI));
     ssd->policy_api->version = 1;
     
-    /* Mapping operations - TODO: need to remove static from these functions */
-    ssd->policy_api->get_maptbl_ent = get_maptbl_ent;
-    ssd->policy_api->set_maptbl_ent = set_maptbl_ent;
-    ssd->policy_api->get_rmap_ent = get_rmap_ent;
-    ssd->policy_api->set_rmap_ent = set_rmap_ent;
+    /* eSWD query operations (mechanism exposes eSWD state) */
+    ssd->policy_api->get_eswd_by_id = get_eswd_by_id;
+    ssd->policy_api->get_eswd_by_ppa = get_eswd_by_ppa;
+    ssd->policy_api->get_eswd_vpc_ipc = get_eswd_vpc_ipc;
+    ssd->policy_api->get_eswd_wp_index = get_eswd_wp_index;
+    ssd->policy_api->get_total_eswds = get_total_eswds;
+    ssd->policy_api->get_total_logical_pages = get_total_logical_pages;
     
-    /* Address validation */
-    ssd->policy_api->valid_lpn = valid_lpn;
-    ssd->policy_api->valid_ppa = valid_ppa;
-    ssd->policy_api->mapped_ppa = mapped_ppa;
+    /* eSWD state modification (mechanism updates eSWD struct) */
+    ssd->policy_api->eswd_set_vpc_ipc = eswd_set_vpc_ipc;
+    ssd->policy_api->eswd_increment_wp = eswd_increment_wp;
+    ssd->policy_api->eswd_reset = eswd_reset;
     
-    /* Page allocation */
-    ssd->policy_api->get_new_page = get_new_page;
-    ssd->policy_api->advance_write_pointer = ssd_advance_write_pointer;
-    ssd->policy_api->get_next_free_line = get_next_free_line;
+    /* eSWD layout query (mechanism owns layout) */
+    ssd->policy_api->eswd_id_to_ppa = eswd_id_to_ppa_wrapper;
+    ssd->policy_api->ppa_to_eswd_id = ppa_to_eswd_id_wrapper;
+    ssd->policy_api->eswd_block_to_ppa = eswd_block_to_ppa_wrapper;
     
-    /* Metadata management */
+    /* Migration and remapping API (mechanism provides) */
+    ssd->policy_api->migrate_eswd_pages = migrate_eswd_pages;
+    ssd->policy_api->remap_eswd_to_physical = remap_eswd_to_physical;
+    
+    /* Validity tracking (mechanism updates backend) */
     ssd->policy_api->mark_page_valid = mark_page_valid;
     ssd->policy_api->mark_page_invalid = mark_page_invalid;
     ssd->policy_api->mark_block_free = mark_block_free;
-    ssd->policy_api->mark_line_free = mark_line_free;
     
-    /* Garbage collection */
-    ssd->policy_api->should_gc = should_gc;
-    ssd->policy_api->should_gc_high = should_gc_high;
-    ssd->policy_api->do_gc = do_gc;
-    ssd->policy_api->select_victim_line = select_victim_line;
-    ssd->policy_api->clean_one_block = clean_one_block;
+    /* Address validation (mechanism checks geometry) */
+    ssd->policy_api->valid_ppa = valid_ppa;
+    ssd->policy_api->mapped_ppa = mapped_ppa;
     
-    /* Block/page accessors */
-    ssd->policy_api->get_blk = get_blk;
-    ssd->policy_api->get_line = get_line;
-    ssd->policy_api->get_pg = get_pg;
+    /* Hardware accessors (mechanism provides) */
     ssd->policy_api->get_lun = get_lun;
     ssd->policy_api->get_ch = get_ch;
     
-    /* Buffer helpers */
+    /* Buffer helpers (mechanism provides) */
     ssd->policy_api->get_request_buffer_size = ftl_get_request_buffer_size;
     ssd->policy_api->copy_request_data = ftl_copy_request_data;
     ssd->policy_api->write_request_data = ftl_write_request_data;
-    
-    /* Default FTL implementations (for policies to call or wrap) */
-    ssd->policy_api->default_read = ssd_read;
-    ssd->policy_api->default_write = ssd_write;
-    
-    /* Geometry information */
-    ssd->policy_api->get_total_logical_pages = get_total_logical_pages;
-    
-    /* Hook registration */
-    ssd->policy_api->register_hook = ftl_register_hook;
-    
-    /* BBM API pass-through */
+
+    /* Hook registration (mechanism provides event system) */
+    ssd->policy_api->register_nvme_hook = ftl_register_nvme_hook;
+    ssd->policy_api->unregister_nvme_hook = ftl_unregister_nvme_hook;
+    ssd->policy_api->inactivate_nvme_hook = ftl_inactivate_nvme_hook;
+    ssd->policy_api->reactivate_nvme_hook = ftl_reactivate_nvme_hook;
+    ssd->policy_api->register_backend_hook = ftl_register_backend_hook;
+    ssd->policy_api->unregister_backend_hook = ftl_unregister_backend_hook;
+    ssd->policy_api->inactivate_backend_hook = ftl_inactivate_backend_hook;
+    ssd->policy_api->reactivate_backend_hook = ftl_reactivate_backend_hook;
+    ssd->policy_api->register_pswd_transition_hook = ftl_register_pswd_transition_hook;
+    ssd->policy_api->unregister_pswd_transition_hook = ftl_unregister_pswd_transition_hook;
+    ssd->policy_api->inactivate_pswd_transition_hook = ftl_inactivate_pswd_transition_hook;
+    ssd->policy_api->reactivate_pswd_transition_hook = ftl_reactivate_pswd_transition_hook;
+    ssd->policy_api->register_background_hook = ftl_register_background_hook;
+    ssd->policy_api->unregister_background_hook = ftl_unregister_background_hook;
+    ssd->policy_api->inactivate_background_hook = ftl_inactivate_background_hook;
+    ssd->policy_api->reactivate_background_hook = ftl_reactivate_background_hook;
+
+    /* eSWD config (policy sets at init) */
+    ssd->policy_api->set_eswd_config = set_eswd_config;
+
+    /* User read through BBM (mechanism builds PPA list via policy resolver and calls BBM) */
+    ssd->policy_api->read_user_request = ftl_read_user_request;
+    ssd->policy_api->write_user_request = ftl_write_user_request;
+
+    /* BBM API pass-through (mechanism provides backend operations) */
     ssd->policy_api->bbm_api = ssd->bbm->policy_api;
 
-    /* Initialize bootstrap policy to handle default I/O and policy loading */
-    if (init_policy(ssd) != 0) {
-        fprintf(stderr, "[FTL] Failed to initialize bootstrap policy\n");
+    /* Block interface policy sets eSWD config via API (then we compute layout from it) */
+    block_interface_policy_apply_eswd_config(ssd); // TODO: This should be done in the policy init function.
+
+    /* Compute eSWD layout from config (policy-set above) and geometry */
+    const struct bbm_geom *geom = ssd->bbm->geom;
+    if (eswd_layout_compute(&ssd->eswd_layout, &ssd->eswd_config, geom) != 0) {
+        fprintf(stderr, "[FTL] Failed to compute eSWD layout\n");
+        return;
+    }
+
+    /* Initialize eSWDs from eSWD layout (must exist before block policy init) */
+    ssd_init_eswds(ssd);
+
+    /* Initialize block interface policy to handle I/O (requires tt_eswds and eswds) */
+    if (init_block_interface_policy(ssd) != 0) {
+        fprintf(stderr, "[FTL] Failed to initialize block interface policy\n");
     }
 
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
                        QEMU_THREAD_JOINABLE);
 }
 
-// Checks that the ppa is in range. 
+/* --- Address validation and channel/LUN accessors --- */
+/* Check that the PPA is in range. BBM indexes by (ch, lun, blk) with blk < blks_per_lun_log. */
 bool valid_ppa(struct ssd *ssd, PseudoPpa *ppa)
 {
     const struct bbm_geom *geom = ssd->bbm->geom;
@@ -849,9 +1092,9 @@ bool valid_ppa(struct ssd *ssd, PseudoPpa *ppa)
     int pg = ppa->g.pg;
     int sec = ppa->g.sec;
 
-    if (ch >= 0 && ch < geom->nchs && lun >= 0 && lun < geom->luns_per_ch && pl >=
-        0 && pl < geom->pls_per_lun && blk >= 0 && blk < geom->blks_per_pl_log && pg
-        >= 0 && pg < geom->pgs_per_blk && sec >= 0 && sec < geom->secs_per_pg)
+    if (ch >= 0 && ch < (int)geom->nchs && lun >= 0 && lun < (int)geom->luns_per_ch &&
+        pl >= 0 && pl < (int)geom->pls_per_lun && blk >= 0 && blk < (int)geom->blks_per_lun_log &&
+        pg >= 0 && pg < (int)geom->pgs_per_blk && sec >= 0 && sec < (int)geom->secs_per_pg)
         return true;
 
     return false;
@@ -878,639 +1121,10 @@ struct nand_lun *get_lun(struct ssd *ssd, PseudoPpa *ppa)
     return &(ch->lun[ppa->g.lun]);
 }
 
-static inline struct nand_plane *get_pl(struct ssd *ssd, PseudoPpa *ppa)
-{
-    struct nand_lun *lun = get_lun(ssd, ppa);
-    return &(lun->pl[ppa->g.pl]);
-}
-
-struct nand_block *get_blk(struct ssd *ssd, PseudoPpa *ppa)
-{
-    struct nand_plane *pl = get_pl(ssd, ppa);
-    return &(pl->blk[ppa->g.blk]);
-}
-
-struct line *get_line(struct ssd *ssd, PseudoPpa *ppa)
-{
-    return &(ssd->lm.lines[ppa->g.blk]);
-}
-
-struct nand_page *get_pg(struct ssd *ssd, PseudoPpa *ppa)
-{
-    struct nand_block *blk = get_blk(ssd, ppa);
-    return &(blk->pg[ppa->g.pg]);
-}
-
-
-// This is purely timing simulation, given a nand command 
-// static uint64_t ssd_advance_status(struct ssd *ssd, PseudoPpa *ppa, struct
-//         nand_cmd *ncmd)
-// {
-//     int c = ncmd->cmd;
-//     uint64_t cmd_stime = (ncmd->stime == 0) ?
-//         qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : ncmd->stime;
-//     uint64_t nand_stime;
-//     struct ssdparams *spp = &ssd->sp;
-//     struct nand_lun *lun = get_lun(ssd, ppa);
-//     uint64_t lat = 0;
-
-//     switch (c) {
-//     case NAND_READ:
-//         /* read: perform NAND cmd first */
-//         nand_stime = (lun->next_lun_avail_time < cmd_stime) ? cmd_stime :
-//                      lun->next_lun_avail_time; // This is where parallelism is introduced. We can access different luns at the same time,
-//                                                // but a given lun has a time delay to perform the operation
-//         lun->next_lun_avail_time = nand_stime + spp->pg_rd_lat; // the lun is now busy
-//         lat = lun->next_lun_avail_time - cmd_stime;
-// #if 0
-//         lun->next_lun_avail_time = nand_stime + spp->pg_rd_lat;
-
-//         /* read: then data transfer through channel */
-//         chnl_stime = (ch->next_ch_avail_time < lun->next_lun_avail_time) ?
-//             lun->next_lun_avail_time : ch->next_ch_avail_time;
-//         ch->next_ch_avail_time = chnl_stime + spp->ch_xfer_lat;
-
-//         lat = ch->next_ch_avail_time - cmd_stime;
-// #endif
-//         break;
-
-//     case NAND_WRITE:
-//         /* write: transfer data through channel first */
-//         nand_stime = (lun->next_lun_avail_time < cmd_stime) ? cmd_stime :
-//                      lun->next_lun_avail_time;
-//         if (ncmd->type == USER_IO) {
-//             lun->next_lun_avail_time = nand_stime + spp->pg_wr_lat;
-//         } else {
-//             lun->next_lun_avail_time = nand_stime + spp->pg_wr_lat;
-//         }
-//         lat = lun->next_lun_avail_time - cmd_stime;
-
-// #if 0
-//         chnl_stime = (ch->next_ch_avail_time < cmd_stime) ? cmd_stime :
-//                      ch->next_ch_avail_time;
-//         ch->next_ch_avail_time = chnl_stime + spp->ch_xfer_lat;
-
-//         /* write: then do NAND program */
-//         nand_stime = (lun->next_lun_avail_time < ch->next_ch_avail_time) ?
-//             ch->next_ch_avail_time : lun->next_lun_avail_time;
-//         lun->next_lun_avail_time = nand_stime + spp->pg_wr_lat;
-
-//         lat = lun->next_lun_avail_time - cmd_stime;
-// #endif
-//         break;
-
-//     case NAND_ERASE:
-//         /* erase: only need to advance NAND status */
-//         nand_stime = (lun->next_lun_avail_time < cmd_stime) ? cmd_stime :
-//                      lun->next_lun_avail_time;
-//         lun->next_lun_avail_time = nand_stime + spp->blk_er_lat;
-
-//         lat = lun->next_lun_avail_time - cmd_stime;
-//         break;
-
-//     default:
-//         ftl_err("Unsupported NAND command: 0x%x\n", c);
-//     }
-
-//     return lat;
-// }
-
-/* update SSD status about one page from PG_VALID -> PG_INVALID */
-/* Josh: These are completely metadata updates. Part of "mapping" */
-void mark_page_invalid(struct ssd *ssd, PseudoPpa *ppa)
-{
-    struct line_mgmt *lm = &ssd->lm;
-    const struct bbm_geom *geom = ssd->bbm->geom;
-    struct nand_block *blk = NULL;
-    struct nand_page *pg = NULL;
-    bool was_full_line = false;
-    struct line *line;
-
-    /* update corresponding page status */
-    pg = get_pg(ssd, ppa);
-    ftl_assert(pg->status == PG_VALID);
-    pg->status = PG_INVALID;
-
-    /* update corresponding block status */
-    blk = get_blk(ssd, ppa);
-    ftl_assert(blk->ipc >= 0 && blk->ipc < geom->pgs_per_blk);
-    blk->ipc++;
-    ftl_assert(blk->vpc > 0 && blk->vpc <= geom->pgs_per_blk);
-    blk->vpc--;
-
-    /* update corresponding line status */
-    line = get_line(ssd, ppa);
-    ftl_assert(line->ipc >= 0 && line->ipc < geom->pgs_per_line);
-    if (line->vpc == geom->pgs_per_line) {
-        ftl_assert(line->ipc == 0);
-        was_full_line = true;
-    }
-    line->ipc++;
-    ftl_assert(line->vpc > 0 && line->vpc <= geom->pgs_per_line);
-    /* Adjust the position of the victime line in the pq under over-writes */
-    if (line->pos) {
-        /* Note that line->vpc will be updated by this call */
-        pqueue_change_priority(lm->victim_line_pq, line->vpc - 1, line);
-    } else {
-        line->vpc--;
-    }
-
-    if (was_full_line) {
-        /* move line: "full" -> "victim" */
-        QTAILQ_REMOVE(&lm->full_line_list, line, entry);
-        lm->full_line_cnt--;
-        pqueue_insert(lm->victim_line_pq, line);
-        lm->victim_line_cnt++;
-    }
-}
-
-/* Josh: These are completely metadata updates. Part of "mapping" */
-void mark_page_valid(struct ssd *ssd, PseudoPpa *ppa)
-{
-    const struct bbm_geom *geom = ssd->bbm->geom;
-    struct nand_block *blk = NULL;
-    struct nand_page *pg = NULL;
-    struct line *line;
-
-    /* update page status */
-    pg = get_pg(ssd, ppa);
-    ftl_assert(pg->status == PG_FREE);
-    pg->status = PG_VALID;
-
-    /* update corresponding block status */
-    blk = get_blk(ssd, ppa);
-    ftl_assert(blk->vpc >= 0 && blk->vpc < geom->pgs_per_blk);
-    blk->vpc++;
-
-    /* update corresponding line status */
-    line = get_line(ssd, ppa);
-    ftl_assert(line->vpc >= 0 && line->vpc < geom->pgs_per_line);
-    line->vpc++;
-    
-    /* Suppress unused variable warning when FEMU_DEBUG_FTL is disabled */
-    (void)geom;
-}
-
-/* Josh: Note: the calling of this function should be a policy level decision.*/
-/* Of course, it is needed as a subfunction for many policies. */
+/* Backend clears per-block validity; policy calls this after cleaning a block (e.g. in migration). */
 void mark_block_free(struct ssd *ssd, PseudoPpa *ppa)
 {
-    const struct bbm_geom *geom = ssd->bbm->geom;
-    struct nand_block *blk = get_blk(ssd, ppa);
-    struct nand_page *pg = NULL;
-
-    for (int i = 0; i < geom->pgs_per_blk; i++) {
-        /* reset page status */
-        pg = &blk->pg[i];
-        ftl_assert(pg->nsecs == geom->secs_per_pg);
-        pg->status = PG_FREE;
-    }
-
-    /* reset block status */
-    ftl_assert(blk->npgs == geom->pgs_per_blk);
-    blk->ipc = 0;
-    blk->vpc = 0;
-  //  blk->erase_cnt++; /* TODO: This is taken care of in the backend.  =*/
-}
-
-/* TODO: Again this can be ignored for now because it is policy level, but this really does nothing. 
- * Other than simulate timing, which is handled in the backend now anyways. */
-static void gc_read_page(struct ssd *ssd, PseudoPpa *ppa)
-{
-    /* Read page for GC operation */
-    if (ssd->fb->sp.enable_gc_delay) {
-        struct BbmEvent event;
-        event.cmd = BBM_EVENT_READ;
-        event.type = BBM_EVENT_POLICY_IO;
-        event.count = 1;
-        event.status_list = NULL;
-        event.stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-        event.lat = 0;
-
-        uint64_t page_size = ssd->fb->sp.secs_per_pg * ssd->fb->sp.secsz;
-        /* We don't actually need the data in a buffer for GC, just simulate timing */
-        bbm_raw_read(ssd->fb, ssd->bbm, NULL, ppa, 1, page_size, &event);
-        //bbm_event_handle();
-    }
-}
-
-/* move valid page data (already in DRAM) from victim line to a new page */
-static uint64_t gc_write_page(struct ssd *ssd, PseudoPpa *old_ppa)
-{
-    PseudoPpa new_ppa;
-    struct nand_lun *new_lun;
-    uint64_t lpn = get_rmap_ent(ssd, old_ppa);
-
-    ftl_assert(valid_lpn(ssd, lpn));
-    new_ppa = get_new_page(ssd);
-    /* update maptbl */
-    set_maptbl_ent(ssd, lpn, &new_ppa);
-    /* update rmap */
-    set_rmap_ent(ssd, lpn, &new_ppa);
-
-    mark_page_valid(ssd, &new_ppa);
-
-    /* need to advance the write pointer here */
-    ssd_advance_write_pointer(ssd);
-
-    /* Write page for GC operation */
-    if (ssd->fb->sp.enable_gc_delay) {
-        struct BbmEvent event;
-        event.cmd = BBM_EVENT_WRITE;
-        event.type = BBM_EVENT_POLICY_IO;
-        event.count = 1;
-        event.status_list = NULL;
-        event.stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-        event.lat = 0;
-
-        uint64_t page_size = ssd->fb->sp.secs_per_pg * ssd->fb->sp.secsz;
-        /* We don't actually need to provide data buffer for GC write, just simulate timing */
-        bbm_raw_write(ssd->fb, ssd->bbm, NULL, &new_ppa, 1, page_size, &event);
-       // bbm_event_handle();
-
-        /* advance per-ch gc_endtime as well */
-        new_lun = get_lun(ssd, &new_ppa);
-        new_lun->gc_endtime = new_lun->next_lun_avail_time;
-    }
-
-    return 0;
-}
-
-struct line *select_victim_line(struct ssd *ssd, bool force)
-{
-    const struct bbm_geom *geom = ssd->bbm->geom;
-    struct line_mgmt *lm = &ssd->lm;
-    struct line *victim_line = NULL;
-
-    victim_line = pqueue_peek(lm->victim_line_pq);
-    if (!victim_line) {
-        return NULL;
-    }
-
-    if (!force && victim_line->ipc < geom->pgs_per_line / 8) {
-        return NULL;
-    }
-
-    pqueue_pop(lm->victim_line_pq);
-    victim_line->pos = 0;
-    lm->victim_line_cnt--;
-
-    /* victim_line is a danggling node now */
-    return victim_line;
-}
-
-/* here ppa identifies the block we want to clean */
-void clean_one_block(struct ssd *ssd, PseudoPpa *ppa)
-{
-    const struct bbm_geom *geom = ssd->bbm->geom;
-    struct nand_page *pg_iter = NULL;
-    int cnt = 0;
-
-    for (int pg = 0; pg < geom->pgs_per_blk; pg++) {
-        ppa->g.pg = pg;
-        pg_iter = get_pg(ssd, ppa);
-        /* there shouldn't be any free page in victim blocks */
-        ftl_assert(pg_iter->status != PG_FREE);
-        if (pg_iter->status == PG_VALID) {
-            gc_read_page(ssd, ppa);
-            /* delay the maptbl update until "write" happens */
-            gc_write_page(ssd, ppa);
-            cnt++;
-        }
-    }
-
-    ftl_assert(get_blk(ssd, ppa)->vpc == cnt);
-}
-
-void mark_line_free(struct ssd *ssd, PseudoPpa *ppa)
-{
-    struct line_mgmt *lm = &ssd->lm;
-    struct line *line = get_line(ssd, ppa);
-    line->ipc = 0;
-    line->vpc = 0;
-    /* move this line to free line list */
-    QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
-    lm->free_line_cnt++;
-}
-
-int do_gc(struct ssd *ssd, bool force)
-{
-    struct line *victim_line = NULL;
-    const struct bbm_geom *geom = ssd->bbm->geom;
-    struct ssdparams *spp = &ssd->fb->sp;
-    struct nand_lun *lunp;
-    PseudoPpa ppa;
-    int ch, lun;
-
-    victim_line = select_victim_line(ssd, force);
-    if (!victim_line) {
-        return -1;
-    }
-
-    ppa.g.blk = victim_line->id;
-    ftl_debug("GC-ing line:%d,ipc=%d,victim=%d,full=%d,free=%d\n", ppa.g.blk,
-              victim_line->ipc, ssd->lm.victim_line_cnt, ssd->lm.full_line_cnt,
-              ssd->lm.free_line_cnt);
-
-    /* copy back valid data */
-    for (ch = 0; ch < geom->nchs; ch++) {
-        for (lun = 0; lun < geom->luns_per_ch; lun++) {
-            ppa.g.ch = ch;
-            ppa.g.lun = lun;
-            ppa.g.pl = 0;
-            lunp = get_lun(ssd, &ppa);
-            clean_one_block(ssd, &ppa);
-            mark_block_free(ssd, &ppa);
-
-            /* Erase block for GC operation */
-            if (spp->enable_gc_delay) {
-                struct BbmEvent event;
-                event.cmd = BBM_EVENT_ERASE;
-                event.type = BBM_EVENT_POLICY_IO;
-                event.count = 1;
-                event.status_list = NULL;
-                event.stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-                event.lat = 0;
-
-                /* Convert PseudoPpa to PseudoPba for erase (block-level operation) */
-                PseudoPba ppba;
-                ppba.g.ch = ppa.g.ch;
-                ppba.g.lun = ppa.g.lun;
-                ppba.g.pl = ppa.g.pl;
-                ppba.g.blk = ppa.g.blk;
-
-                bbm_raw_erase(ssd->fb, ssd->bbm, &ppba, 1, &event);
-               // bbm_event_handle();
-
-                lunp->gc_endtime = lunp->next_lun_avail_time;
-            }
-        }
-    }
-
-    /* update line status */
-    mark_line_free(ssd, &ppa);
-
-    return 0;
-}
-
-uint64_t ftl_read(struct ssd *ssd, NvmeRequest *req) {
-    struct FtlEvent event;
-    ftl_fill_read_event(ssd, req, &event);
-    return ftl_event_handle(ssd, &event);
-}
-
-static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
-{
-
-
-  //  FTLEvent *event = gen_ftl_read_event(ssd, req);
-   // ftl_read_event_handle(event);
-
-    struct ssdparams *spp = &ssd->fb->sp; 
-    const struct bbm_geom *geom = ssd->bbm->geom;
-    uint64_t lba = req->slba;
-    int nsecs = req->nlb;
-    PseudoPpa ppa;
-    uint64_t start_lpn = lba / geom->secs_per_pg;
-    uint64_t end_lpn = (lba + nsecs - 1) / geom->secs_per_pg;
-    uint64_t lpn_cnt = end_lpn - start_lpn + 1;
-    uint64_t lpn;
-
-    if (end_lpn >= geom->tt_pgs_log) {
-        ftl_err("start_lpn=%"PRIu64",tt_pgs=%"PRIu64"\n", start_lpn, (uint64_t)geom->tt_pgs_log);
-    }
-
-    PseudoPpa *ppa_list = g_malloc0(sizeof(PseudoPpa) * lpn_cnt);
-    int ppa_idx = 0;
-    /* normal IO read path */
-    for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-        ppa = get_maptbl_ent(ssd, lpn);
-        if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) {
-            //printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
-            //printf("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n",
-            //ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
-            continue;
-        }
-
-        ppa_list[ppa_idx++] = ppa;
-    }
-
-    /* Create BBM event to track latency */
-    struct BbmEvent event;
-    event.cmd = BBM_EVENT_READ;
-    event.type = BBM_EVENT_USER_IO;
-    event.count = ppa_idx;
-    /* FTL owns status_list: allocate if you want per-page status, free after call. */
-    event.status_list = (ppa_idx > 0) ? g_malloc0(sizeof(int) * ppa_idx) : NULL;
-    event.stime = req->stime;
-    event.lat = 0;
-
-    uint64_t page_size = spp->secs_per_pg * spp->secsz;
-    bbm_read(ssd->fb, ssd->bbm, req, ppa_list, ppa_idx, page_size, &event);
- //  bbm_event_handle();
-    g_free(event.status_list);
-    event.status_list = NULL;
-    g_free(ppa_list);
-
-    return event.lat;
-}
-
-uint64_t ftl_write(struct ssd *ssd, NvmeRequest *req) {
-    struct FtlEvent event;
-    ftl_fill_write_event(ssd, req, &event);
-    return ftl_event_handle(ssd, &event);
-}
-
-static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
-{
-   // ftl_debug("ssd_write called\n");
-
-    // As an always existing policy, I need 
-    // something which checks if the request is for specific locations
-    // related to the exensiblity design itself.
-    // especially, there should be a location whose semantics are
-    // the command to LOAD policies into relevant tables. 
-   // FTLEvent *event = gen_ftl_write_event(ssd, req);
-  //  ftl_write_event_handle(event);
-    
-    uint64_t lba = req->slba;
-    const struct bbm_geom *geom = ssd->bbm->geom;
-    const struct ssdparams *spp = &ssd->fb->sp;
-    int len = req->nlb;
-    uint64_t start_lpn = lba / spp->secs_per_pg; // so LBA is a sector number? (it seems that sector is a logical concept?)
-    uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
-    uint64_t lpn_cnt = end_lpn - start_lpn + 1;
-    PseudoPpa ppa;
-    uint64_t lpn;
-    ftl_debug("start_lpn=%"PRIu64",end_lpn=%"PRIu64"\n", start_lpn, end_lpn);
-    ftl_debug("lpn_cnt=%"PRIu64"\n", lpn_cnt);
-
-
-    PseudoPpa *ppa_list = g_malloc0(sizeof(PseudoPpa) * lpn_cnt);
-    int ppa_idx = 0;
-    if (end_lpn >= geom->tt_pgs_log) { /* tt_pgs is the total number of pages in the FTL
-                                   * however, we should use the logical geometry here not the physical geometry. */
-        ftl_err("start_lpn=%"PRIu64",tt_pgs=%"PRIu64"\n", start_lpn, (uint64_t)geom->tt_pgs_log);
-    }
-
-    // TODO: GC should be a policy attached to the write "event".
-    // Or at least, checking if GC needs to be done.
-
-
-//    while (should_gc_high(ssd)) {
-//        /* perform GC here until !should_gc(ssd) */
-//        r = do_gc(ssd, true);
-//        if (r == -1)
-//            break;
-//    }
-
-    for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-        ppa = get_maptbl_ent(ssd, lpn); /* TODO: This gets the ppa for the given lpn.
-                                           Notably, this is the ppa before the write occurs.
-                                           This is useful for any versioning system. 
-                                           This code is where the mapping explicitly changes.
-                                           This is an event that we can attach a policy to. 
-                                           The policy can be to keep track of the previous 
-                                           mapping! (it is certainly possible
-                                           to create a traversable linked list here!) */
-                                      
-        if (mapped_ppa(&ppa)) {
-            /* update old page information first */
-            mark_page_invalid(ssd, &ppa);
-            set_rmap_ent(ssd, INVALID_LPN, &ppa);
-        }
-
-        /* new write */
-        ppa = get_new_page(ssd);
-        /* update maptbl */
-        set_maptbl_ent(ssd, lpn, &ppa); /* TODO: This is a change in fundamental metadata. 
-                                           It should be propigated as an event? with
-                                           something something previous mapping attached
-                                           to it? */
-        /* update rmap */
-        set_rmap_ent(ssd, lpn, &ppa); /* This seems like internal bookkeeping? probably does
-                                        not need to be exposed to the upper layer. */
-
-        mark_page_valid(ssd, &ppa);  // TODO: what does this do? 
-                                     // It marks a newly allocated pseudophysical page
-                                     // as containing live data.
-                                     // PG_FREE to PG_VALID.
-                                     // So this is needed here, and it is different from
-                                     // marking a page FREE. 
-                                     // Note that this is internal bookkeeping,
-                                     // and I think it should not be tied to an event.
-
-        ppa_list[ppa_idx++] = ppa;
-
-        /* need to advance the write pointer here */
-        ssd_advance_write_pointer(ssd); // TODO: The construction of the
-                                        // write pointer linked list needs to be customizable.
-                                        // This is fundamenally a policy decision. 
-                                        // Can this fit into the event system?
-    }
-
-    /* Create BBM event */
-    struct BbmEvent event;
-    event.cmd = BBM_EVENT_WRITE;
-    event.type = BBM_EVENT_USER_IO;
-    event.count = ppa_idx;
-    /* FTL owns status_list: allocate if you want per-page status, free after call. */
-    event.status_list = (ppa_idx > 0) ? g_malloc0(sizeof(int) * ppa_idx) : NULL;
-    event.stime = req->stime;
-    event.lat = 0;
-
-    /* Call backend to move data. */
-    uint64_t page_size = (uint64_t)spp->secs_per_pg * spp->secsz;
-    bbm_write(ssd->fb, ssd->bbm, req, ppa_list, ppa_idx, page_size, &event);
- //   bbm_event_handle();
-    g_free(event.status_list);
-    event.status_list = NULL;
-    g_free(ppa_list);
-
-    return event.lat;
-}
-
-static uint64_t ssd_trim(struct ssd *ssd, NvmeRequest *req)
-{
-    const struct bbm_geom *geom = ssd->bbm->geom;
-    NvmeDsmRange *ranges = req->dsm_ranges;
-    int nr_ranges = req->dsm_nr_ranges;
-    // uint32_t attributes = req->dsm_attributes;
-    
-    int total_trimmed_pages = 0;
-    int total_already_invalid = 0;
-    int total_out_of_bounds = 0;
-    
-    if (!ranges || nr_ranges <= 0) {
-        printf("TRIM: Invalid ranges or count\n");
-        return 0;
-    }
-    
-    // printf("TRIM: Processing %d ranges (attributes=0x%x)\n", nr_ranges, attributes);
-    
-    for (int range_idx = 0; range_idx < nr_ranges; range_idx++) {
-        uint64_t slba = le64_to_cpu(ranges[range_idx].slba);
-        uint32_t nlb = le32_to_cpu(ranges[range_idx].nlb);
-        // uint32_t cattr = le32_to_cpu(ranges[range_idx].cattr);
-        
-        uint64_t start_lpn = slba / geom->secs_per_pg;
-        uint64_t end_lpn = (slba + nlb - 1) / geom->secs_per_pg;
-        uint64_t lpn;
-        PseudoPpa ppa;
-        int trimmed_pages = 0;
-        int already_invalid = 0;
-
-        // ftl_debug("TRIM Range %d: LBA %lu + %u sectors, LPN range %lu-%lu (%lu pages), cattr=0x%x\n", 
-        //        range_idx, slba, nlb, start_lpn, end_lpn, end_lpn - start_lpn + 1, cattr);
-
-        // Boundary check
-        if (end_lpn >= geom->tt_pgs_log) {
-            ftl_err("TRIM: Range %d exceeds FTL capacity - end_lpn=%"PRIu64", tt_pgs=%"PRIu64"\n", 
-                   range_idx, end_lpn, (uint64_t)geom->tt_pgs_log);
-            total_out_of_bounds++;
-            continue;  // Skip this range, continue with others
-        }
-
-        // Process each LPN in this range
-        for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-            ppa = get_maptbl_ent(ssd, lpn);
-            
-            // Skip already unmapped/invalid pages
-            if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) {
-                already_invalid++;
-                continue;
-            }
-
-            // Invalidate the existing mapped page
-            mark_page_invalid(ssd, &ppa);
-            
-            // Clear reverse mapping
-            set_rmap_ent(ssd, INVALID_LPN, &ppa);
-            
-            // Set mapping table entry as unmapped
-            ppa.ppa = UNMAPPED_PPA;
-            set_maptbl_ent(ssd, lpn, &ppa);
-            
-            trimmed_pages++;
-        }
-        
-        total_trimmed_pages += trimmed_pages;
-        total_already_invalid += already_invalid;
-        
-        // ftl_debug("TRIM Range %d: %d pages trimmed, %d already invalid\n", 
-        //        range_idx, trimmed_pages, already_invalid);
-    }
-
-    // ftl_debug("TRIM: Completed - %d pages trimmed, %d already invalid, %d out of bounds across %d ranges\n", 
-    //        total_trimmed_pages, total_already_invalid, total_out_of_bounds, nr_ranges);
-
-    // Free the ranges array
-    g_free(ranges);
-    req->dsm_ranges = NULL;
-    req->dsm_nr_ranges = 0;
-    req->dsm_attributes = 0;
-
-    return 0;  // Assume TRIM operations have no NAND latency
+    ssd->policy_api->bbm_api->mark_block_free(ssd->fb, ssd->bbm, ppa);
 }
 
 static void *ftl_thread(void *arg)
@@ -1536,28 +1150,12 @@ static void *ftl_thread(void *arg)
                 continue;
 
             rc = femu_ring_dequeue(ssd->to_ftl[i], (void *)&req, 1);
-            if (rc != 1) {
-                printf("FEMU: FTL to_ftl dequeue failed\n");
-            }
-
+            ftl_assert(rc == 1);
             ftl_assert(req);
-            switch (req->cmd.opcode) {
-            case NVME_CMD_WRITE:
-               // lat = ssd_write(ssd, req);
-                lat = ftl_write(ssd, req);
-                break;
-            case NVME_CMD_READ:
-               // lat = ssd_read(ssd, req);
-                lat = ftl_read(ssd, req);
-                break;
-            case NVME_CMD_DSM:
-                if (req->dsm_ranges && req->dsm_nr_ranges > 0) {
-                    lat = ssd_trim(ssd, req);
-                }
-                break;
-            default:
-                //ftl_err("FTL received unkown request type, ERROR\n");
-                ;
+            {
+                struct NvmeCommandEvent nvme_event;
+                ftl_fill_nvme_event(ssd, req, &nvme_event);
+                lat = policy_engine_dispatch_nvme_cmd(ssd->policy_engine, ssd, &nvme_event);
             }
 
             req->reqlat = lat;
@@ -1568,10 +1166,8 @@ static void *ftl_thread(void *arg)
                 ftl_err("FTL to_poller enqueue failed\n");
             }
 
-            /* clean one line if needed (in the background) */
-            if (should_gc(ssd)) {
-                do_gc(ssd, false);
-            }
+            /* Background event: policy engine runs registered hooks (e.g. if should_gc do_gc) */
+            policy_engine_dispatch_background_event(ssd->policy_engine, ssd);
         }
     }
 

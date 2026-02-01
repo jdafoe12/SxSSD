@@ -250,35 +250,13 @@ typedef void (*BackendEventHookCallback)(struct FtlBackend *fb,
                                          void *context);
 
 /*
- * Register a BBM backend event hook
- * 
- * Parameters:
- *   - ctx: BBM context
- *   - condition: function determining when to trigger (NULL = always)
- *   - callback: function to call on event
- *   - context: policy-specific data
- * 
- * Returns: hook handle (>= 0) on success, -1 on failure
+ * Hook registration (backend events, pSWD state transitions) is done via the
+ * FTL policy API, not via BBM. In init_policy(ssd, api), use:
+ *   api->register_backend_hook(ssd, condition, callback, context);
+ *   api->register_pswd_transition_hook(ssd, condition, callback, context);
+ * and the corresponding unregister/inactivate/reactivate functions.
+ * bbm_api is for I/O and validity only (raw_read, get_page_status, get_block_vpc_ipc, etc.).
  */
-int bbm_register_hook(struct bbm *ctx,
-                      BackendEventHookCondition condition,
-                      BackendEventHookCallback callback,
-                      void *context);
-
-/*
- * Unregister a BBM event hook
- */
-int bbm_unregister_hook(struct bbm *ctx, int hook_handle);
-
-/*
- * Temporarily deactivate a hook (without unregistering)
- */
-int bbm_inactivate_hook(struct bbm *ctx, int hook_handle);
-
-/*
- * Reactivate a previously deactivated hook
- */
-int bbm_reactivate_hook(struct bbm *ctx, int hook_handle);
 
 #endif /* FEMU_BBM_POLICY_H */
 

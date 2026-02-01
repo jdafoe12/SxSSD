@@ -1,5 +1,6 @@
 #include "../nvme.h"
 #include "./ftl.h"
+#include "./policy-engine.h"
 
 static void bb_init_ctrl_str(FemuCtrl *n)
 {
@@ -76,14 +77,42 @@ static uint16_t bb_nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     return nvme_rw(n, ns, cmd, req);
 }
 
+static uint16_t bb_custom_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+                               NvmeRequest *req)
+{
+    /* Minimal parsing - just enough to route to FTL thread */
+    /* Policy hook will handle all command-specific logic */
+    
+    /* Store opcode in request for ftl_fill_nvme_event() */
+    req->cmd = *cmd;  /* Copy entire command for CDW10-CDW15 access */
+    req->slba = 0;    /* Custom commands may not use SLBA */
+    req->nlb = 0;     /* Custom commands may not use NLB */
+    req->is_write = 0; /* Policy determines data direction */
+    req->status = NVME_SUCCESS;
+    
+    /* If command has data transfer, map PRP/SGL */
+    /* For now, assume no automatic buffer mapping - policy uses buffer API */
+    /* Policies can use copy_request_data/write_request_data for data access */
+    
+    return NVME_SUCCESS;
+}
+
 static uint16_t bb_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
                           NvmeRequest *req)
 {
+    struct ssd *ssd = n->ssd;
+    
     switch (cmd->opcode) {
     case NVME_CMD_READ:
     case NVME_CMD_WRITE:
         return bb_nvme_rw(n, ns, cmd, req);
     default:
+        /* Check if policy has registered a handler for this opcode */
+        if (ssd && ssd->policy_engine && 
+            policy_engine_has_nvme_hook(ssd->policy_engine, cmd->opcode)) {
+            /* Policy will handle this - parse as generic command */
+            return bb_custom_cmd(n, ns, cmd, req);
+        }
         return NVME_INVALID_OPCODE | NVME_DNR;
     }
 }

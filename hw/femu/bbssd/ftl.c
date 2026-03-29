@@ -3,6 +3,7 @@
 #include "policy-engine.h"
 #include "eswd-config.h"
 #include "eswd-layout.h"
+#include "meta-interface-policy.h"
 #include <errno.h>
 //#include "../backend/ftl-backend.h"
 
@@ -166,6 +167,32 @@ uint64_t ftl_write_request_data(NvmeRequest *req, const uint8_t *buffer,
     return written;
 }
 
+const NvmeDsmRange *ftl_get_dsm_ranges(NvmeRequest *req, int *nr_ranges)
+{
+    if (nr_ranges) {
+        *nr_ranges = req ? req->dsm_nr_ranges : 0;
+    }
+    return req ? req->dsm_ranges : NULL;
+}
+
+int ftl_get_gc_thres_lines(struct ssd *ssd)
+{
+    return (ssd && ssd->fb) ? ssd->fb->sp.gc_thres_lines : 0;
+}
+
+int ftl_get_gc_thres_lines_high(struct ssd *ssd)
+{
+    return (ssd && ssd->fb) ? ssd->fb->sp.gc_thres_lines_high : 0;
+}
+
+int ftl_get_page_status(struct ssd *ssd, const PseudoPpa *ppa)
+{
+    if (!ssd || !ssd->policy_api || !ssd->policy_api->bbm_api || !ppa) {
+        return -1;
+    }
+    return ssd->policy_api->bbm_api->get_page_status(ssd->fb, ssd->bbm, ppa);
+}
+
 /* ======================================================== */
 /* FTL API functions for FTL policies to interact with NVMe event hooks */
 /* ======================================================== */
@@ -178,7 +205,7 @@ int ftl_register_nvme_hook(struct ssd *ssd, uint8_t opcode,
     if (!ssd || !callback || !ssd->policy_engine) {
         return -1;
     }
-    return policy_engine_register_nvme_hook(ssd->policy_engine, opcode, condition, callback, context);
+    return pe_register_nvme_hook(ssd->policy_engine, opcode, condition, callback, context);
 }
 
 int ftl_unregister_nvme_hook(struct ssd *ssd, int hook_handle)
@@ -186,7 +213,7 @@ int ftl_unregister_nvme_hook(struct ssd *ssd, int hook_handle)
     if (!ssd || !ssd->policy_engine) {
         return -1;
     }
-    return policy_engine_unregister_nvme_hook(ssd->policy_engine, hook_handle);
+    return pe_unregister_nvme_hook(ssd->policy_engine, hook_handle);
 }
 
 int ftl_inactivate_nvme_hook(struct ssd *ssd, int hook_handle)
@@ -194,7 +221,7 @@ int ftl_inactivate_nvme_hook(struct ssd *ssd, int hook_handle)
     if (!ssd || !ssd->policy_engine) {
         return -1;
     }
-    return policy_engine_inactivate_nvme_hook(ssd->policy_engine, hook_handle);
+    return pe_inactivate_nvme_hook(ssd->policy_engine, hook_handle);
 }
 
 int ftl_reactivate_nvme_hook(struct ssd *ssd, int hook_handle)
@@ -202,7 +229,7 @@ int ftl_reactivate_nvme_hook(struct ssd *ssd, int hook_handle)
     if (!ssd || !ssd->policy_engine) {
         return -1;
     }
-    return policy_engine_reactivate_nvme_hook(ssd->policy_engine, hook_handle);
+    return pe_reactivate_nvme_hook(ssd->policy_engine, hook_handle);
 }
 
 /* ======================================================== */
@@ -215,7 +242,7 @@ int ftl_register_background_hook(struct ssd *ssd, BackgroundHookCondition condit
     if (!ssd || !callback || !ssd->policy_engine) {
         return -1;
     }
-    return policy_engine_register_background_hook(ssd->policy_engine, condition, callback, context);
+    return pe_register_background_hook(ssd->policy_engine, condition, callback, context);
 }
 
 int ftl_unregister_background_hook(struct ssd *ssd, int hook_handle)
@@ -223,7 +250,7 @@ int ftl_unregister_background_hook(struct ssd *ssd, int hook_handle)
     if (!ssd || !ssd->policy_engine) {
         return -1;
     }
-    return policy_engine_unregister_background_hook(ssd->policy_engine, hook_handle);
+    return pe_unregister_background_hook(ssd->policy_engine, hook_handle);
 }
 
 int ftl_inactivate_background_hook(struct ssd *ssd, int hook_handle)
@@ -231,7 +258,7 @@ int ftl_inactivate_background_hook(struct ssd *ssd, int hook_handle)
     if (!ssd || !ssd->policy_engine) {
         return -1;
     }
-    return policy_engine_inactivate_background_hook(ssd->policy_engine, hook_handle);
+    return pe_inactivate_background_hook(ssd->policy_engine, hook_handle);
 }
 
 int ftl_reactivate_background_hook(struct ssd *ssd, int hook_handle)
@@ -239,7 +266,7 @@ int ftl_reactivate_background_hook(struct ssd *ssd, int hook_handle)
     if (!ssd || !ssd->policy_engine) {
         return -1;
     }
-    return policy_engine_reactivate_background_hook(ssd->policy_engine, hook_handle);
+    return pe_reactivate_background_hook(ssd->policy_engine, hook_handle);
 }
 
 /* ======================================================== */
@@ -251,7 +278,7 @@ static int ftl_register_backend_hook(struct ssd *ssd, BackendEventHookCondition 
     if (!ssd || !callback || !ssd->policy_engine) {
         return -1;
     }
-    return policy_engine_register_backend_hook(ssd->policy_engine, condition, callback, context);
+    return pe_register_backend_hook(ssd->policy_engine, condition, callback, context);
 }
 
 static int ftl_unregister_backend_hook(struct ssd *ssd, int hook_handle)
@@ -259,7 +286,7 @@ static int ftl_unregister_backend_hook(struct ssd *ssd, int hook_handle)
     if (!ssd || !ssd->policy_engine) {
         return -1;
     }
-    return policy_engine_unregister_backend_hook(ssd->policy_engine, hook_handle);
+    return pe_unregister_backend_hook(ssd->policy_engine, hook_handle);
 }
 
 static int ftl_inactivate_backend_hook(struct ssd *ssd, int hook_handle)
@@ -267,7 +294,7 @@ static int ftl_inactivate_backend_hook(struct ssd *ssd, int hook_handle)
     if (!ssd || !ssd->policy_engine) {
         return -1;
     }
-    return policy_engine_inactivate_backend_hook(ssd->policy_engine, hook_handle);
+    return pe_inactivate_backend_hook(ssd->policy_engine, hook_handle);
 }
 
 static int ftl_reactivate_backend_hook(struct ssd *ssd, int hook_handle)
@@ -275,7 +302,7 @@ static int ftl_reactivate_backend_hook(struct ssd *ssd, int hook_handle)
     if (!ssd || !ssd->policy_engine) {
         return -1;
     }
-    return policy_engine_reactivate_backend_hook(ssd->policy_engine, hook_handle);
+    return pe_reactivate_backend_hook(ssd->policy_engine, hook_handle);
 }
 
 /* ======================================================== */
@@ -287,7 +314,7 @@ static int ftl_register_pswd_transition_hook(struct ssd *ssd, PswdTransitionHook
     if (!ssd || !callback || !ssd->policy_engine) {
         return -1;
     }
-    return policy_engine_register_pswd_transition_hook(ssd->policy_engine, condition, callback, context);
+    return pe_register_pswd_transition_hook(ssd->policy_engine, condition, callback, context);
 }
 
 static int ftl_unregister_pswd_transition_hook(struct ssd *ssd, int hook_handle)
@@ -295,7 +322,7 @@ static int ftl_unregister_pswd_transition_hook(struct ssd *ssd, int hook_handle)
     if (!ssd || !ssd->policy_engine) {
         return -1;
     }
-    return policy_engine_unregister_pswd_transition_hook(ssd->policy_engine, hook_handle);
+    return pe_unregister_pswd_transition_hook(ssd->policy_engine, hook_handle);
 }
 
 static int ftl_inactivate_pswd_transition_hook(struct ssd *ssd, int hook_handle)
@@ -303,7 +330,7 @@ static int ftl_inactivate_pswd_transition_hook(struct ssd *ssd, int hook_handle)
     if (!ssd || !ssd->policy_engine) {
         return -1;
     }
-    return policy_engine_inactivate_pswd_transition_hook(ssd->policy_engine, hook_handle);
+    return pe_inactivate_pswd_transition_hook(ssd->policy_engine, hook_handle);
 }
 
 static int ftl_reactivate_pswd_transition_hook(struct ssd *ssd, int hook_handle)
@@ -311,7 +338,7 @@ static int ftl_reactivate_pswd_transition_hook(struct ssd *ssd, int hook_handle)
     if (!ssd || !ssd->policy_engine) {
         return -1;
     }
-    return policy_engine_reactivate_pswd_transition_hook(ssd->policy_engine, hook_handle);
+    return pe_reactivate_pswd_transition_hook(ssd->policy_engine, hook_handle);
 }
 
 void ftl_fill_nvme_event(struct ssd *ssd, NvmeRequest *req, struct NvmeCommandEvent *event)
@@ -322,14 +349,34 @@ void ftl_fill_nvme_event(struct ssd *ssd, NvmeRequest *req, struct NvmeCommandEv
     const struct bbm_geom *geom = ssd->bbm->geom;
 
     event->opcode = req->cmd.opcode;
+    event->is_admin = false;
     event->lba = req->slba;
     event->nsecs = req->nlb;
     event->start_lpn = req->slba / geom->secs_per_pg;
     event->end_lpn = (req->slba + req->nlb - 1) / geom->secs_per_pg;
     event->lpn_cnt = event->end_lpn - event->start_lpn + 1;
     event->req = req;
+    event->cmd = &req->cmd;
+    event->ctrl = req->sq ? req->sq->ctrl : NULL;
     event->stime = req->stime;
     event->lat = 0;
+    event->status = NVME_SUCCESS;
+}
+
+void ftl_fill_admin_nvme_event(struct ssd *ssd, FemuCtrl *n, NvmeCmd *cmd,
+                               struct NvmeCommandEvent *event)
+{
+    if (!ssd || !n || !cmd || !event) {
+        return;
+    }
+
+    memset(event, 0, sizeof(*event));
+    event->opcode = cmd->opcode;
+    event->is_admin = true;
+    event->req = NULL;
+    event->cmd = cmd;
+    event->ctrl = n;
+    event->status = NVME_SUCCESS;
 }
 
 /*
@@ -419,6 +466,16 @@ uint64_t get_total_logical_pages(struct ssd *ssd)
     return ssd->bbm->geom->tt_pgs_log;
 }
 
+const struct bbm_geom *get_bbm_geom(struct ssd *ssd)
+{
+    return (ssd && ssd->bbm) ? ssd->bbm->geom : NULL;
+}
+
+const struct eswd_layout *get_eswd_layout(struct ssd *ssd)
+{
+    return ssd ? &ssd->eswd_layout : NULL;
+}
+
 
 uint64_t ppa_to_pgidx(struct ssd *ssd, PseudoPpa *ppa)
 {
@@ -445,6 +502,10 @@ void set_eswd_config(struct ssd *ssd, const struct eswd_config *config)
     if (!ssd || !config || !ssd->bbm || !ssd->bbm->geom) {
         return;
     }
+    if (ssd->eswd_layout_finalized) {
+        ftl_err("[FTL] set_eswd_config: layout already finalized\n");
+        return;
+    }
     const struct bbm_geom *geom = ssd->bbm->geom;
     if (!eswd_config_valid(config, geom->nchs, geom->luns_per_ch,
                            geom->pls_per_lun, geom->blks_per_lun_log)) {
@@ -468,6 +529,32 @@ static void ssd_init_eswds(struct ssd *ssd)
         ssd->eswds[i].vpc = 0;
         ssd->eswds[i].wp_page_index = 0;
     }
+}
+
+int finalize_ftl_init(struct ssd *ssd)
+{
+    const struct bbm_geom *geom;
+
+    if (!ssd || !ssd->bbm || !ssd->bbm->geom) {
+        return -1;
+    }
+    if (ssd->eswd_layout_finalized) {
+        return 0;
+    }
+    if (!ssd->eswd_config_set) {
+        ftl_err("[FTL] finalize_ftl_init: eSWD config has not been set\n");
+        return -1;
+    }
+
+    geom = ssd->bbm->geom;
+    if (eswd_layout_compute(&ssd->eswd_layout, &ssd->eswd_config, geom) != 0) {
+        fprintf(stderr, "[FTL] Failed to compute eSWD layout\n");
+        return -1;
+    }
+
+    ssd->eswd_layout_finalized = true;
+    ssd_init_eswds(ssd);
+    return 0;
 }
 
 /* --- eSWD: lookup --- Definitely mechanism level! */
@@ -981,10 +1068,10 @@ void ssd_init(FemuCtrl *n)
     }
 
     /* Create policy engine (holds FTL, backend, pSWD hook arrays) and wire to BBM and backend */
-    ssd->policy_engine = policy_engine_create();
+    ssd->policy_engine = pe_create();
     bbm_set_policy_engine(ssd->bbm, ssd->policy_engine);
-    policy_engine_set_bbm(ssd->policy_engine, ssd->bbm);
-    ftl_backend_set_pswd_transition_notify(ssd->fb, policy_engine_dispatch_pswd_transition, ssd->policy_engine);
+    pe_set_bbm(ssd->policy_engine, ssd->bbm);
+    ftl_backend_set_pswd_transition_notify(ssd->fb, pe_dispatch_pswd_transition, ssd->policy_engine);
 
     /* Initialize FTL Policy API (mechanism primitives only) */
     ssd->policy_api = g_malloc0(sizeof(struct FtlPolicyAPI));
@@ -997,6 +1084,8 @@ void ssd_init(FemuCtrl *n)
     ssd->policy_api->get_eswd_wp_index = get_eswd_wp_index;
     ssd->policy_api->get_total_eswds = get_total_eswds;
     ssd->policy_api->get_total_logical_pages = get_total_logical_pages;
+    ssd->policy_api->get_bbm_geom = get_bbm_geom;
+    ssd->policy_api->get_eswd_layout = get_eswd_layout;
     
     /* eSWD state modification (mechanism updates eSWD struct) */
     ssd->policy_api->eswd_set_vpc_ipc = eswd_set_vpc_ipc;
@@ -1010,6 +1099,7 @@ void ssd_init(FemuCtrl *n)
     
     /* Migration and remapping API (mechanism provides) */
     ssd->policy_api->migrate_eswd_pages = migrate_eswd_pages;
+    ssd->policy_api->run_migration = ftl_run_migration;
     ssd->policy_api->remap_eswd_to_physical = remap_eswd_to_physical;
     
     /* Validity tracking (mechanism updates backend) */
@@ -1020,6 +1110,7 @@ void ssd_init(FemuCtrl *n)
     /* Address validation (mechanism checks geometry) */
     ssd->policy_api->valid_ppa = valid_ppa;
     ssd->policy_api->mapped_ppa = mapped_ppa;
+    ssd->policy_api->ppa_to_pgidx = ppa_to_pgidx;
     
     /* Hardware accessors (mechanism provides) */
     ssd->policy_api->get_lun = get_lun;
@@ -1029,6 +1120,10 @@ void ssd_init(FemuCtrl *n)
     ssd->policy_api->get_request_buffer_size = ftl_get_request_buffer_size;
     ssd->policy_api->copy_request_data = ftl_copy_request_data;
     ssd->policy_api->write_request_data = ftl_write_request_data;
+    ssd->policy_api->get_dsm_ranges = ftl_get_dsm_ranges;
+    ssd->policy_api->get_gc_thres_lines = ftl_get_gc_thres_lines;
+    ssd->policy_api->get_gc_thres_lines_high = ftl_get_gc_thres_lines_high;
+    ssd->policy_api->get_page_status = ftl_get_page_status;
 
     /* Hook registration (mechanism provides event system) */
     ssd->policy_api->register_nvme_hook = ftl_register_nvme_hook;
@@ -1050,6 +1145,7 @@ void ssd_init(FemuCtrl *n)
 
     /* eSWD config (policy sets at init) */
     ssd->policy_api->set_eswd_config = set_eswd_config;
+    ssd->policy_api->finalize_ftl_init = finalize_ftl_init;
 
     /* User read through BBM (mechanism builds PPA list via policy resolver and calls BBM) */
     ssd->policy_api->read_user_request = ftl_read_user_request;
@@ -1058,22 +1154,8 @@ void ssd_init(FemuCtrl *n)
     /* BBM API pass-through (mechanism provides backend operations) */
     ssd->policy_api->bbm_api = ssd->bbm->policy_api;
 
-    /* Block interface policy sets eSWD config via API (then we compute layout from it) */
-    block_interface_policy_apply_eswd_config(ssd); // TODO: This should be done in the policy init function.
-
-    /* Compute eSWD layout from config (policy-set above) and geometry */
-    const struct bbm_geom *geom = ssd->bbm->geom;
-    if (eswd_layout_compute(&ssd->eswd_layout, &ssd->eswd_config, geom) != 0) {
-        fprintf(stderr, "[FTL] Failed to compute eSWD layout\n");
-        return;
-    }
-
-    /* Initialize eSWDs from eSWD layout (must exist before block policy init) */
-    ssd_init_eswds(ssd);
-
-    /* Initialize block interface policy to handle I/O (requires tt_eswds and eswds) */
-    if (init_block_interface_policy(ssd) != 0) {
-        fprintf(stderr, "[FTL] Failed to initialize block interface policy\n");
+    if (m_interface_policy_init(ssd) != 0) {
+        fprintf(stderr, "[FTL] Failed to initialize meta interface policy\n");
     }
 
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
@@ -1155,7 +1237,7 @@ static void *ftl_thread(void *arg)
             {
                 struct NvmeCommandEvent nvme_event;
                 ftl_fill_nvme_event(ssd, req, &nvme_event);
-                lat = policy_engine_dispatch_nvme_cmd(ssd->policy_engine, ssd, &nvme_event);
+                lat = pe_dispatch_nvme_cmd(ssd->policy_engine, ssd, &nvme_event);
             }
 
             req->reqlat = lat;
@@ -1167,7 +1249,7 @@ static void *ftl_thread(void *arg)
             }
 
             /* Background event: policy engine runs registered hooks (e.g. if should_gc do_gc) */
-            policy_engine_dispatch_background_event(ssd->policy_engine, ssd);
+            pe_dispatch_background_event(ssd->policy_engine, ssd);
         }
     }
 

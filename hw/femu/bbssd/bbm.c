@@ -3,6 +3,30 @@
 #include "./policy-engine.h"
 #include <assert.h>
 
+// TODO: Implement the BBM API!
+
+static uint32_t bbm_phys_blks_per_plane(const struct bbm *ctx)
+{
+    return ctx->geom->blks_per_pl_log + ctx->reserved_per_lun;
+}
+
+static uint64_t bbm_phys_blk_slot_index(const struct bbm *ctx,
+                                        const struct pba *pba)
+{
+    return ((((uint64_t)pba->g.ch * ctx->geom->luns_per_ch) + pba->g.lun)
+            * ctx->geom->pls_per_lun + pba->g.pl) * bbm_phys_blks_per_plane(ctx) +
+           pba->g.blk;
+}
+
+static bool bbm_valid_phys_pba(const struct bbm *ctx, const struct pba *pba)
+{
+    return ctx && ctx->geom && pba &&
+           pba->g.ch < ctx->geom->nchs &&
+           pba->g.lun < ctx->geom->luns_per_ch &&
+           pba->g.pl < ctx->geom->pls_per_lun &&
+           pba->g.blk < bbm_phys_blks_per_plane(ctx);
+}
+
 int bbm_init(struct bbm *ctx, const BbCtrlParams *bbp, const struct ssdparams *phys)
 {
     if (!ctx || !bbp || !phys) {
@@ -66,6 +90,9 @@ int bbm_init(struct bbm *ctx, const BbCtrlParams *bbp, const struct ssdparams *p
     }
 
     ctx->policy_engine = NULL;  /* FTL sets this after policy_engine_create */
+    ctx->total_phys_blks = (uint64_t)bbp->nchs * bbp->luns_per_ch *
+                           bbp->pls_per_lun * bbm_phys_blks_per_plane(ctx);
+    ctx->excluded_phys_blks = g_malloc0(ctx->total_phys_blks);
 
     /* Initialize BBM Policy API */
     ctx->policy_api = g_malloc0(sizeof(struct BbmPolicyAPI));
@@ -95,6 +122,42 @@ int bbm_init(struct bbm *ctx, const BbCtrlParams *bbp, const struct ssdparams *p
 uint32_t bbm_blks_per_pl_log(const struct bbm *ctx)
 {
     return (ctx && ctx->geom) ? ctx->geom->blks_per_pl_log : 0;
+}
+
+bool bbm_is_mappable_to_host(const struct bbm *ctx, const struct pba *pba)
+{
+    return bbm_valid_phys_pba(ctx, pba) &&
+           pba->g.blk < ctx->geom->blks_per_pl_log &&
+           !bbm_is_excluded_phys_blk(ctx, pba);
+}
+
+bool bbm_is_excluded_phys_blk(const struct bbm *ctx, const struct pba *pba)
+{
+    if (!ctx || !ctx->excluded_phys_blks || !bbm_valid_phys_pba(ctx, pba)) {
+        return false;
+    }
+
+    return ctx->excluded_phys_blks[bbm_phys_blk_slot_index(ctx, pba)] != 0;
+}
+
+int bbm_exclude_phys_blk_from_mapping(struct bbm *ctx, const struct pba *pba)
+{
+    if (!ctx || !ctx->excluded_phys_blks || !bbm_valid_phys_pba(ctx, pba)) {
+        return -1;
+    }
+
+    ctx->excluded_phys_blks[bbm_phys_blk_slot_index(ctx, pba)] = 1;
+    return 0;
+}
+
+int bbm_include_phys_blk_in_mapping(struct bbm *ctx, const struct pba *pba)
+{
+    if (!ctx || !ctx->excluded_phys_blks || !bbm_valid_phys_pba(ctx, pba)) {
+        return -1;
+    }
+
+    ctx->excluded_phys_blks[bbm_phys_blk_slot_index(ctx, pba)] = 0;
+    return 0;
 }
 
 struct pba bbm_get_maptbl_entry(const struct bbm *ctx,
@@ -190,7 +253,7 @@ int bbm_read(struct FtlBackend *fb, const struct bbm *ctx,
     int rc = ftl_backend_read(fb, req, phys, ppa_count, page_size, event ? &bev : NULL);
     if (event) {
         if (ctx->policy_engine) {
-            policy_engine_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
+            pe_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
         }
         event->lat = bev.lat;
         event->count = bev.count;
@@ -228,7 +291,7 @@ int bbm_write(struct FtlBackend *fb, const struct bbm *ctx,
     int rc = ftl_backend_write(fb, req, phys, ppa_count, page_size, event ? &bev : NULL);
     if (event) {
         if (ctx->policy_engine) {
-            policy_engine_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
+            pe_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
         }
         event->lat = bev.lat;
         event->count = bev.count;
@@ -265,7 +328,7 @@ int bbm_raw_read(struct FtlBackend *fb, const struct bbm *ctx,
     int rc = ftl_backend_raw_read(fb, buffer, phys, ppa_count, page_size, event ? &bev : NULL);
     if (event) {
         if (ctx->policy_engine) {
-            policy_engine_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
+            pe_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
         }
         event->lat = bev.lat;
         event->count = bev.count;
@@ -302,7 +365,7 @@ int bbm_raw_write(struct FtlBackend *fb, const struct bbm *ctx,
     int rc = ftl_backend_raw_write(fb, buffer, phys, ppa_count, page_size, event ? &bev : NULL);
     if (event) {
         if (ctx->policy_engine) {
-            policy_engine_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
+            pe_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
         }
         event->lat = bev.lat;
         event->count = bev.count;
@@ -338,7 +401,7 @@ int bbm_raw_erase(struct FtlBackend *fb, const struct bbm *ctx,
     int rc = ftl_backend_raw_erase(fb, phys, blk_count, event ? &bev : NULL);
     if (event) {
         if (ctx->policy_engine) {
-            policy_engine_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
+            pe_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
         }
         event->lat = bev.lat;
         event->count = bev.count;
@@ -347,6 +410,7 @@ int bbm_raw_erase(struct FtlBackend *fb, const struct bbm *ctx,
     g_free(phys);
     return rc;
 }
+
 
 int bbm_get_erase_cnt(const struct FtlBackend *fb, const struct bbm *ctx,
                       const PseudoPba *ppba)

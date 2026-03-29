@@ -13,20 +13,77 @@
 #include <stdbool.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <errno.h>
 #include <sys/ioctl.h>
 #include <linux/nvme_ioctl.h>
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
-#include <openssl/params.h>
 #include <openssl/err.h>
 
-/* INIT_SESSION opcode (from meta-interface-policy.h) */
-#define NVME_CMD_INIT_SESSION  0x93
+static uint64_t g_admin_session_counter = 0;
 
-/* Request and response sizes */
-#define INIT_SESSION_REQUEST_SIZE   96
-#define INIT_SESSION_RESPONSE_SIZE  96
+static void print_hex(const char *label, const uint8_t *data, size_t len)
+{
+    size_t i;
+
+    printf("[Admin] %s (%zu bytes): ", label, len);
+    for (i = 0; i < len; i++) {
+        printf("%02x", data[i]);
+    }
+    printf("\n");
+}
+
+static void encode_u64_le(uint64_t value, uint8_t out[8])
+{
+    for (size_t i = 0; i < 8; i++) {
+        out[i] = (uint8_t)(value >> (8 * i));
+    }
+}
+
+static uint64_t decode_u64_le(const uint8_t in[8])
+{
+    uint64_t value = 0;
+
+    for (size_t i = 0; i < 8; i++) {
+        value |= ((uint64_t)in[i]) << (8 * i);
+    }
+
+    return value;
+}
+
+static bool reserve_session_counter(uint64_t *counter_out)
+{
+    g_admin_session_counter++;
+    *counter_out = g_admin_session_counter;
+    return true;
+}
+
+static void build_admin_init_message(const uint8_t *admin_ephem_pub, uint64_t counter,
+                                     uint8_t *message_out)
+{
+    uint8_t counter_le[8];
+
+    message_out[0] = NVME_CMD_INIT_SESSION_SUBMIT;
+    memcpy(message_out + 1, admin_ephem_pub, 32);
+    encode_u64_le(counter, counter_le);
+    memcpy(message_out + 33, counter_le, sizeof(counter_le));
+}
+
+static void build_ssd_response_message(const uint8_t *admin_ephem_pub,
+                                       const uint8_t *ssd_ephem_pub,
+                                       uint64_t counter,
+                                       uint8_t *message_out)
+{
+    uint8_t counter_le[8];
+    size_t offset = 1;
+
+    message_out[0] = NVME_CMD_INIT_SESSION_SUBMIT;
+    memcpy(message_out + offset, admin_ephem_pub, 32);
+    offset += 32;
+    memcpy(message_out + offset, ssd_ephem_pub, 32);
+    offset += 32;
+    encode_u64_le(counter, counter_le);
+    memcpy(message_out + offset, counter_le, sizeof(counter_le));
+}
 
 /* ========================================================================== */
 /* Cryptographic Functions */
@@ -180,17 +237,18 @@ cleanup:
 /* X25519 ECDH + HKDF to derive 32-byte session key */
 static bool derive_session_key(const uint8_t *admin_ephem_priv,
                                const uint8_t *ssd_ephem_pub,
+                               const uint8_t *admin_ephem_pub,
+                               uint64_t counter,
                                uint8_t *session_key_out)
 {
     EVP_PKEY *admin_priv_pkey = NULL;
     EVP_PKEY *ssd_pub_pkey = NULL;
     EVP_PKEY_CTX *ctx = NULL;
-    EVP_KDF *kdf = NULL;
-    EVP_KDF_CTX *kctx = NULL;
+    EVP_PKEY_CTX *kctx = NULL;
     uint8_t shared_secret[32];
     size_t secret_len = 32;
-    OSSL_PARAM params[4];
-    const char *digest = "SHA256";
+    uint8_t kdf_info[1 + 32 + 32 + 8];
+    uint8_t counter_le[8];
     bool result = false;
     
     /* Create EVP_PKEY for admin ephemeral private key */
@@ -232,27 +290,41 @@ static bool derive_session_key(const uint8_t *admin_ephem_priv,
         goto cleanup;
     }
     
-    /* Apply HKDF to derive session key from shared secret */
-    kdf = EVP_KDF_fetch(NULL, "HKDF", NULL);
-    if (!kdf) {
-        fprintf(stderr, "[Admin] Failed to fetch HKDF\n");
-        goto cleanup;
-    }
-    
-    kctx = EVP_KDF_CTX_new(kdf);
+    /* Apply HKDF to derive the transcript-bound session key. */
+    kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
     if (!kctx) {
         fprintf(stderr, "[Admin] Failed to create KDF context\n");
         goto cleanup;
     }
-    
-    /* Set up HKDF parameters: mode=extract-and-expand, digest=SHA256, key=shared_secret, info="" */
-    params[0] = OSSL_PARAM_construct_utf8_string("digest", (char *)digest, 0);
-    params[1] = OSSL_PARAM_construct_octet_string("key", shared_secret, 32);
-    params[2] = OSSL_PARAM_construct_octet_string("info", (void *)"", 0);
-    params[3] = OSSL_PARAM_construct_end();
-    
-    /* Derive 32-byte session key */
-    if (EVP_KDF_derive(kctx, session_key_out, 32, params) != 1) {
+
+    if (EVP_PKEY_derive_init(kctx) != 1) {
+        fprintf(stderr, "[Admin] Failed to init HKDF\n");
+        goto cleanup;
+    }
+
+    if (EVP_PKEY_CTX_set_hkdf_md(kctx, EVP_sha256()) != 1) {
+        fprintf(stderr, "[Admin] Failed to set HKDF digest\n");
+        goto cleanup;
+    }
+
+    kdf_info[0] = NVME_CMD_INIT_SESSION_SUBMIT;
+    memcpy(kdf_info + 1, admin_ephem_pub, 32);
+    memcpy(kdf_info + 33, ssd_ephem_pub, 32);
+    encode_u64_le(counter, counter_le);
+    memcpy(kdf_info + 65, counter_le, sizeof(counter_le));
+
+    if (EVP_PKEY_CTX_set1_hkdf_key(kctx, shared_secret, sizeof(shared_secret)) != 1) {
+        fprintf(stderr, "[Admin] Failed to set HKDF key\n");
+        goto cleanup;
+    }
+
+    if (EVP_PKEY_CTX_add1_hkdf_info(kctx, kdf_info, sizeof(kdf_info)) != 1) {
+        fprintf(stderr, "[Admin] Failed to set HKDF info\n");
+        goto cleanup;
+    }
+
+    /* Derive 32-byte session key. */
+    if (EVP_PKEY_derive(kctx, session_key_out, &secret_len) != 1 || secret_len != 32) {
         fprintf(stderr, "[Admin] Failed to derive session key\n");
         goto cleanup;
     }
@@ -262,12 +334,10 @@ static bool derive_session_key(const uint8_t *admin_ephem_priv,
 cleanup:
     /* Clear sensitive data */
     OPENSSL_cleanse(shared_secret, 32);
+    OPENSSL_cleanse(kdf_info, sizeof(kdf_info));
     
     if (kctx) {
-        EVP_KDF_CTX_free(kctx);
-    }
-    if (kdf) {
-        EVP_KDF_free(kdf);
+        EVP_PKEY_CTX_free(kctx);
     }
     if (ctx) {
         EVP_PKEY_CTX_free(ctx);
@@ -285,8 +355,8 @@ cleanup:
 /* NVMe Communication */
 /* ========================================================================== */
 
-/* Send INIT_SESSION NVMe IO command via ioctl */
-static int send_init_session_nvme_cmd(const char *device, uint8_t *buffer)
+static int send_nvme_session_cmd(const char *device, uint8_t opcode,
+                                 uint8_t *buffer, uint32_t data_len)
 {
     int fd = -1;
     struct nvme_passthru_cmd cmd;
@@ -301,12 +371,12 @@ static int send_init_session_nvme_cmd(const char *device, uint8_t *buffer)
     
     /* Prepare NVMe passthrough command */
     memset(&cmd, 0, sizeof(cmd));
-    cmd.opcode = NVME_CMD_INIT_SESSION;
+    cmd.opcode = opcode;
     cmd.nsid = 1;  /* Namespace ID */
     cmd.addr = (uint64_t)(uintptr_t)buffer;
-    cmd.data_len = INIT_SESSION_REQUEST_SIZE;
+    cmd.data_len = data_len;
     
-    /* Send command via ioctl (IO command, not admin) */
+    /* Send command via I/O passthrough ioctl. */
     ret = ioctl(fd, NVME_IOCTL_IO_CMD, &cmd);
     if (ret < 0) {
         fprintf(stderr, "[Admin] NVME_IOCTL_IO_CMD failed: %s\n", strerror(errno));
@@ -336,58 +406,80 @@ int admin_establish_session(const char *device, uint8_t *session_key_out)
     uint8_t admin_ephem_priv[32];
     uint8_t request[INIT_SESSION_REQUEST_SIZE];
     uint8_t response[INIT_SESSION_RESPONSE_SIZE];
-    uint8_t proof_message[64];
-    uint8_t *admin_sig;
+    uint8_t admin_init_message[1 + 32 + 8];
+    uint8_t proof_message[1 + 32 + 32 + 8];
+    uint64_t counter;
+    uint64_t response_counter;
     uint8_t *ssd_ephem_pub;
     uint8_t *proof_sig;
     
-    printf("[Admin] Starting session establishment...\n");
+    if (!reserve_session_counter(&counter)) {
+        fprintf(stderr, "[Admin] Failed to reserve session counter\n");
+        goto error;
+    }
     
     /* Step 1: Generate admin ephemeral keypair (X25519) */
-    printf("[Admin] Generating ephemeral keypair...\n");
     if (!generate_ephemeral_keypair(admin_ephem_pub, admin_ephem_priv)) {
         fprintf(stderr, "[Admin] Failed to generate ephemeral keypair\n");
         goto error;
     }
     
-    /* Step 2: Sign admin_ephem_pub with admin private key (Ed25519) */
-    printf("[Admin] Signing ephemeral public key...\n");
-    admin_sig = request + 32;
-    if (!sign_with_admin_private_key(admin_ephem_pub, 32, admin_sig)) {
-        fprintf(stderr, "[Admin] Failed to sign ephemeral public key\n");
+    /* Step 2: Sign the admin transcript fragment, including the replay counter. */
+    build_admin_init_message(admin_ephem_pub, counter, admin_init_message);
+    if (!sign_with_admin_private_key(admin_init_message, sizeof(admin_init_message),
+                                     request + 40)) {
+        fprintf(stderr, "[Admin] Failed to sign session request\n");
         goto error;
     }
     
     /* Step 3: Build request */
     memcpy(request, admin_ephem_pub, 32);
-    /* admin_sig already written to request + 32 */
+    encode_u64_le(counter, request + 32);
+    /* The final layout of request is:
+     * [admin_ephem_pub (32)] [counter (8)] [admin_sig (64)] = 104 bytes.
+     */
     
     /* Step 4: Send INIT_SESSION NVMe command */
-    printf("[Admin] Sending INIT_SESSION command to %s...\n", device);
-    memcpy(response, request, INIT_SESSION_REQUEST_SIZE);  /* Response uses same buffer */
-    if (send_init_session_nvme_cmd(device, response) < 0) {
-        fprintf(stderr, "[Admin] Failed to send INIT_SESSION command\n");
+    if (send_nvme_session_cmd(device, NVME_CMD_INIT_SESSION_SUBMIT,
+                              request,
+                              INIT_SESSION_REQUEST_SIZE) < 0) {
+        fprintf(stderr, "[Admin] Failed to submit INIT_SESSION request\n");
+        goto error;
+    }
+
+    memset(response, 0, sizeof(response));
+    if (send_nvme_session_cmd(device, NVME_CMD_INIT_SESSION_FETCH,
+                              response,
+                              INIT_SESSION_RESPONSE_SIZE) < 0) {
+        fprintf(stderr, "[Admin] Failed to fetch INIT_SESSION response\n");
         goto error;
     }
     
     /* Step 5: Extract response */
     ssd_ephem_pub = response;
-    proof_sig = response + 32;
+    response_counter = decode_u64_le(response + 32);
+    proof_sig = response + 40;
+    /* The final layout of response is:
+     * [ssd_ephem_pub (32)] [counter (8)] [proof_sig (64)] = 104 bytes.
+     */
+
+    if (response_counter != counter) {
+        fprintf(stderr, "[Admin] SSD echoed mismatched session counter\n");
+        goto error;
+    }
     
     /* Step 6: Build proof message for verification */
-    memcpy(proof_message, admin_ephem_pub, 32);
-    memcpy(proof_message + 32, ssd_ephem_pub, 32);
+    build_ssd_response_message(admin_ephem_pub, ssd_ephem_pub, counter, proof_message);
     
     /* Step 7: Verify SSD's proof signature */
-    printf("[Admin] Verifying SSD signature...\n");
-    if (!verify_ssd_signature(proof_message, 64, proof_sig)) {
+    if (!verify_ssd_signature(proof_message, sizeof(proof_message), proof_sig)) {
         fprintf(stderr, "[Admin] SSD signature verification failed\n");
         goto error;
     }
     
     /* Step 8: Derive session key (ECDH + HKDF) */
-    printf("[Admin] Deriving session key...\n");
-    if (!derive_session_key(admin_ephem_priv, ssd_ephem_pub, session_key_out)) {
+    if (!derive_session_key(admin_ephem_priv, ssd_ephem_pub, admin_ephem_pub,
+                            counter, session_key_out)) {
         fprintf(stderr, "[Admin] Failed to derive session key\n");
         goto error;
     }
@@ -396,31 +488,19 @@ int admin_establish_session(const char *device, uint8_t *session_key_out)
     OPENSSL_cleanse(admin_ephem_priv, 32);
     OPENSSL_cleanse(request, INIT_SESSION_REQUEST_SIZE);
     OPENSSL_cleanse(response, INIT_SESSION_RESPONSE_SIZE);
+    OPENSSL_cleanse(admin_init_message, sizeof(admin_init_message));
+    OPENSSL_cleanse(proof_message, sizeof(proof_message));
     
-    printf("[Admin] Session established successfully\n");
     return 0;
     
 error:
     OPENSSL_cleanse(admin_ephem_priv, 32);
     OPENSSL_cleanse(request, INIT_SESSION_REQUEST_SIZE);
     OPENSSL_cleanse(response, INIT_SESSION_RESPONSE_SIZE);
+    OPENSSL_cleanse(admin_init_message, sizeof(admin_init_message));
+    OPENSSL_cleanse(proof_message, sizeof(proof_message));
+    OPENSSL_cleanse(session_key_out, 32);
     return -1;
-}
-
-/* ========================================================================== */
-/* Test main() Function */
-/* ========================================================================== */
-
-static void print_hex(const char *label, const uint8_t *data, size_t len)
-{
-    printf("%s: ", label);
-    for (size_t i = 0; i < len; i++) {
-        printf("%02x", data[i]);
-        if ((i + 1) % 32 == 0 && i + 1 < len) {
-            printf("\n%*s", (int)strlen(label) + 2, "");
-        }
-    }
-    printf("\n");
 }
 
 int main(int argc, char **argv)

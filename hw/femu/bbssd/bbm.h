@@ -154,6 +154,10 @@ struct bbm {
 
     /* Policy engine (set by FTL at init); backend and pSWD hooks live there */
     struct policy_engine *policy_engine;
+
+    /* Generic bookkeeping for physical blocks excluded from pseudo allocation. */
+    uint64_t total_phys_blks;
+    uint8_t *excluded_phys_blks;
     
     /*
      * BBM Policy API - function pointer table for policies.
@@ -170,8 +174,13 @@ struct pba bbm_get_maptbl_entry(const struct bbm *ctx,
 static inline bool bbm_is_reserved_blk(const struct bbm *ctx,
                                        uint32_t blk)
 {
-    return blk >= ctx->geom->blks_per_lun_log;
+    return blk >= ctx->geom->blks_per_pl_log;
 }
+
+bool bbm_is_mappable_to_host(const struct bbm *ctx, const struct pba *pba);
+bool bbm_is_excluded_phys_blk(const struct bbm *ctx, const struct pba *pba);
+int bbm_exclude_phys_blk_from_mapping(struct bbm *ctx, const struct pba *pba);
+int bbm_include_phys_blk_in_mapping(struct bbm *ctx, const struct pba *pba);
 
 // Need raw functions and non-raw functions, like in the backend. (raw serve policies, while non-raw serve the host.)
 

@@ -311,6 +311,10 @@ static int pswd_validate_write(struct FtlBackend *fb, const struct ppa *ppa,
             return -1;
         }
         pswd_do_transition(fb, blkidx, PSWD_OPEN);
+        ctx->wp = 1;
+        if (ctx->wp == spp->pgs_per_blk) {
+            pswd_do_transition(fb, blkidx, PSWD_CLOSED);
+        }
         return 0;
     }
     if (ctx->state == PSWD_OPEN) {

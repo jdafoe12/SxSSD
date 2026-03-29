@@ -82,6 +82,9 @@ static uint16_t bb_custom_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
 {
     /* Minimal parsing - just enough to route to FTL thread */
     /* Policy hook will handle all command-specific logic */
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    uint32_t phase = le32_to_cpu(cmd->cdw10);
     
     /* Store opcode in request for ftl_fill_nvme_event() */
     req->cmd = *cmd;  /* Copy entire command for CDW10-CDW15 access */
@@ -89,6 +92,11 @@ static uint16_t bb_custom_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     req->nlb = 0;     /* Custom commands may not use NLB */
     req->is_write = 0; /* Policy determines data direction */
     req->status = NVME_SUCCESS;
+
+    printf("FEMU: bb_custom_cmd opcode=0x%02x phase=%u prp1=0x%llx prp2=0x%llx\n",
+           cmd->opcode, phase,
+           (unsigned long long)prp1,
+           (unsigned long long)prp2);
     
     /* If command has data transfer, map PRP/SGL */
     /* For now, assume no automatic buffer mapping - policy uses buffer API */
@@ -109,7 +117,7 @@ static uint16_t bb_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     default:
         /* Check if policy has registered a handler for this opcode */
         if (ssd && ssd->policy_engine && 
-            policy_engine_has_nvme_hook(ssd->policy_engine, cmd->opcode)) {
+            pe_has_nvme_hook(ssd->policy_engine, cmd->opcode)) {
             /* Policy will handle this - parse as generic command */
             return bb_custom_cmd(n, ns, cmd, req);
         }
@@ -142,4 +150,3 @@ int nvme_register_bbssd(FemuCtrl *n)
 
     return 0;
 }
-

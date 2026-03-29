@@ -48,14 +48,18 @@ struct FtlEvent {
  */
 struct NvmeCommandEvent {
     uint8_t opcode;         /* NVMe command opcode (e.g. NVME_CMD_READ, NVME_CMD_WRITE) */
+    bool is_admin;          /* true for admin-queue commands, false for I/O queue commands */
     uint64_t lba;
     uint64_t nsecs;
     uint64_t start_lpn;
     uint64_t end_lpn;
     uint64_t lpn_cnt;
     NvmeRequest *req;
+    NvmeCmd *cmd;           /* Raw command pointer for generic/custom handlers */
+    FemuCtrl *ctrl;         /* Controller context for DMA-backed handlers */
     uint64_t stime;
     uint64_t lat;
+    uint16_t status;        /* NVMe completion status for generic/custom handlers */
 };
 
 struct ssd; /* Forward declaration */
@@ -358,6 +362,8 @@ struct FtlPolicyAPI {
     uint32_t (*get_eswd_wp_index)(struct ssd *ssd, uint32_t eswd_id);
     uint32_t (*get_total_eswds)(struct ssd *ssd);
     uint64_t (*get_total_logical_pages)(struct ssd *ssd);
+    const struct bbm_geom *(*get_bbm_geom)(struct ssd *ssd);
+    const struct eswd_layout *(*get_eswd_layout)(struct ssd *ssd);
     
     /* eSWD state modification (mechanism updates eSWD struct, policy tracks queues) */
     void (*eswd_set_vpc_ipc)(struct ssd *ssd, uint32_t eswd_id, int vpc, int ipc);
@@ -379,6 +385,10 @@ struct FtlPolicyAPI {
                               void *context,
                               struct FtlMigrationCallbacks *callbacks,
                               void *policy_ctx);
+    int (*run_migration)(struct ssd *ssd,
+                         struct FtlMigrationCallbacks *callbacks,
+                         void *policy_ctx,
+                         bool force);
     
     /* Remapping API (mechanism updates eSWD→physical mapping for wear leveling) */
     int (*remap_eswd_to_physical)(struct ssd *ssd,
@@ -396,6 +406,7 @@ struct FtlPolicyAPI {
     /* Address validation (mechanism checks PPA against geometry) */
     bool (*valid_ppa)(struct ssd *ssd, PseudoPpa *ppa);
     bool (*mapped_ppa)(PseudoPpa *ppa);
+    uint64_t (*ppa_to_pgidx)(struct ssd *ssd, PseudoPpa *ppa);
     
     /* Hardware accessors (mechanism provides access to channels/LUNs) */
     struct nand_lun *(*get_lun)(struct ssd *ssd, PseudoPpa *ppa);
@@ -407,6 +418,10 @@ struct FtlPolicyAPI {
                                    uint64_t length, uint64_t *out_size);
     uint64_t (*write_request_data)(NvmeRequest *req, const uint8_t *buffer,
                                     uint64_t offset, uint64_t length);
+    const NvmeDsmRange *(*get_dsm_ranges)(NvmeRequest *req, int *nr_ranges);
+    int (*get_gc_thres_lines)(struct ssd *ssd);
+    int (*get_gc_thres_lines_high)(struct ssd *ssd);
+    int (*get_page_status)(struct ssd *ssd, const PseudoPpa *ppa);
 
     /* Hook registration (mechanism provides event system, policy attaches handlers) */
     int (*register_nvme_hook)(struct ssd *ssd, uint8_t opcode,
@@ -434,6 +449,7 @@ struct FtlPolicyAPI {
 
     /* eSWD config (policy sets at init to define striping and layout) */
     void (*set_eswd_config)(struct ssd *ssd, const struct eswd_config *config);
+    int (*finalize_ftl_init)(struct ssd *ssd);
 
     /* GC mapping update (policy provides; mechanism calls when migrating a page in legacy GC path) */
     void (*gc_update_mapping)(struct ssd *ssd, PseudoPpa *old_ppa, PseudoPpa *new_ppa);
@@ -471,6 +487,7 @@ struct ssd { // This needs to be dissected and probably renamed
     struct eswd_config eswd_config;
     struct eswd_layout eswd_layout;
     bool eswd_config_set;
+    bool eswd_layout_finalized;
     
     /* DEPRECATED: Policy-level fields, will be moved to policy_private */
     struct eswd *cur_eswd;
@@ -495,17 +512,14 @@ struct ssd { // This needs to be dissected and probably renamed
 
 void ssd_init(FemuCtrl *n);
 
-/* Block interface policy: apply eSWD config (call before eswd_layout_compute) */
-void block_interface_policy_apply_eswd_config(struct ssd *ssd);
-
-/* Block interface policy initialization */
-int init_block_interface_policy(struct ssd *ssd);
-
 /* eSWD config – call from init_policy to define striping and size before lines/wp are inited */
 void set_eswd_config(struct ssd *ssd, const struct eswd_config *config);
+int finalize_ftl_init(struct ssd *ssd);
 
 /* Event filling helpers */
 void ftl_fill_nvme_event(struct ssd *ssd, NvmeRequest *req, struct NvmeCommandEvent *event);
+void ftl_fill_admin_nvme_event(struct ssd *ssd, FemuCtrl *n, NvmeCmd *cmd,
+                               struct NvmeCommandEvent *event);
 uint64_t ftl_read_user_request(struct ssd *ssd, struct NvmeCommandEvent *event,
                                ReadPpaResolver resolve_ppa, void *resolve_ctx);
 uint64_t ftl_write_user_request(struct ssd *ssd, NvmeRequest *req,
@@ -517,6 +531,8 @@ struct eswd *get_eswd_by_ppa(struct ssd *ssd, PseudoPpa *ppa);
 void get_eswd_vpc_ipc(struct ssd *ssd, uint32_t eswd_id, int *vpc, int *ipc);
 uint32_t get_eswd_wp_index(struct ssd *ssd, uint32_t eswd_id);
 uint32_t get_total_eswds(struct ssd *ssd);
+const struct bbm_geom *get_bbm_geom(struct ssd *ssd);
+const struct eswd_layout *get_eswd_layout(struct ssd *ssd);
 void eswd_set_vpc_ipc(struct ssd *ssd, uint32_t eswd_id, int vpc, int ipc);
 void eswd_increment_wp(struct ssd *ssd, uint32_t eswd_id);
 void eswd_reset(struct ssd *ssd, uint32_t eswd_id);
@@ -622,6 +638,10 @@ uint8_t *ftl_copy_request_data(NvmeRequest *req, uint64_t offset,
  */
 uint64_t ftl_write_request_data(NvmeRequest *req, const uint8_t *buffer,
                                  uint64_t offset, uint64_t length);
+const NvmeDsmRange *ftl_get_dsm_ranges(NvmeRequest *req, int *nr_ranges);
+int ftl_get_gc_thres_lines(struct ssd *ssd);
+int ftl_get_gc_thres_lines_high(struct ssd *ssd);
+int ftl_get_page_status(struct ssd *ssd, const PseudoPpa *ppa);
 
 /* NVMe hook management (opcode-keyed, condition + callback) */
 int ftl_register_nvme_hook(struct ssd *ssd, uint8_t opcode,

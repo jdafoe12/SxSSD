@@ -3,7 +3,7 @@
 
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -I../..
-LDFLAGS = -lssl -lcrypto
+LDFLAGS = -Wl,-rpath,'$$ORIGIN' -lcrypto
 
 TARGET = admin-simulation
 SOURCES = admin-simulation.c

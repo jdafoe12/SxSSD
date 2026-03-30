@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -fPIC -I. -Iinc
 POLICY_LDFLAGS = -shared
-TOOL_LDFLAGS =
+TOOL_LDFLAGS = -lssl -lcrypto
 
 POLICIES = block-interface-policy.so
 TOOLS = policyctl

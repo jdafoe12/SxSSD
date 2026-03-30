@@ -57,19 +57,23 @@ static bool reserve_session_counter(uint64_t *counter_out)
     return true;
 }
 
-static void build_admin_init_message(const uint8_t *admin_ephem_pub, uint64_t counter,
+static void build_admin_init_message(const uint8_t *admin_ephem_pub,
+                                     uint8_t session_mode,
+                                     uint64_t counter,
                                      uint8_t *message_out)
 {
     uint8_t counter_le[8];
 
     message_out[0] = NVME_CMD_INIT_SESSION_SUBMIT;
     memcpy(message_out + 1, admin_ephem_pub, 32);
+    message_out[33] = session_mode;
     encode_u64_le(counter, counter_le);
-    memcpy(message_out + 33, counter_le, sizeof(counter_le));
+    memcpy(message_out + 34, counter_le, sizeof(counter_le));
 }
 
 static void build_ssd_response_message(const uint8_t *admin_ephem_pub,
                                        const uint8_t *ssd_ephem_pub,
+                                       uint8_t session_mode,
                                        uint64_t counter,
                                        uint8_t *message_out)
 {
@@ -81,6 +85,7 @@ static void build_ssd_response_message(const uint8_t *admin_ephem_pub,
     offset += 32;
     memcpy(message_out + offset, ssd_ephem_pub, 32);
     offset += 32;
+    message_out[offset++] = session_mode;
     encode_u64_le(counter, counter_le);
     memcpy(message_out + offset, counter_le, sizeof(counter_le));
 }
@@ -238,6 +243,7 @@ cleanup:
 static bool derive_session_key(const uint8_t *admin_ephem_priv,
                                const uint8_t *ssd_ephem_pub,
                                const uint8_t *admin_ephem_pub,
+                               uint8_t session_mode,
                                uint64_t counter,
                                uint8_t *session_key_out)
 {
@@ -247,7 +253,7 @@ static bool derive_session_key(const uint8_t *admin_ephem_priv,
     EVP_PKEY_CTX *kctx = NULL;
     uint8_t shared_secret[32];
     size_t secret_len = 32;
-    uint8_t kdf_info[1 + 32 + 32 + 8];
+    uint8_t kdf_info[1 + 32 + 32 + 1 + 8];
     uint8_t counter_le[8];
     bool result = false;
     
@@ -310,8 +316,9 @@ static bool derive_session_key(const uint8_t *admin_ephem_priv,
     kdf_info[0] = NVME_CMD_INIT_SESSION_SUBMIT;
     memcpy(kdf_info + 1, admin_ephem_pub, 32);
     memcpy(kdf_info + 33, ssd_ephem_pub, 32);
+    kdf_info[65] = session_mode;
     encode_u64_le(counter, counter_le);
-    memcpy(kdf_info + 65, counter_le, sizeof(counter_le));
+    memcpy(kdf_info + 66, counter_le, sizeof(counter_le));
 
     if (EVP_PKEY_CTX_set1_hkdf_key(kctx, shared_secret, sizeof(shared_secret)) != 1) {
         fprintf(stderr, "[Admin] Failed to set HKDF key\n");
@@ -400,14 +407,15 @@ static int send_nvme_session_cmd(const char *device, uint8_t opcode,
 /* ========================================================================== */
 
 /* Establish session with SSD and derive shared session key */
-int admin_establish_session(const char *device, uint8_t *session_key_out)
+int admin_establish_session(const char *device, uint8_t session_mode,
+                            uint8_t *session_key_out)
 {
     uint8_t admin_ephem_pub[32];
     uint8_t admin_ephem_priv[32];
     uint8_t request[INIT_SESSION_REQUEST_SIZE];
     uint8_t response[INIT_SESSION_RESPONSE_SIZE];
-    uint8_t admin_init_message[1 + 32 + 8];
-    uint8_t proof_message[1 + 32 + 32 + 8];
+    uint8_t admin_init_message[1 + 32 + 1 + 8];
+    uint8_t proof_message[1 + 32 + 32 + 1 + 8];
     uint64_t counter;
     uint64_t response_counter;
     uint8_t *ssd_ephem_pub;
@@ -425,18 +433,20 @@ int admin_establish_session(const char *device, uint8_t *session_key_out)
     }
     
     /* Step 2: Sign the admin transcript fragment, including the replay counter. */
-    build_admin_init_message(admin_ephem_pub, counter, admin_init_message);
+    build_admin_init_message(admin_ephem_pub, session_mode, counter,
+                             admin_init_message);
     if (!sign_with_admin_private_key(admin_init_message, sizeof(admin_init_message),
-                                     request + 40)) {
+                                     request + 41)) {
         fprintf(stderr, "[Admin] Failed to sign session request\n");
         goto error;
     }
     
     /* Step 3: Build request */
     memcpy(request, admin_ephem_pub, 32);
-    encode_u64_le(counter, request + 32);
+    request[32] = session_mode;
+    encode_u64_le(counter, request + 33);
     /* The final layout of request is:
-     * [admin_ephem_pub (32)] [counter (8)] [admin_sig (64)] = 104 bytes.
+     * [admin_ephem_pub (32)] [mode (1)] [counter (8)] [admin_sig (64)] = 105 bytes.
      */
     
     /* Step 4: Send INIT_SESSION NVMe command */
@@ -469,7 +479,8 @@ int admin_establish_session(const char *device, uint8_t *session_key_out)
     }
     
     /* Step 6: Build proof message for verification */
-    build_ssd_response_message(admin_ephem_pub, ssd_ephem_pub, counter, proof_message);
+    build_ssd_response_message(admin_ephem_pub, ssd_ephem_pub, session_mode,
+                               counter, proof_message);
     
     /* Step 7: Verify SSD's proof signature */
     if (!verify_ssd_signature(proof_message, sizeof(proof_message), proof_sig)) {
@@ -479,6 +490,7 @@ int admin_establish_session(const char *device, uint8_t *session_key_out)
     
     /* Step 8: Derive session key (ECDH + HKDF) */
     if (!derive_session_key(admin_ephem_priv, ssd_ephem_pub, admin_ephem_pub,
+                            session_mode,
                             counter, session_key_out)) {
         fprintf(stderr, "[Admin] Failed to derive session key\n");
         goto error;
@@ -522,7 +534,7 @@ int main(int argc, char **argv)
     device = argv[1];
     
     /* Establish session */
-    if (admin_establish_session(device, session_key) < 0) {
+    if (admin_establish_session(device, SESSION_MODE_NORMAL, session_key) < 0) {
         fprintf(stderr, "\n[Admin] Session establishment failed\n");
         return 1;
     }
@@ -540,3 +552,8 @@ int main(int argc, char **argv)
     
     return 0;
 }
+    if (session_mode != SESSION_MODE_NORMAL &&
+        session_mode != SESSION_MODE_CONFIDENTIAL) {
+        fprintf(stderr, "[Admin] Invalid session mode %u\n", session_mode);
+        goto error;
+    }

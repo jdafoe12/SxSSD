@@ -5,7 +5,10 @@
 
 #define NVME_CMD_INIT_SESSION_SUBMIT 0x93
 #define NVME_CMD_INIT_SESSION_FETCH  0x94
-#define INIT_SESSION_REQUEST_SIZE  104
+#define SESSION_MODE_NORMAL        0
+#define SESSION_MODE_CONFIDENTIAL  1
+
+#define INIT_SESSION_REQUEST_SIZE  105
 #define INIT_SESSION_RESPONSE_SIZE 104
 
 static const uint8_t ADMIN_PRIVATE_KEY[32] = {
@@ -56,6 +59,7 @@ struct ssd_cert_t {
  * Returns:
  *   0 on success, -1 on error
  */
-int admin_establish_session(const char *device, uint8_t *session_key_out);
+int admin_establish_session(const char *device, uint8_t session_mode,
+                            uint8_t *session_key_out);
 
 #endif

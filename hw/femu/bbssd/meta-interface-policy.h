@@ -11,7 +11,10 @@
 #define NVME_CMD_ACTIVATE_POLICY      0x96
 #define NVME_CMD_DEACTIVATE_POLICY    0x97
 
-#define INIT_SESSION_REQUEST_SIZE   104
+#define SESSION_MODE_NORMAL        0
+#define SESSION_MODE_CONFIDENTIAL  1
+
+#define INIT_SESSION_REQUEST_SIZE   105
 #define INIT_SESSION_RESPONSE_SIZE  104
 
 /* Meta interface policy init; implemented in meta-interface-policy.c */

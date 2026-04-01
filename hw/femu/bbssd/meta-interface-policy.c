@@ -689,6 +689,12 @@ static void fill_policy_storage_desc(const struct meta_policy_context *ctx, int 
     desc->expected_payload = ctx->installed_policies[slot].payload_copy;
 }
 
+static void reset_policy_slot_record(struct meta_policy_context *ctx, int slot)
+{
+    memset(&ctx->installed_policies[slot], 0,
+           sizeof(ctx->installed_policies[slot]));
+}
+
 static int select_policy_blocks(struct ssd *ssd,
                                 struct meta_policy_context *ctx,
                                 uint32_t block_count,
@@ -763,6 +769,43 @@ static void unexclude_policy_blocks(struct ssd *ssd,
     for (i = 0; i < block_count; i++) {
         bbm_include_phys_blk_in_mapping(ssd->bbm, &blocks[i]);
     }
+}
+
+static int erase_policy_blocks(struct ssd *ssd,
+                               const struct pba *blocks,
+                               uint32_t block_count)
+{
+    struct pba *erase_list;
+    int rc;
+
+    if (!blocks || block_count == 0) {
+        return 0;
+    }
+
+    erase_list = g_malloc0(sizeof(struct pba) * block_count);
+    memcpy(erase_list, blocks, sizeof(struct pba) * block_count);
+    rc = ftl_backend_raw_erase(ssd->fb, erase_list, block_count, NULL);
+    g_free(erase_list);
+    return rc;
+}
+
+static int reclaim_policy_storage(struct ssd *ssd,
+                                  const struct pba *blocks,
+                                  uint32_t block_count)
+{
+    if (erase_policy_blocks(ssd, blocks, block_count) != 0) {
+        return -1;
+    }
+
+    unexclude_policy_blocks(ssd, blocks, block_count);
+    return 0;
+}
+
+static void free_policy_slot_resources(struct meta_policy_context *ctx, int slot)
+{
+    g_free(ctx->installed_policies[slot].blocks);
+    g_free(ctx->installed_policies[slot].payload_copy);
+    reset_policy_slot_record(ctx, slot);
 }
 
 static int write_policy_payload(struct ssd *ssd,
@@ -922,6 +965,234 @@ static uint64_t install_policy_callback(struct ssd *ssd, struct NvmeCommandEvent
 
     g_free(payload);
     event->status = NVME_SUCCESS;
+cleanup:
+    if (plaintext) {
+        OPENSSL_cleanse(plaintext, plaintext_len);
+        g_free(plaintext);
+    }
+    return 0;
+}
+
+static int authenticate_inactive_policy_request(struct meta_policy_context *ctx,
+                                                struct NvmeCommandEvent *event,
+                                                uint8_t expected_opcode,
+                                                uint8_t **plaintext_out,
+                                                size_t *plaintext_len_out,
+                                                uint32_t *policy_id_out,
+                                                int *slot_out)
+{
+    uint8_t *plaintext = NULL;
+    size_t plaintext_len = 0;
+    uint32_t policy_id;
+    int slot;
+
+    if (!ctx || !event || !plaintext_out || !plaintext_len_out ||
+        !policy_id_out || !slot_out) {
+        return -1;
+    }
+    if (event->opcode != expected_opcode) {
+        return -1;
+    }
+    if (authenticate_meta_request(ctx, event->ctrl, event->cmd, event->opcode,
+                                  &plaintext, &plaintext_len) != 0) {
+        return -1;
+    }
+    if (plaintext_len < 4) {
+        goto fail;
+    }
+
+    policy_id = decode_u32_le(plaintext);
+    if (policy_id == 0) {
+        goto fail;
+    }
+
+    slot = find_policy_slot(ctx, policy_id);
+    if (slot < 0 || ctx->installed_policies[slot].active) {
+        goto fail;
+    }
+
+    *plaintext_out = plaintext;
+    *plaintext_len_out = plaintext_len;
+    *policy_id_out = policy_id;
+    *slot_out = slot;
+    return 0;
+
+fail:
+    if (plaintext) {
+        OPENSSL_cleanse(plaintext, plaintext_len);
+        g_free(plaintext);
+    }
+    return -1;
+}
+
+static bool update_policy_condition(struct ssd *ssd, struct NvmeCommandEvent *event,
+                                    struct FtlPolicyAPI *api, void *context)
+{
+    (void)ssd;
+    (void)api;
+    (void)context;
+    return !event->is_admin && event->opcode == NVME_CMD_UPDATE_POLICY;
+}
+
+static uint64_t update_policy_callback(struct ssd *ssd,
+                                       struct NvmeCommandEvent *event,
+                                       struct FtlPolicyAPI *api,
+                                       void *context)
+{
+    struct meta_policy_context *ctx = (struct meta_policy_context *)context;
+    uint8_t *plaintext = NULL;
+    size_t plaintext_len = 0;
+    uint32_t policy_id;
+    int slot;
+
+    (void)api;
+
+    if (authenticate_inactive_policy_request(ctx, event, NVME_CMD_UPDATE_POLICY,
+                                             &plaintext, &plaintext_len,
+                                             &policy_id, &slot) != 0) {
+        event->status = NVME_INVALID_FIELD | NVME_DNR;
+        return 0;
+    }
+
+    {
+        uint32_t policy_version;
+        uint32_t policy_size_bytes;
+        uint32_t page_size = page_size_bytes(ssd);
+        uint32_t ppb = pages_per_block(ssd);
+        uint32_t page_count;
+        uint32_t block_count;
+        uint8_t *payload = NULL;
+        uint8_t *payload_copy = NULL;
+        struct pba *new_blocks = NULL;
+        struct pba *old_blocks;
+        uint32_t old_block_count;
+        uint8_t *old_payload_copy;
+
+        if (plaintext_len < 12) {
+            event->status = NVME_INVALID_FIELD | NVME_DNR;
+            goto cleanup;
+        }
+
+        policy_version = decode_u32_le(plaintext + 4);
+        policy_size_bytes = decode_u32_le(plaintext + 8);
+
+        if (policy_version == 0 || policy_size_bytes == 0) {
+            event->status = NVME_INVALID_FIELD | NVME_DNR;
+            goto cleanup;
+        }
+        if (plaintext_len != (size_t)12 + policy_size_bytes) {
+            event->status = NVME_INVALID_FIELD | NVME_DNR;
+            goto cleanup;
+        }
+
+        page_count = (policy_size_bytes + page_size - 1) / page_size;
+        block_count = (page_count + ppb - 1) / ppb;
+
+        payload = g_malloc0(policy_size_bytes);
+        memcpy(payload, plaintext + 12, policy_size_bytes);
+        payload_copy = g_memdup2(payload, policy_size_bytes);
+
+        new_blocks = g_malloc0(sizeof(struct pba) * block_count);
+        if (select_policy_blocks(ssd, ctx, block_count, new_blocks) < 0) {
+            event->status = NVME_INVALID_FIELD | NVME_DNR;
+            goto update_cleanup;
+        }
+        if (exclude_policy_blocks(ssd, new_blocks, block_count) < 0) {
+            event->status = NVME_INVALID_FIELD | NVME_DNR;
+            goto update_cleanup;
+        }
+        if (write_policy_payload(ssd, payload, policy_size_bytes,
+                                 new_blocks, block_count) < 0) {
+            unexclude_policy_blocks(ssd, new_blocks, block_count);
+            event->status = NVME_DATA_TRAS_ERROR | NVME_DNR;
+            goto update_cleanup;
+        }
+
+        old_blocks = ctx->installed_policies[slot].blocks;
+        old_block_count = ctx->installed_policies[slot].block_count;
+        old_payload_copy = ctx->installed_policies[slot].payload_copy;
+
+        if (reclaim_policy_storage(ssd, old_blocks, old_block_count) != 0) {
+            reclaim_policy_storage(ssd, new_blocks, block_count);
+            event->status = NVME_DATA_TRAS_ERROR | NVME_DNR;
+            goto update_cleanup;
+        }
+
+        ctx->installed_policies[slot].policy_version = policy_version;
+        ctx->installed_policies[slot].policy_size_bytes = policy_size_bytes;
+        ctx->installed_policies[slot].policy_size_pages = page_count;
+        ctx->installed_policies[slot].block_count = block_count;
+        ctx->installed_policies[slot].blocks = new_blocks;
+        ctx->installed_policies[slot].payload_copy = payload_copy;
+
+        g_free(old_blocks);
+        g_free(old_payload_copy);
+        g_free(payload);
+
+        printf("[Meta] Updated policy id=%u version=%u size=%u bytes blocks=%u\n",
+               policy_id, policy_version, policy_size_bytes, block_count);
+
+        event->status = NVME_SUCCESS;
+        goto cleanup;
+
+update_cleanup:
+        g_free(new_blocks);
+        g_free(payload_copy);
+        g_free(payload);
+        goto cleanup;
+    }
+
+cleanup:
+    if (plaintext) {
+        OPENSSL_cleanse(plaintext, plaintext_len);
+        g_free(plaintext);
+    }
+    return 0;
+}
+
+static bool remove_policy_condition(struct ssd *ssd, struct NvmeCommandEvent *event,
+                                    struct FtlPolicyAPI *api, void *context)
+{
+    (void)ssd;
+    (void)api;
+    (void)context;
+    return !event->is_admin && event->opcode == NVME_CMD_REMOVE_POLICY;
+}
+
+static uint64_t remove_policy_callback(struct ssd *ssd,
+                                       struct NvmeCommandEvent *event,
+                                       struct FtlPolicyAPI *api,
+                                       void *context)
+{
+    struct meta_policy_context *ctx = (struct meta_policy_context *)context;
+    uint8_t *plaintext = NULL;
+    size_t plaintext_len = 0;
+    uint32_t policy_id;
+    int slot;
+
+    (void)api;
+
+    if (authenticate_inactive_policy_request(ctx, event, NVME_CMD_REMOVE_POLICY,
+                                             &plaintext, &plaintext_len,
+                                             &policy_id, &slot) != 0) {
+        event->status = NVME_INVALID_FIELD | NVME_DNR;
+        return 0;
+    }
+    if (plaintext_len != 4) {
+        event->status = NVME_INVALID_FIELD | NVME_DNR;
+        goto cleanup;
+    }
+    if (reclaim_policy_storage(ssd,
+                               ctx->installed_policies[slot].blocks,
+                               ctx->installed_policies[slot].block_count) != 0) {
+        event->status = NVME_DATA_TRAS_ERROR | NVME_DNR;
+        goto cleanup;
+    }
+
+    free_policy_slot_resources(ctx, slot);
+    printf("[Meta] Removed policy id=%u\n", policy_id);
+    event->status = NVME_SUCCESS;
+
 cleanup:
     if (plaintext) {
         OPENSSL_cleanse(plaintext, plaintext_len);
@@ -1159,6 +1430,20 @@ int m_interface_policy_init(struct ssd *ssd)
         return -1;
     }
 
-    printf("[Meta] INIT_SESSION, INSTALL_POLICY, ACTIVATE_POLICY, and DEACTIVATE_POLICY hooks registered\n");
+    if (ftl_register_nvme_hook(ssd, NVME_CMD_UPDATE_POLICY,
+                               update_policy_condition,
+                               update_policy_callback, ctx) < 0) {
+        fprintf(stderr, "[Meta] Failed to register UPDATE_POLICY hook\n");
+        return -1;
+    }
+
+    if (ftl_register_nvme_hook(ssd, NVME_CMD_REMOVE_POLICY,
+                               remove_policy_condition,
+                               remove_policy_callback, ctx) < 0) {
+        fprintf(stderr, "[Meta] Failed to register REMOVE_POLICY hook\n");
+        return -1;
+    }
+
+    printf("[Meta] INIT_SESSION, INSTALL_POLICY, ACTIVATE_POLICY, DEACTIVATE_POLICY, UPDATE_POLICY, and REMOVE_POLICY hooks registered\n");
     return 0;
 }

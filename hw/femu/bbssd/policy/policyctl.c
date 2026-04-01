@@ -17,6 +17,8 @@
 #define NVME_CMD_INSTALL_POLICY       0x95
 #define NVME_CMD_ACTIVATE_POLICY      0x96
 #define NVME_CMD_DEACTIVATE_POLICY    0x97
+#define NVME_CMD_UPDATE_POLICY        0x98
+#define NVME_CMD_REMOVE_POLICY        0x99
 
 #define SESSION_MODE_NORMAL        0
 #define SESSION_MODE_CONFIDENTIAL  1
@@ -822,8 +824,9 @@ static int do_session(const char *device, uint8_t session_mode)
     return rc;
 }
 
-static int do_install(const char *device, const char *policy_path,
-                      uint32_t policy_id, uint32_t policy_version)
+static int do_policy_image_cmd(const char *device, uint8_t opcode,
+                               const char *policy_path,
+                               uint32_t policy_id, uint32_t policy_version)
 {
     struct stat st;
     struct policy_session session = {0};
@@ -870,7 +873,7 @@ static int do_install(const char *device, const char *policy_path,
     encode_u32_le((uint32_t)st.st_size, plaintext + 8);
     memcpy(plaintext + 12, policy, (size_t)st.st_size);
 
-    rc = send_authenticated_meta_cmd(device, &session, NVME_CMD_INSTALL_POLICY,
+    rc = send_authenticated_meta_cmd(device, &session, opcode,
                                      plaintext, plaintext_len);
 
 cleanup:
@@ -887,6 +890,20 @@ cleanup:
     }
     OPENSSL_cleanse(&session, sizeof(session));
     return rc;
+}
+
+static int do_install(const char *device, const char *policy_path,
+                      uint32_t policy_id, uint32_t policy_version)
+{
+    return do_policy_image_cmd(device, NVME_CMD_INSTALL_POLICY, policy_path,
+                               policy_id, policy_version);
+}
+
+static int do_update(const char *device, const char *policy_path,
+                     uint32_t policy_id, uint32_t policy_version)
+{
+    return do_policy_image_cmd(device, NVME_CMD_UPDATE_POLICY, policy_path,
+                               policy_id, policy_version);
 }
 
 static int do_simple_opcode(const char *device, uint8_t opcode, uint32_t policy_id)
@@ -941,9 +958,11 @@ int main(int argc, char **argv)
                 "Usage:\n"
                 "  %s [--mode normal|confidential] session <device>\n"
                 "  %s [--mode normal|confidential] install <device> <policy.so> <policy_id> <version>\n"
+                "  %s [--mode normal|confidential] update <device> <policy.so> <policy_id> <version>\n"
                 "  %s [--mode normal|confidential] activate <device> <policy_id>\n"
-                "  %s [--mode normal|confidential] deactivate <device> <policy_id>\n",
-                argv[0], argv[0], argv[0], argv[0]);
+                "  %s [--mode normal|confidential] deactivate <device> <policy_id>\n"
+                "  %s [--mode normal|confidential] remove <device> <policy_id>\n",
+                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
 
@@ -964,6 +983,15 @@ int main(int argc, char **argv)
                           (uint32_t)strtoul(argv[argi + 4], NULL, 0)) == 0 ? 0 : 1;
     }
 
+    if (strcmp(argv[argi], "update") == 0) {
+        if (argc - argi != 5) {
+            return 1;
+        }
+        return do_update(argv[argi + 1], argv[argi + 2],
+                         (uint32_t)strtoul(argv[argi + 3], NULL, 0),
+                         (uint32_t)strtoul(argv[argi + 4], NULL, 0)) == 0 ? 0 : 1;
+    }
+
     if (strcmp(argv[argi], "activate") == 0) {
         if (argc - argi != 3) {
             return 1;
@@ -979,6 +1007,15 @@ int main(int argc, char **argv)
         }
         return do_simple_opcode(argv[argi + 1],
                                 NVME_CMD_DEACTIVATE_POLICY,
+                                (uint32_t)strtoul(argv[argi + 2], NULL, 0)) == 0 ? 0 : 1;
+    }
+
+    if (strcmp(argv[argi], "remove") == 0) {
+        if (argc - argi != 3) {
+            return 1;
+        }
+        return do_simple_opcode(argv[argi + 1],
+                                NVME_CMD_REMOVE_POLICY,
                                 (uint32_t)strtoul(argv[argi + 2], NULL, 0)) == 0 ? 0 : 1;
     }
 

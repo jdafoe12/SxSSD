@@ -15,10 +15,12 @@
 #define NVME_CMD_INIT_SESSION_SUBMIT  0x93
 #define NVME_CMD_INIT_SESSION_FETCH   0x94
 #define NVME_CMD_INSTALL_POLICY       0x95
-#define NVME_CMD_ACTIVATE_POLICY      0x96
+#define NVME_CMD_ACTIVATE_POLICY      0x9b
 #define NVME_CMD_DEACTIVATE_POLICY    0x97
-#define NVME_CMD_UPDATE_POLICY        0x98
+#define NVME_CMD_UPDATE_POLICY        0x9d
 #define NVME_CMD_REMOVE_POLICY        0x99
+#define NVME_CMD_POLICY_ATTESTATION_FETCH   0x9a
+#define NVME_CMD_POLICY_ATTESTATION_SUBMIT  0x9f
 
 #define SESSION_MODE_NORMAL        0
 #define SESSION_MODE_CONFIDENTIAL  1
@@ -30,6 +32,13 @@
 #define META_AUTH_TAG_SIZE 16
 #define META_ENVELOPE_AUTH_SIZE 32
 #define META_ENVELOPE_HEADER_SIZE (8 + META_ENVELOPE_AUTH_SIZE)
+
+#define POLICY_ATTESTATION_REPORT_SECURITY     1
+#define POLICY_ATTESTATION_REPORT_CONSISTENCY  2
+
+#define POLICY_ATTESTATION_REQUEST_PLAINTEXT_SIZE   8
+#define POLICY_ATTESTATION_RESPONSE_HASH_SIZE      32
+#define POLICY_ATTESTATION_RESPONSE_PLAINTEXT_SIZE 44
 
 #define POLICYCTL_COUNTER_PATH "/tmp/policyctl-session-counter"
 #define POLICYCTL_SESSION_STATE_PATH "/tmp/policyctl-session-state"
@@ -59,6 +68,22 @@ struct persisted_policy_session {
     uint64_t command_counter;
 };
 
+struct meta_encrypted_request {
+    uint64_t counter;
+    uint8_t auth[META_ENVELOPE_AUTH_SIZE];
+    const uint8_t *ciphertext;
+    size_t ciphertext_len;
+};
+
+struct policy_attestation_report {
+    uint32_t policy_id;
+    uint32_t report_type;
+    uint8_t installed;
+    uint8_t active;
+    uint8_t reserved[2];
+    uint8_t hash[POLICY_ATTESTATION_RESPONSE_HASH_SIZE];
+};
+
 static void encode_u64_le(uint64_t value, uint8_t out[8])
 {
     for (size_t i = 0; i < 8; i++) {
@@ -82,6 +107,17 @@ static void encode_u32_le(uint32_t value, uint8_t out[4])
     for (size_t i = 0; i < 4; i++) {
         out[i] = (uint8_t)(value >> (8 * i));
     }
+}
+
+static uint32_t decode_u32_le(const uint8_t in[4])
+{
+    uint32_t value = 0;
+
+    for (size_t i = 0; i < 4; i++) {
+        value |= ((uint32_t)in[i]) << (8 * i);
+    }
+
+    return value;
 }
 
 static uint64_t load_persistent_counter(void)
@@ -359,7 +395,8 @@ static int derive_labeled_key(const uint8_t base_key[32], const char *label,
     if (EVP_PKEY_CTX_set1_hkdf_key(pctx, base_key, 32) != 1) {
         goto cleanup;
     }
-    if (EVP_PKEY_CTX_add1_hkdf_info(pctx, label, (int)strlen(label)) != 1) {
+    if (EVP_PKEY_CTX_add1_hkdf_info(pctx, (const unsigned char *)label,
+                                    (int)strlen(label)) != 1) {
         goto cleanup;
     }
     if (EVP_PKEY_derive(pctx, derived_key, &derived_len) != 1 ||
@@ -574,8 +611,73 @@ cleanup:
     return rc;
 }
 
-static int send_nvme_io_cmd(const char *device, uint8_t opcode,
-                            void *buffer, uint32_t data_len)
+static int aes256_gcm_decrypt(const uint8_t key[32], uint64_t counter,
+                              uint8_t opcode, const uint8_t *ciphertext,
+                              size_t ciphertext_len,
+                              const uint8_t tag[META_AUTH_TAG_SIZE],
+                              uint8_t *plaintext)
+{
+    EVP_CIPHER_CTX *ctx = NULL;
+    uint8_t nonce[12];
+    int len = 0;
+    int rc = -1;
+
+    build_meta_nonce(counter, nonce);
+    ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        return -1;
+    }
+
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) {
+        goto cleanup;
+    }
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, (int)sizeof(nonce), NULL) != 1) {
+        goto cleanup;
+    }
+    if (EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) {
+        goto cleanup;
+    }
+    if (EVP_DecryptUpdate(ctx, NULL, &len, &opcode, 1) != 1) {
+        goto cleanup;
+    }
+    if (ciphertext_len > 0 &&
+        EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, (int)ciphertext_len) != 1) {
+        goto cleanup;
+    }
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, META_AUTH_TAG_SIZE, (void *)tag) != 1) {
+        goto cleanup;
+    }
+    if (EVP_DecryptFinal_ex(ctx, plaintext + len, &len) != 1) {
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    OPENSSL_cleanse(nonce, sizeof(nonce));
+    if (ctx) {
+        EVP_CIPHER_CTX_free(ctx);
+    }
+    return rc;
+}
+
+static int parse_meta_envelope(const uint8_t *buffer, size_t buffer_len,
+                               struct meta_encrypted_request *req)
+{
+    if (!buffer || !req || buffer_len < META_ENVELOPE_HEADER_SIZE) {
+        return -1;
+    }
+
+    req->counter = decode_u64_le(buffer);
+    memcpy(req->auth, buffer + 8, META_ENVELOPE_AUTH_SIZE);
+    req->ciphertext = buffer + META_ENVELOPE_HEADER_SIZE;
+    req->ciphertext_len = buffer_len - META_ENVELOPE_HEADER_SIZE;
+    return 0;
+}
+
+static int send_nvme_io_cmd_ex(const char *device, uint8_t opcode,
+                               void *buffer, uint32_t data_len,
+                               uint32_t cdw12, uint32_t cdw13)
 {
     struct nvme_passthru_cmd cmd = {0};
     int fd;
@@ -591,7 +693,8 @@ static int send_nvme_io_cmd(const char *device, uint8_t opcode,
     cmd.nsid = 1;
     cmd.addr = (uintptr_t)buffer;
     cmd.data_len = data_len;
-    cmd.cdw12 = data_len;
+    cmd.cdw12 = cdw12;
+    cmd.cdw13 = cdw13;
 
     if (ioctl(fd, NVME_IOCTL_IO_CMD, &cmd) != 0) {
         perror("ioctl");
@@ -607,6 +710,12 @@ static int send_nvme_io_cmd(const char *device, uint8_t opcode,
 cleanup:
     close(fd);
     return rc;
+}
+
+static int send_nvme_io_cmd(const char *device, uint8_t opcode,
+                            void *buffer, uint32_t data_len)
+{
+    return send_nvme_io_cmd_ex(device, opcode, buffer, data_len, data_len, 0);
 }
 
 static int establish_session(const char *device, uint8_t session_mode,
@@ -810,6 +919,179 @@ cleanup:
     return rc;
 }
 
+static int verify_attestation_response(const struct policy_session *session,
+                                       uint8_t opcode,
+                                       uint64_t counter,
+                                       uint32_t expected_policy_id,
+                                       const uint8_t *response,
+                                       uint32_t response_len,
+                                       struct policy_attestation_report *report_out)
+{
+    struct meta_encrypted_request env;
+    uint8_t plaintext[POLICY_ATTESTATION_RESPONSE_PLAINTEXT_SIZE];
+    int rc = -1;
+
+    if (!session || !response || !report_out ||
+        response_len != META_ENVELOPE_HEADER_SIZE +
+                        POLICY_ATTESTATION_RESPONSE_PLAINTEXT_SIZE) {
+        return -1;
+    }
+    if (parse_meta_envelope(response, response_len, &env) != 0) {
+        return -1;
+    }
+    if (env.counter != counter ||
+        env.ciphertext_len != POLICY_ATTESTATION_RESPONSE_PLAINTEXT_SIZE) {
+        return -1;
+    }
+
+    memset(plaintext, 0, sizeof(plaintext));
+
+    if (session->mode == SESSION_MODE_NORMAL) {
+        uint8_t mac_key[32];
+        uint8_t computed_mac[META_AUTH_HMAC_SIZE];
+
+        if (derive_labeled_key(session->key, "meta-normal-response-mac", mac_key) != 0) {
+            OPENSSL_cleanse(mac_key, sizeof(mac_key));
+            goto cleanup;
+        }
+        if (compute_meta_hmac(mac_key, opcode, counter,
+                              env.ciphertext, env.ciphertext_len,
+                              computed_mac) != 0) {
+            OPENSSL_cleanse(mac_key, sizeof(mac_key));
+            OPENSSL_cleanse(computed_mac, sizeof(computed_mac));
+            goto cleanup;
+        }
+        if (CRYPTO_memcmp(computed_mac, env.auth, META_AUTH_HMAC_SIZE) != 0) {
+            OPENSSL_cleanse(mac_key, sizeof(mac_key));
+            OPENSSL_cleanse(computed_mac, sizeof(computed_mac));
+            goto cleanup;
+        }
+        memcpy(plaintext, env.ciphertext, sizeof(plaintext));
+        OPENSSL_cleanse(mac_key, sizeof(mac_key));
+        OPENSSL_cleanse(computed_mac, sizeof(computed_mac));
+    } else if (session->mode == SESSION_MODE_CONFIDENTIAL) {
+        uint8_t aead_key[32];
+
+        if (derive_labeled_key(session->key, "meta-conf-response-aead", aead_key) != 0) {
+            OPENSSL_cleanse(aead_key, sizeof(aead_key));
+            goto cleanup;
+        }
+        if (aes256_gcm_decrypt(aead_key, counter, opcode,
+                               env.ciphertext, env.ciphertext_len,
+                               env.auth, plaintext) != 0) {
+            OPENSSL_cleanse(aead_key, sizeof(aead_key));
+            goto cleanup;
+        }
+        OPENSSL_cleanse(aead_key, sizeof(aead_key));
+    } else {
+        goto cleanup;
+    }
+
+    memset(report_out, 0, sizeof(*report_out));
+    report_out->policy_id = decode_u32_le(plaintext);
+    report_out->report_type = decode_u32_le(plaintext + 4);
+    report_out->installed = plaintext[8];
+    report_out->active = plaintext[9];
+    memcpy(report_out->hash, plaintext + 12, sizeof(report_out->hash));
+
+    if (report_out->policy_id != expected_policy_id) {
+        goto cleanup;
+    }
+    if (report_out->report_type != POLICY_ATTESTATION_REPORT_SECURITY &&
+        report_out->report_type != POLICY_ATTESTATION_REPORT_CONSISTENCY) {
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    OPENSSL_cleanse(plaintext, sizeof(plaintext));
+    if (rc != 0) {
+        memset(report_out, 0, sizeof(*report_out));
+    }
+    return rc;
+}
+
+static int do_attestation(const char *device, uint32_t policy_id, uint32_t report_type)
+{
+    struct policy_session session = {0};
+    uint8_t plaintext[POLICY_ATTESTATION_REQUEST_PLAINTEXT_SIZE];
+    uint8_t *buffer = NULL;
+    uint32_t response_len = META_ENVELOPE_HEADER_SIZE +
+                            POLICY_ATTESTATION_RESPONSE_PLAINTEXT_SIZE;
+    uint64_t counter;
+    struct policy_attestation_report report = {0};
+    int rc = -1;
+
+    if (load_session_state(&session) != 0) {
+        fprintf(stderr, "No active session. Run: policyctl --mode normal|confidential session <device>\n");
+        return -1;
+    }
+    if (policy_id == 0) {
+        fprintf(stderr, "Invalid policy_id 0\n");
+        goto cleanup;
+    }
+    if (report_type != POLICY_ATTESTATION_REPORT_SECURITY &&
+        report_type != POLICY_ATTESTATION_REPORT_CONSISTENCY) {
+        fprintf(stderr, "Invalid report type\n");
+        goto cleanup;
+    }
+
+    encode_u32_le(policy_id, plaintext);
+    encode_u32_le(report_type, plaintext + 4);
+
+    if (send_authenticated_meta_cmd(device, &session,
+                                    NVME_CMD_POLICY_ATTESTATION_SUBMIT,
+                                    plaintext, sizeof(plaintext)) != 0) {
+        goto cleanup;
+    }
+    counter = session.command_counter;
+
+    buffer = calloc(1, response_len);
+    if (!buffer) {
+        goto cleanup;
+    }
+
+    if (send_nvme_io_cmd(device, NVME_CMD_POLICY_ATTESTATION_FETCH,
+                         buffer, response_len) != 0) {
+        goto cleanup;
+    }
+
+    if (verify_attestation_response(&session, NVME_CMD_POLICY_ATTESTATION_SUBMIT,
+                                    counter, policy_id,
+                                    buffer, response_len, &report) != 0) {
+        fprintf(stderr, "Failed to verify attestation response\n");
+        goto cleanup;
+    }
+
+    printf("policy_id=%u report=%s installed=%u active=%u\n",
+           report.policy_id,
+           report.report_type == POLICY_ATTESTATION_REPORT_SECURITY ?
+           "security" : "consistency",
+           report.installed, report.active);
+    if (report.report_type == POLICY_ATTESTATION_REPORT_CONSISTENCY) {
+        size_t i;
+
+        printf("hash=");
+        for (i = 0; i < sizeof(report.hash); i++) {
+            printf("%02x", report.hash[i]);
+        }
+        printf("\n");
+    }
+
+    rc = 0;
+
+cleanup:
+    if (buffer) {
+        OPENSSL_cleanse(buffer, response_len);
+        free(buffer);
+    }
+    OPENSSL_cleanse(plaintext, sizeof(plaintext));
+    OPENSSL_cleanse(&report, sizeof(report));
+    OPENSSL_cleanse(&session, sizeof(session));
+    return rc;
+}
+
 static int do_session(const char *device, uint8_t session_mode)
 {
     struct policy_session session = {0};
@@ -940,9 +1222,26 @@ static int parse_mode(const char *arg, uint8_t *mode_out)
     return -1;
 }
 
+static int parse_report_type(const char *arg, uint32_t *report_type_out)
+{
+    if (!arg || !report_type_out) {
+        return -1;
+    }
+    if (strcmp(arg, "security") == 0) {
+        *report_type_out = POLICY_ATTESTATION_REPORT_SECURITY;
+        return 0;
+    }
+    if (strcmp(arg, "consistency") == 0) {
+        *report_type_out = POLICY_ATTESTATION_REPORT_CONSISTENCY;
+        return 0;
+    }
+    return -1;
+}
+
 int main(int argc, char **argv)
 {
     uint8_t session_mode = SESSION_MODE_NORMAL;
+    uint32_t report_type;
     int argi = 1;
 
     if (argc > 3 && strcmp(argv[1], "--mode") == 0) {
@@ -961,8 +1260,9 @@ int main(int argc, char **argv)
                 "  %s [--mode normal|confidential] update <device> <policy.so> <policy_id> <version>\n"
                 "  %s [--mode normal|confidential] activate <device> <policy_id>\n"
                 "  %s [--mode normal|confidential] deactivate <device> <policy_id>\n"
-                "  %s [--mode normal|confidential] remove <device> <policy_id>\n",
-                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+                "  %s [--mode normal|confidential] remove <device> <policy_id>\n"
+                "  %s [--mode normal|confidential] attest <device> <policy_id> <security|consistency>\n",
+                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
 
@@ -1017,6 +1317,19 @@ int main(int argc, char **argv)
         return do_simple_opcode(argv[argi + 1],
                                 NVME_CMD_REMOVE_POLICY,
                                 (uint32_t)strtoul(argv[argi + 2], NULL, 0)) == 0 ? 0 : 1;
+    }
+
+    if (strcmp(argv[argi], "attest") == 0) {
+        if (argc - argi != 4) {
+            return 1;
+        }
+        if (parse_report_type(argv[argi + 3], &report_type) != 0) {
+            fprintf(stderr, "Invalid report type: %s\n", argv[argi + 3]);
+            return 1;
+        }
+        return do_attestation(argv[argi + 1],
+                              (uint32_t)strtoul(argv[argi + 2], NULL, 0),
+                              report_type) == 0 ? 0 : 1;
     }
 
     fprintf(stderr, "Unknown command: %s\n", argv[argi]);

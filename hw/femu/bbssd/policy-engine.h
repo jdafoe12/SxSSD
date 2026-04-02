@@ -87,6 +87,9 @@ bool pe_has_nvme_hook(struct policy_engine *pe, uint8_t opcode);
 /* Create and init */
 struct policy_engine *pe_create(void);
 void pe_set_bbm(struct policy_engine *pe, struct bbm *ctx);
+int pe_read_policy_payload(struct ssd *ssd,
+                           const struct policy_storage_desc *desc,
+                           uint8_t **payload_out);
 int pe_activate_stored_policy(struct policy_engine *pe, struct ssd *ssd,
                               const struct policy_storage_desc *desc);
 int pe_deactivate_policy(struct policy_engine *pe, uint32_t policy_id);

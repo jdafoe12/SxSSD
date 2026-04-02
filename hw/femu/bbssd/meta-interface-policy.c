@@ -20,11 +20,19 @@
 /* Type Definitions */
 /* ========================================================================== */
 
+#define META_AUTH_HMAC_SIZE 32
+#define META_AUTH_TAG_SIZE 16
+#define META_ENVELOPE_AUTH_SIZE 32
+#define META_ENVELOPE_HEADER_SIZE (8 + META_ENVELOPE_AUTH_SIZE)
+
 struct meta_policy_context {
     uint8_t session_key[32];
     uint8_t pending_response[INIT_SESSION_RESPONSE_SIZE];
+    uint8_t pending_attestation_response[META_ENVELOPE_HEADER_SIZE +
+                                         POLICY_ATTESTATION_RESPONSE_PLAINTEXT_SIZE];
     bool session_established;
     bool pending_response_valid;
+    bool pending_attestation_response_valid;
     int mode;            // TODO: Not used yet.
     uint64_t active_session_counter; // This is ctr0 in the paper. This is for replay protection within the session.
     uint64_t session_counter;        // This is for replay protection of session initialization.
@@ -36,7 +44,6 @@ struct meta_policy_context {
         uint32_t policy_size_pages;
         uint32_t block_count;
         struct pba *blocks;
-        uint8_t *payload_copy;
         bool active;
         bool in_use;
     } installed_policies[16];
@@ -44,16 +51,20 @@ struct meta_policy_context {
 
 static struct meta_policy_context *g_meta_ctx = NULL;
 
-#define META_AUTH_HMAC_SIZE 32
-#define META_AUTH_TAG_SIZE 16
-#define META_ENVELOPE_AUTH_SIZE 32
-#define META_ENVELOPE_HEADER_SIZE (8 + META_ENVELOPE_AUTH_SIZE)
-
 struct meta_encrypted_request {
     uint64_t counter;
     uint8_t auth[META_ENVELOPE_AUTH_SIZE];
     const uint8_t *ciphertext;
     size_t ciphertext_len;
+};
+
+struct policy_attestation_report {
+    uint32_t policy_id;
+    uint32_t report_type;
+    uint8_t installed;
+    uint8_t active;
+    uint8_t reserved[2];
+    uint8_t hash[POLICY_ATTESTATION_RESPONSE_HASH_SIZE];
 };
 
 static void encode_u64_le(uint64_t value, uint8_t out[8])
@@ -83,6 +94,13 @@ static uint32_t decode_u32_le(const uint8_t in[4])
     }
 
     return value;
+}
+
+static void encode_u32_le(uint32_t value, uint8_t out[4])
+{
+    for (size_t i = 0; i < 4; i++) {
+        out[i] = (uint8_t)(value >> (8 * i));
+    }
 }
 
 static void build_meta_nonce(uint64_t counter, uint8_t nonce[12])
@@ -243,6 +261,95 @@ cleanup:
     return rc;
 }
 
+static int aes256_gcm_encrypt(const uint8_t key[32], uint64_t counter,
+                              uint8_t opcode, const uint8_t *plaintext,
+                              size_t plaintext_len, uint8_t *ciphertext,
+                              uint8_t tag[16])
+{
+    EVP_CIPHER_CTX *ctx = NULL;
+    uint8_t nonce[12];
+    int len = 0;
+    int out_len = 0;
+    int rc = -1;
+
+    build_meta_nonce(counter, nonce);
+    ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        return -1;
+    }
+
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) {
+        goto cleanup;
+    }
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, (int)sizeof(nonce), NULL) != 1) {
+        goto cleanup;
+    }
+    if (EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) {
+        goto cleanup;
+    }
+    if (EVP_EncryptUpdate(ctx, NULL, &len, &opcode, 1) != 1) {
+        goto cleanup;
+    }
+    if (plaintext_len > 0 &&
+        EVP_EncryptUpdate(ctx, ciphertext, &len, plaintext, (int)plaintext_len) != 1) {
+        goto cleanup;
+    }
+    out_len += len;
+    if (EVP_EncryptFinal_ex(ctx, ciphertext + out_len, &len) != 1) {
+        goto cleanup;
+    }
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, META_AUTH_TAG_SIZE, tag) != 1) {
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    OPENSSL_cleanse(nonce, sizeof(nonce));
+    if (ctx) {
+        EVP_CIPHER_CTX_free(ctx);
+    }
+    return rc;
+}
+
+static int compute_policy_sha256(const uint8_t *payload, size_t payload_len,
+                                 uint8_t out[POLICY_ATTESTATION_RESPONSE_HASH_SIZE])
+{
+    EVP_MD_CTX *md_ctx = NULL;
+    unsigned int digest_len = 0;
+    int rc = -1;
+
+    if (!payload || !out) {
+        return -1;
+    }
+
+    md_ctx = EVP_MD_CTX_new();
+    if (!md_ctx) {
+        return -1;
+    }
+    if (EVP_DigestInit_ex(md_ctx, EVP_sha256(), NULL) != 1) {
+        goto cleanup;
+    }
+    if (payload_len > 0 && EVP_DigestUpdate(md_ctx, payload, payload_len) != 1) {
+        goto cleanup;
+    }
+    if (EVP_DigestFinal_ex(md_ctx, out, &digest_len) != 1 ||
+        digest_len != POLICY_ATTESTATION_RESPONSE_HASH_SIZE) {
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    if (md_ctx) {
+        EVP_MD_CTX_free(md_ctx);
+    }
+    if (rc != 0) {
+        memset(out, 0, POLICY_ATTESTATION_RESPONSE_HASH_SIZE);
+    }
+    return rc;
+}
+
 static int parse_meta_envelope(const uint8_t *buffer, size_t buffer_len,
                                struct meta_encrypted_request *req)
 {
@@ -259,6 +366,7 @@ static int parse_meta_envelope(const uint8_t *buffer, size_t buffer_len,
 
 static int authenticate_meta_request(struct meta_policy_context *ctx,
                                      FemuCtrl *n, NvmeCmd *cmd, uint8_t opcode,
+                                     uint64_t *counter_out,
                                      uint8_t **plaintext_out,
                                      size_t *plaintext_len_out)
 {
@@ -280,7 +388,6 @@ static int authenticate_meta_request(struct meta_policy_context *ctx,
     request_len = le32_to_cpu(cmd->cdw12);
     prp1 = le64_to_cpu(cmd->dptr.prp1);
     prp2 = le64_to_cpu(cmd->dptr.prp2);
-
     if (request_len < META_ENVELOPE_HEADER_SIZE) {
         return -1;
     }
@@ -340,6 +447,9 @@ static int authenticate_meta_request(struct meta_policy_context *ctx,
     }
 
     ctx->active_session_counter = req.counter;
+    if (counter_out) {
+        *counter_out = req.counter;
+    }
     *plaintext_out = plaintext;
     *plaintext_len_out = req.ciphertext_len;
     plaintext = NULL;
@@ -686,7 +796,7 @@ static void fill_policy_storage_desc(const struct meta_policy_context *ctx, int 
     desc->policy_size_bytes = ctx->installed_policies[slot].policy_size_bytes;
     desc->block_count = ctx->installed_policies[slot].block_count;
     desc->blocks = ctx->installed_policies[slot].blocks;
-    desc->expected_payload = ctx->installed_policies[slot].payload_copy;
+    desc->expected_payload = NULL;
 }
 
 static void reset_policy_slot_record(struct meta_policy_context *ctx, int slot)
@@ -804,7 +914,6 @@ static int reclaim_policy_storage(struct ssd *ssd,
 static void free_policy_slot_resources(struct meta_policy_context *ctx, int slot)
 {
     g_free(ctx->installed_policies[slot].blocks);
-    g_free(ctx->installed_policies[slot].payload_copy);
     reset_policy_slot_record(ctx, slot);
 }
 
@@ -888,6 +997,7 @@ static uint64_t install_policy_callback(struct ssd *ssd, struct NvmeCommandEvent
     (void)api;
 
     if (authenticate_meta_request(ctx, n, event->cmd, event->opcode,
+                                  NULL,
                                   &plaintext, &plaintext_len) != 0) {
         event->status = NVME_INVALID_FIELD | NVME_DNR;
         return 0;
@@ -956,7 +1066,6 @@ static uint64_t install_policy_callback(struct ssd *ssd, struct NvmeCommandEvent
     ctx->installed_policies[slot].policy_size_pages = page_count;
     ctx->installed_policies[slot].block_count = block_count;
     ctx->installed_policies[slot].blocks = blocks;
-    ctx->installed_policies[slot].payload_copy = g_memdup2(payload, policy_size_bytes);
     ctx->installed_policies[slot].active = false;
     ctx->installed_policies[slot].in_use = true;
 
@@ -994,6 +1103,7 @@ static int authenticate_inactive_policy_request(struct meta_policy_context *ctx,
         return -1;
     }
     if (authenticate_meta_request(ctx, event->ctrl, event->cmd, event->opcode,
+                                  NULL,
                                   &plaintext, &plaintext_len) != 0) {
         return -1;
     }
@@ -1062,11 +1172,9 @@ static uint64_t update_policy_callback(struct ssd *ssd,
         uint32_t page_count;
         uint32_t block_count;
         uint8_t *payload = NULL;
-        uint8_t *payload_copy = NULL;
         struct pba *new_blocks = NULL;
         struct pba *old_blocks;
         uint32_t old_block_count;
-        uint8_t *old_payload_copy;
 
         if (plaintext_len < 12) {
             event->status = NVME_INVALID_FIELD | NVME_DNR;
@@ -1090,7 +1198,6 @@ static uint64_t update_policy_callback(struct ssd *ssd,
 
         payload = g_malloc0(policy_size_bytes);
         memcpy(payload, plaintext + 12, policy_size_bytes);
-        payload_copy = g_memdup2(payload, policy_size_bytes);
 
         new_blocks = g_malloc0(sizeof(struct pba) * block_count);
         if (select_policy_blocks(ssd, ctx, block_count, new_blocks) < 0) {
@@ -1110,7 +1217,6 @@ static uint64_t update_policy_callback(struct ssd *ssd,
 
         old_blocks = ctx->installed_policies[slot].blocks;
         old_block_count = ctx->installed_policies[slot].block_count;
-        old_payload_copy = ctx->installed_policies[slot].payload_copy;
 
         if (reclaim_policy_storage(ssd, old_blocks, old_block_count) != 0) {
             reclaim_policy_storage(ssd, new_blocks, block_count);
@@ -1123,10 +1229,8 @@ static uint64_t update_policy_callback(struct ssd *ssd,
         ctx->installed_policies[slot].policy_size_pages = page_count;
         ctx->installed_policies[slot].block_count = block_count;
         ctx->installed_policies[slot].blocks = new_blocks;
-        ctx->installed_policies[slot].payload_copy = payload_copy;
 
         g_free(old_blocks);
-        g_free(old_payload_copy);
         g_free(payload);
 
         printf("[Meta] Updated policy id=%u version=%u size=%u bytes blocks=%u\n",
@@ -1137,7 +1241,6 @@ static uint64_t update_policy_callback(struct ssd *ssd,
 
 update_cleanup:
         g_free(new_blocks);
-        g_free(payload_copy);
         g_free(payload);
         goto cleanup;
     }
@@ -1224,6 +1327,7 @@ static uint64_t activate_policy_callback(struct ssd *ssd, struct NvmeCommandEven
     (void)api;
 
     if (authenticate_meta_request(ctx, event->ctrl, event->cmd, event->opcode,
+                                  NULL,
                                   &plaintext, &plaintext_len) != 0) {
         event->status = NVME_INVALID_FIELD | NVME_DNR;
         return 0;
@@ -1276,6 +1380,207 @@ static uint64_t activate_policy_callback(struct ssd *ssd, struct NvmeCommandEven
 
     event->status = NVME_SUCCESS;
 cleanup:
+    if (plaintext) {
+        OPENSSL_cleanse(plaintext, plaintext_len);
+        g_free(plaintext);
+    }
+    return 0;
+}
+
+static int build_attestation_response_envelope(struct meta_policy_context *ctx,
+                                               uint8_t opcode,
+                                               uint64_t counter,
+                                               const uint8_t *plaintext,
+                                               size_t plaintext_len,
+                                               uint8_t **response_out,
+                                               uint32_t *response_len_out)
+{
+    uint8_t *response = NULL;
+    uint8_t *ciphertext;
+    size_t response_len;
+    int rc = -1;
+
+    if (!ctx || !plaintext || !response_out || !response_len_out ||
+        plaintext_len > UINT32_MAX) {
+        return -1;
+    }
+
+    response_len = META_ENVELOPE_HEADER_SIZE + plaintext_len;
+    if (response_len > UINT32_MAX) {
+        return -1;
+    }
+    response = g_malloc0(response_len);
+    encode_u64_le(counter, response);
+    ciphertext = response + META_ENVELOPE_HEADER_SIZE;
+
+    if (ctx->mode == SESSION_MODE_NORMAL) {
+        uint8_t mac_key[32];
+
+        if (derive_labeled_key(ctx->session_key, "meta-normal-response-mac", mac_key) != 0) {
+            OPENSSL_cleanse(mac_key, sizeof(mac_key));
+            goto cleanup;
+        }
+        memcpy(ciphertext, plaintext, plaintext_len);
+        if (compute_meta_hmac(mac_key, opcode, counter, ciphertext, plaintext_len,
+                              response + 8) != 0) {
+            OPENSSL_cleanse(mac_key, sizeof(mac_key));
+            goto cleanup;
+        }
+        OPENSSL_cleanse(mac_key, sizeof(mac_key));
+    } else if (ctx->mode == SESSION_MODE_CONFIDENTIAL) {
+        uint8_t aead_key[32];
+
+        if (derive_labeled_key(ctx->session_key, "meta-conf-response-aead", aead_key) != 0) {
+            OPENSSL_cleanse(aead_key, sizeof(aead_key));
+            goto cleanup;
+        }
+        if (aes256_gcm_encrypt(aead_key, counter, opcode, plaintext, plaintext_len,
+                               ciphertext, response + 8) != 0) {
+            OPENSSL_cleanse(aead_key, sizeof(aead_key));
+            goto cleanup;
+        }
+        OPENSSL_cleanse(aead_key, sizeof(aead_key));
+    } else {
+        goto cleanup;
+    }
+
+    *response_out = response;
+    *response_len_out = (uint32_t)response_len;
+    response = NULL;
+    rc = 0;
+
+cleanup:
+    if (response) {
+        OPENSSL_cleanse(response, response_len);
+        g_free(response);
+    }
+    return rc;
+}
+
+static bool policy_attestation_condition(struct ssd *ssd, struct NvmeCommandEvent *event,
+                                         struct FtlPolicyAPI *api, void *context)
+{
+    (void)ssd;
+    (void)api;
+    (void)context;
+    return !event->is_admin &&
+           (event->opcode == NVME_CMD_POLICY_ATTESTATION_SUBMIT ||
+            event->opcode == NVME_CMD_POLICY_ATTESTATION_FETCH);
+}
+
+static uint64_t policy_attestation_callback(struct ssd *ssd,
+                                            struct NvmeCommandEvent *event,
+                                            struct FtlPolicyAPI *api,
+                                            void *context)
+{
+    struct meta_policy_context *ctx = (struct meta_policy_context *)context;
+    FemuCtrl *n = event->ctrl;
+    NvmeCmd *cmd = event->cmd;
+    uint8_t *plaintext = NULL;
+    size_t plaintext_len = 0;
+    uint64_t request_counter = 0;
+    uint32_t policy_id;
+    uint32_t report_type;
+    int slot;
+    struct policy_attestation_report report = {0};
+    uint8_t response_plaintext[POLICY_ATTESTATION_RESPONSE_PLAINTEXT_SIZE];
+    uint8_t *response = NULL;
+    uint8_t *policy_payload = NULL;
+    struct policy_storage_desc desc;
+    uint32_t response_len = 0;
+
+    (void)api;
+    if (event->opcode == NVME_CMD_POLICY_ATTESTATION_FETCH) {
+        if (!ctx->pending_attestation_response_valid) {
+            event->status = NVME_INVALID_FIELD | NVME_DNR;
+            return 0;
+        }
+
+        if (dma_read_prp(n, ctx->pending_attestation_response,
+                         sizeof(ctx->pending_attestation_response),
+                         le64_to_cpu(cmd->dptr.prp1),
+                         le64_to_cpu(cmd->dptr.prp2)) != NVME_SUCCESS) {
+            event->status = NVME_DATA_TRAS_ERROR | NVME_DNR;
+            return 0;
+        }
+
+        ctx->pending_attestation_response_valid = false;
+        event->status = NVME_SUCCESS;
+        return 0;
+    }
+
+    if (authenticate_meta_request(ctx, n, cmd, event->opcode, &request_counter,
+                                  &plaintext, &plaintext_len) != 0) {
+        event->status = NVME_INVALID_FIELD | NVME_DNR;
+        return 0;
+    }
+    if (plaintext_len != POLICY_ATTESTATION_REQUEST_PLAINTEXT_SIZE) {
+        event->status = NVME_INVALID_FIELD | NVME_DNR;
+        goto cleanup;
+    }
+    policy_id = decode_u32_le(plaintext);
+    report_type = decode_u32_le(plaintext + 4);
+    if (policy_id == 0) {
+        event->status = NVME_INVALID_FIELD | NVME_DNR;
+        goto cleanup;
+    }
+    if (report_type != POLICY_ATTESTATION_REPORT_SECURITY &&
+        report_type != POLICY_ATTESTATION_REPORT_CONSISTENCY) {
+        event->status = NVME_INVALID_FIELD | NVME_DNR;
+        goto cleanup;
+    }
+
+    slot = find_policy_slot(ctx, policy_id);
+
+    report.policy_id = policy_id;
+    report.report_type = report_type;
+    report.installed = (slot >= 0) ? 1 : 0;
+    report.active = pe_is_policy_active(ssd->policy_engine, policy_id) ? 1 : 0;
+
+    if (report_type == POLICY_ATTESTATION_REPORT_CONSISTENCY && slot >= 0) {
+        fill_policy_storage_desc(ctx, slot, &desc);
+        if (pe_read_policy_payload(ssd, &desc, &policy_payload) != 0) {
+            event->status = NVME_DATA_TRAS_ERROR | NVME_DNR;
+            goto cleanup;
+        }
+        if (compute_policy_sha256(policy_payload,
+                                  desc.policy_size_bytes,
+                                  report.hash) != 0) {
+            event->status = NVME_INVALID_FIELD | NVME_DNR;
+            goto cleanup;
+        }
+    }
+
+    memset(response_plaintext, 0, sizeof(response_plaintext));
+    encode_u32_le(report.policy_id, response_plaintext);
+    encode_u32_le(report.report_type, response_plaintext + 4);
+    response_plaintext[8] = report.installed;
+    response_plaintext[9] = report.active;
+    memcpy(response_plaintext + 12, report.hash, sizeof(report.hash));
+
+    if (build_attestation_response_envelope(ctx, NVME_CMD_POLICY_ATTESTATION_SUBMIT,
+                                            request_counter,
+                                            response_plaintext,
+                                            sizeof(response_plaintext),
+                                            &response, &response_len) != 0) {
+        event->status = NVME_INVALID_FIELD | NVME_DNR;
+        goto cleanup;
+    }
+
+    memcpy(ctx->pending_attestation_response, response, response_len);
+    ctx->pending_attestation_response_valid = true;
+    event->status = NVME_SUCCESS;
+
+cleanup:
+    OPENSSL_cleanse(response_plaintext, sizeof(response_plaintext));
+    if (policy_payload) {
+        OPENSSL_cleanse(policy_payload, desc.policy_size_bytes);
+        g_free(policy_payload);
+    }
+    if (response) {
+        OPENSSL_cleanse(response, response_len);
+        g_free(response);
+    }
     if (plaintext) {
         OPENSSL_cleanse(plaintext, plaintext_len);
         g_free(plaintext);
@@ -1360,6 +1665,7 @@ static uint64_t init_session_callback(struct ssd *ssd, struct NvmeCommandEvent *
         ctx->session_counter = counter;
         ctx->mode = session_mode;
         ctx->active_session_counter = 0;
+        ctx->pending_attestation_response_valid = false;
         ctx->session_established = true;
     } else if (event->opcode == NVME_CMD_INIT_SESSION_FETCH) {
         if (!ctx->pending_response_valid) {
@@ -1391,6 +1697,7 @@ int m_interface_policy_init(struct ssd *ssd)
     struct meta_policy_context *ctx = g_malloc0(sizeof(struct meta_policy_context));
     ctx->session_established = false;
     ctx->pending_response_valid = false;
+    ctx->pending_attestation_response_valid = false;
     ctx->session_counter = 0;
     
     g_meta_ctx = ctx;
@@ -1444,6 +1751,19 @@ int m_interface_policy_init(struct ssd *ssd)
         return -1;
     }
 
-    printf("[Meta] INIT_SESSION, INSTALL_POLICY, ACTIVATE_POLICY, DEACTIVATE_POLICY, UPDATE_POLICY, and REMOVE_POLICY hooks registered\n");
+    if (ftl_register_nvme_hook(ssd, NVME_CMD_POLICY_ATTESTATION_SUBMIT,
+                               policy_attestation_condition,
+                               policy_attestation_callback, ctx) < 0) {
+        fprintf(stderr, "[Meta] Failed to register POLICY_ATTESTATION_SUBMIT hook\n");
+        return -1;
+    }
+
+    if (ftl_register_nvme_hook(ssd, NVME_CMD_POLICY_ATTESTATION_FETCH,
+                               policy_attestation_condition,
+                               policy_attestation_callback, ctx) < 0) {
+        fprintf(stderr, "[Meta] Failed to register POLICY_ATTESTATION_FETCH hook\n");
+        return -1;
+    }
+
     return 0;
 }

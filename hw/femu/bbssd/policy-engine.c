@@ -214,9 +214,9 @@ static void policy_loader_close(struct policy_loader_ctx *loader)
     g_free(loader);
 }
 
-static int read_policy_payload(struct ssd *ssd,
-                               const struct policy_storage_desc *desc,
-                               uint8_t **payload_out)
+int pe_read_policy_payload(struct ssd *ssd,
+                           const struct policy_storage_desc *desc,
+                           uint8_t **payload_out)
 {
     uint32_t page_size;
     uint32_t pages_per_block;
@@ -682,7 +682,7 @@ int pe_activate_stored_policy(struct policy_engine *pe, struct ssd *ssd,
         return -1;
     }
 
-    if (read_policy_payload(ssd, desc, &payload) < 0) {
+    if (pe_read_policy_payload(ssd, desc, &payload) < 0) {
         printf("[PolicyEngine] Failed to read stored policy payload\n");
         return -1;
     }

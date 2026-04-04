@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 POLICY_DIR="$(cd "$SCRIPT_DIR/../policy" && pwd)"
-DEVICE="${1:-/dev/nvme0n1}"
+DEVICE="${1:-/dev/nvme0}"
 BASE_POLICY_ID="${2:-100}"
 BASE_POLICY_VERSION="${3:-1}"
 POLICY_PATH="${4:-$POLICY_DIR/block-interface-policy.so}"

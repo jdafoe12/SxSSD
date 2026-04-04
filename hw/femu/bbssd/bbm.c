@@ -95,10 +95,9 @@ int bbm_init(struct bbm *ctx, const BbCtrlParams *bbp, const struct ssdparams *p
     ctx->excluded_phys_blks = g_malloc0(ctx->total_phys_blks);
 
     /* Initialize BBM Policy API */
+#if 0
     ctx->policy_api = g_malloc0(sizeof(struct BbmPolicyAPI));
     ctx->policy_api->version = 1;
-    
-    /* Populate function pointers */
     ctx->policy_api->get_maptbl_entry = bbm_get_maptbl_entry;
     ctx->policy_api->is_reserved_blk = bbm_is_reserved_blk;
     ctx->policy_api->read = bbm_read;
@@ -115,6 +114,7 @@ int bbm_init(struct bbm *ctx, const BbCtrlParams *bbp, const struct ssdparams *p
     ctx->policy_api->mark_block_free = bbm_mark_block_free;
     ctx->policy_api->get_page_status = bbm_get_page_status;
     ctx->policy_api->get_block_vpc_ipc = bbm_get_block_vpc_ipc;
+#endif
 
     return 0;
 }

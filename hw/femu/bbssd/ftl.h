@@ -10,6 +10,7 @@ struct policy_engine;
 
 struct FtlBackend;
 struct FtlPolicyAPI;  /* Forward declaration */
+struct FemuCtrl;
 
 #define INVALID_PPA     (~(0ULL))
 #define INVALID_LPN     (~(0ULL))
@@ -17,6 +18,18 @@ struct FtlPolicyAPI;  /* Forward declaration */
 
 #define MAX_FTL_EVENT_HOOKS (256)
 #define MAX_NVME_HOOKS (256)
+
+struct NamespacePersonalityConfig {
+    uint8_t csi;
+    uint64_t nsze;
+    uint64_t ncap;
+    uint64_t nuse;
+    uint32_t noiob;
+    const void *ns_csi_data;
+    size_t ns_csi_data_len;
+    const void *ctrl_csi_data;
+    size_t ctrl_csi_data_len;
+};
 
 enum FtlEventCmd {
     FTL_WRITE_EVENT,
@@ -137,6 +150,14 @@ typedef uint64_t (*NvmeHookCallback)(struct ssd *ssd,
                                      struct FtlPolicyAPI *api,
                                      void *context);
 struct NvmeHook {
+    uint8_t opcode;
+    NvmeHookCondition condition;
+    NvmeHookCallback callback;
+    void *context;
+    bool active;
+};
+
+struct AdminHook {
     uint8_t opcode;
     NvmeHookCondition condition;
     NvmeHookCallback callback;
@@ -282,6 +303,10 @@ struct eswd {
     int vpc;           /* valid page count in this eSWD */
     int ipc;           /* invalid page count in this eSWD */
     uint32_t wp_page_index;  /* next page to write in this eSWD (0..pgs_per_eswd-1) */
+    uint64_t wp_lba;         /* host-visible sequential write pointer for this eSWD */
+    uint64_t staged_page_lba;    /* absolute LBA of the staged physical page */
+    uint32_t staged_valid_lbas;  /* number of valid LBAs currently staged */
+    uint8_t *staged_page_buf;    /* one physical page buffer owned by the mechanism */
 };
 
 /*struct nand_cmd {
@@ -369,7 +394,33 @@ struct FtlPolicyAPI {
     void (*eswd_set_vpc_ipc)(struct ssd *ssd, uint32_t eswd_id, int vpc, int ipc);
     void (*eswd_increment_wp)(struct ssd *ssd, uint32_t eswd_id);
     void (*eswd_reset)(struct ssd *ssd, uint32_t eswd_id);  /* Reset to initial state (for free) */
-    
+    uint64_t (*eswd_get_wp_lba)(struct ssd *ssd, uint32_t eswd_id);
+    uint16_t (*eswd_check_seq_write)(struct ssd *ssd, uint32_t eswd_id,
+                                     uint64_t slba, uint32_t nlb);
+    uint16_t (*eswd_check_read_range)(struct ssd *ssd, uint32_t eswd_id,
+                                      uint64_t slba, uint32_t nlb);
+    uint64_t (*eswd_write_lbas)(struct ssd *ssd, NvmeRequest *req,
+                                uint32_t eswd_id, uint64_t slba, uint32_t nlb,
+                                int64_t stime_ns);
+    uint64_t (*eswd_read_lbas)(struct ssd *ssd, NvmeRequest *req,
+                               uint32_t eswd_id, uint64_t slba, uint32_t nlb,
+                               int64_t stime_ns);
+    uint64_t (*read_page_buffer)(struct ssd *ssd, const PseudoPpa *ppa,
+                                 uint8_t *buffer, int64_t stime_ns);
+    uint64_t (*commit_page_to_eswd)(struct ssd *ssd, uint32_t eswd_id,
+                                    const uint8_t *buffer, PseudoPpa *out_ppa,
+                                    int64_t stime_ns);
+    /*
+     * Advance eSWD write pointer from its current index to pgs_per_eswd (zone full / finish).
+     * Returns 0 on success, -1 on invalid eswd_id or layout error.
+     */
+    int (*eswd_advance_wp_to_end)(struct ssd *ssd, uint32_t eswd_id);
+    /*
+     * Erase every block in the eSWD (mark free + raw erase); does not call eswd_reset.
+     * Returns max erase latency (ns) across blocks, 0 if eswd_id invalid.
+     */
+    uint64_t (*eswd_erase_physical)(struct ssd *ssd, uint32_t eswd_id, int64_t stime_ns);
+
     /* eSWD layout query (mechanism owns layout, policy uses for translation) */
     int (*eswd_id_to_ppa)(struct ssd *ssd, uint32_t eswd_id, uint32_t page_index, PseudoPpa *ppa);
     int (*ppa_to_eswd_id)(struct ssd *ssd, const PseudoPpa *ppa, uint32_t *eswd_id, uint32_t *page_index);
@@ -415,22 +466,35 @@ struct FtlPolicyAPI {
     /* Buffer helpers (mechanism provides request data access) */
     uint64_t (*get_request_buffer_size)(NvmeRequest *req);
     uint8_t *(*copy_request_data)(NvmeRequest *req, uint64_t offset, 
-                                   uint64_t length, uint64_t *out_size);
+                                  uint64_t length, uint64_t *out_size);
     uint64_t (*write_request_data)(NvmeRequest *req, const uint8_t *buffer,
-                                    uint64_t offset, uint64_t length);
+                                   uint64_t offset, uint64_t length);
     const NvmeDsmRange *(*get_dsm_ranges)(NvmeRequest *req, int *nr_ranges);
+    uint16_t (*read_cmd_buffer)(struct NvmeCommandEvent *event, void *dst,
+                                uint32_t length);
+    uint16_t (*write_cmd_buffer)(struct NvmeCommandEvent *event, const void *src,
+                                 uint32_t length);
+    void (*set_completion_result_u64)(struct NvmeCommandEvent *event,
+                                      uint64_t value);
     int (*get_gc_thres_lines)(struct ssd *ssd);
     int (*get_gc_thres_lines_high)(struct ssd *ssd);
     int (*get_page_status)(struct ssd *ssd, const PseudoPpa *ppa);
 
     /* Hook registration (mechanism provides event system, policy attaches handlers) */
     int (*register_nvme_hook)(struct ssd *ssd, uint8_t opcode,
-                             NvmeHookCondition condition,
-                             NvmeHookCallback callback,
-                             void *context);
+                              NvmeHookCondition condition,
+                              NvmeHookCallback callback,
+                              void *context);
     int (*unregister_nvme_hook)(struct ssd *ssd, int hook_handle);
     int (*inactivate_nvme_hook)(struct ssd *ssd, int hook_handle);
     int (*reactivate_nvme_hook)(struct ssd *ssd, int hook_handle);
+    int (*register_admin_hook)(struct ssd *ssd, uint8_t opcode,
+                               NvmeHookCondition condition,
+                               NvmeHookCallback callback,
+                               void *context);
+    int (*unregister_admin_hook)(struct ssd *ssd, int hook_handle);
+    int (*inactivate_admin_hook)(struct ssd *ssd, int hook_handle);
+    int (*reactivate_admin_hook)(struct ssd *ssd, int hook_handle);
     int (*register_backend_hook)(struct ssd *ssd, BackendEventHookCondition condition,
                                  BackendEventHookCallback callback, void *context);
     int (*unregister_backend_hook)(struct ssd *ssd, int hook_handle);
@@ -450,6 +514,8 @@ struct FtlPolicyAPI {
     /* eSWD config (policy sets at init to define striping and layout) */
     void (*set_eswd_config)(struct ssd *ssd, const struct eswd_config *config);
     int (*finalize_ftl_init)(struct ssd *ssd);
+    int (*configure_namespace_personality)(struct ssd *ssd,
+                                           const struct NamespacePersonalityConfig *config);
 
     /* GC mapping update (policy provides; mechanism calls when migrating a page in legacy GC path) */
     void (*gc_update_mapping)(struct ssd *ssd, PseudoPpa *old_ppa, PseudoPpa *new_ppa);
@@ -464,12 +530,13 @@ struct FtlPolicyAPI {
     uint64_t (*write_user_request)(struct ssd *ssd, NvmeRequest *req,
                                   PseudoPpa *ppa_list, uint64_t ppa_cnt);
 
-    /* BBM API pass-through (mechanism provides backend I/O and validity operations) */
-    struct BbmPolicyAPI *bbm_api;
+    /* BBM API pass-through intentionally disabled; mechanism calls bbm_* directly. */
+    /* struct BbmPolicyAPI *bbm_api; */
 };
 
 struct ssd { // This needs to be dissected and probably renamed
     char *ssdname;
+    struct FemuCtrl *ctrl;
     struct FtlBackend *fb; /* backend timing/error model */
     struct bbm *bbm;     /* bad block manager / OP mapping context */
    // struct ssdparams sp;
@@ -515,6 +582,8 @@ void ssd_init(FemuCtrl *n);
 /* eSWD config – call from init_policy to define striping and size before lines/wp are inited */
 void set_eswd_config(struct ssd *ssd, const struct eswd_config *config);
 int finalize_ftl_init(struct ssd *ssd);
+int configure_namespace_personality(struct ssd *ssd,
+                                    const struct NamespacePersonalityConfig *config);
 
 /* Event filling helpers */
 void ftl_fill_nvme_event(struct ssd *ssd, NvmeRequest *req, struct NvmeCommandEvent *event);
@@ -536,11 +605,29 @@ const struct eswd_layout *get_eswd_layout(struct ssd *ssd);
 void eswd_set_vpc_ipc(struct ssd *ssd, uint32_t eswd_id, int vpc, int ipc);
 void eswd_increment_wp(struct ssd *ssd, uint32_t eswd_id);
 void eswd_reset(struct ssd *ssd, uint32_t eswd_id);
+uint64_t eswd_get_wp_lba(struct ssd *ssd, uint32_t eswd_id);
+uint16_t eswd_check_seq_write(struct ssd *ssd, uint32_t eswd_id,
+                              uint64_t slba, uint32_t nlb);
+uint16_t eswd_check_read_range(struct ssd *ssd, uint32_t eswd_id,
+                               uint64_t slba, uint32_t nlb);
+uint64_t eswd_write_lbas(struct ssd *ssd, NvmeRequest *req,
+                         uint32_t eswd_id, uint64_t slba, uint32_t nlb,
+                         int64_t stime_ns);
+uint64_t eswd_read_lbas(struct ssd *ssd, NvmeRequest *req,
+                        uint32_t eswd_id, uint64_t slba, uint32_t nlb,
+                        int64_t stime_ns);
+uint64_t read_page_buffer(struct ssd *ssd, const PseudoPpa *ppa,
+                          uint8_t *buffer, int64_t stime_ns);
+uint64_t commit_page_to_eswd(struct ssd *ssd, uint32_t eswd_id,
+                             const uint8_t *buffer, PseudoPpa *out_ppa,
+                             int64_t stime_ns);
 
 /* eSWD layout query wrappers */
 int eswd_id_to_ppa_wrapper(struct ssd *ssd, uint32_t eswd_id, uint32_t page_index, PseudoPpa *ppa);
 int ppa_to_eswd_id_wrapper(struct ssd *ssd, const PseudoPpa *ppa, uint32_t *eswd_id, uint32_t *page_index);
 int eswd_block_to_ppa_wrapper(struct ssd *ssd, uint32_t eswd_id, uint32_t block_index, PseudoPpa *ppa);
+int ftl_eswd_advance_wp_to_end(struct ssd *ssd, uint32_t eswd_id);
+uint64_t ftl_eswd_erase_physical(struct ssd *ssd, uint32_t eswd_id, int64_t stime_ns);
 
 /* eSWD migration and remapping.
  * If callbacks and policy_ctx are non-NULL, on_destination_full may be used when
@@ -592,7 +679,7 @@ void mark_page_valid(struct ssd *ssd, PseudoPpa *ppa);
 void mark_page_invalid(struct ssd *ssd, PseudoPpa *ppa);
 void mark_block_free(struct ssd *ssd, PseudoPpa *ppa);
 
-/* eSWD/channel accessors (page/block validity via BBM API: bbm_api->get_page_status, bbm_api->get_block_vpc_ipc) */
+/* eSWD/channel accessors (page/block validity lives in BBM/backend mechanism code) */
 struct eswd *get_eswd(struct ssd *ssd, PseudoPpa *ppa);
 struct nand_lun *get_lun(struct ssd *ssd, PseudoPpa *ppa);
 struct ssd_channel *get_ch(struct ssd *ssd, PseudoPpa *ppa);
@@ -639,6 +726,12 @@ uint8_t *ftl_copy_request_data(NvmeRequest *req, uint64_t offset,
 uint64_t ftl_write_request_data(NvmeRequest *req, const uint8_t *buffer,
                                  uint64_t offset, uint64_t length);
 const NvmeDsmRange *ftl_get_dsm_ranges(NvmeRequest *req, int *nr_ranges);
+uint16_t ftl_read_cmd_buffer(struct NvmeCommandEvent *event, void *dst,
+                             uint32_t length);
+uint16_t ftl_write_cmd_buffer(struct NvmeCommandEvent *event, const void *src,
+                              uint32_t length);
+void ftl_set_completion_result_u64(struct NvmeCommandEvent *event,
+                                   uint64_t value);
 int ftl_get_gc_thres_lines(struct ssd *ssd);
 int ftl_get_gc_thres_lines_high(struct ssd *ssd);
 int ftl_get_page_status(struct ssd *ssd, const PseudoPpa *ppa);
@@ -651,6 +744,13 @@ int ftl_register_nvme_hook(struct ssd *ssd, uint8_t opcode,
 int ftl_unregister_nvme_hook(struct ssd *ssd, int hook_handle);
 int ftl_inactivate_nvme_hook(struct ssd *ssd, int hook_handle);
 int ftl_reactivate_nvme_hook(struct ssd *ssd, int hook_handle);
+int ftl_register_admin_hook(struct ssd *ssd, uint8_t opcode,
+                            NvmeHookCondition condition,
+                            NvmeHookCallback callback,
+                            void *context);
+int ftl_unregister_admin_hook(struct ssd *ssd, int hook_handle);
+int ftl_inactivate_admin_hook(struct ssd *ssd, int hook_handle);
+int ftl_reactivate_admin_hook(struct ssd *ssd, int hook_handle);
 
 /* Background hook management */
 int ftl_register_background_hook(struct ssd *ssd, BackgroundHookCondition condition,
@@ -740,10 +840,10 @@ int ftl_reactivate_background_hook(struct ssd *ssd, int hook_handle);
  *         .lat = 0
  *     };
  *     
- *     // Use BBM API through FTL API
+ *     // Raw BBM access is intentionally not policy-visible anymore.
  *     for (uint64_t i = 0; i < event->lpn_cnt; i++) {
- *         api->bbm_api->raw_read(ssd->fb, ssd->bbm, page_buffers[i], 
- *                                &permuted_ppas[i], 1, page_size, &bbm_event);
+ *         bbm_raw_read(ssd->fb, ssd->bbm, page_buffers[i],
+ *                      &permuted_ppas[i], 1, page_size, &bbm_event);
  *     }
  *     
  *     // Write data back to request buffer in correct order using API

@@ -14,6 +14,7 @@ static void bb_init_ctrl_str(FemuCtrl *n)
 /* bb <=> black-box */
 static void bb_init(FemuCtrl *n, Error **errp)
 {
+    uint32_t i;
     struct ssd *ssd = n->ssd = g_malloc0(sizeof(struct ssd));
 
     bb_init_ctrl_str(n);
@@ -22,6 +23,16 @@ static void bb_init(FemuCtrl *n, Error **errp)
     ssd->ssdname = (char *)n->devname;
     femu_debug("Starting FEMU in Blackbox-SSD mode ...\n");
     ssd_init(n);
+
+    /*
+     * Bootstrap in an unpublished state so policyctl can resolve and publish
+     * the final namespace personality before the guest kernel binds a block
+     * namespace. The controller remains reachable via /dev/nvmeX.
+     */
+    n->id_ctrl.nn = cpu_to_le32(0);
+    for (i = 0; i < n->num_namespaces; i++) {
+        n->namespaces[i].published = false;
+    }
 }
 
 static void bb_flip(FemuCtrl *n, NvmeCmd *cmd)
@@ -109,7 +120,15 @@ static uint16_t bb_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
                           NvmeRequest *req)
 {
     struct ssd *ssd = n->ssd;
-    
+
+    if (ns && !ns->published) {
+        if (ssd && ssd->policy_engine &&
+            pe_has_nvme_hook(ssd->policy_engine, cmd->opcode)) {
+            return bb_custom_cmd(n, ns, cmd, req);
+        }
+        return NVME_INVALID_NSID | NVME_DNR;
+    }
+
     switch (cmd->opcode) {
     case NVME_CMD_READ:
     case NVME_CMD_WRITE:
@@ -125,13 +144,31 @@ static uint16_t bb_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     }
 }
 
-static uint16_t bb_admin_cmd(FemuCtrl *n, NvmeCmd *cmd)
+static uint16_t bb_admin_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
 {
+    struct ssd *ssd = n->ssd;
+
+    (void)cqe;
+
     switch (cmd->opcode) {
     case NVME_ADM_CMD_FEMU_FLIP:
         bb_flip(n, cmd);
         return NVME_SUCCESS;
     default:
+        if (ssd && ssd->policy_engine &&
+            pe_has_admin_hook(ssd->policy_engine, cmd->opcode)) {
+            struct NvmeCommandEvent event = {
+                .opcode = cmd->opcode,
+                .is_admin = true,
+                .req = NULL,
+                .cmd = cmd,
+                .ctrl = n,
+                .status = NVME_SUCCESS,
+            };
+
+            pe_dispatch_admin_cmd(ssd->policy_engine, ssd, &event);
+            return event.status;
+        }
         return NVME_INVALID_OPCODE | NVME_DNR;
     }
 }

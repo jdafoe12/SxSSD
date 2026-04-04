@@ -1159,8 +1159,9 @@ static inline bool nvme_csi_has_nvm_support(NvmeNamespace *ns)
     return false;
 }
 
-static uint16_t zns_admin_cmd(FemuCtrl *n, NvmeCmd *cmd)
+static uint16_t zns_admin_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
 {
+    (void)cqe;
     switch (cmd->opcode) {
     default:
         return NVME_INVALID_OPCODE | NVME_DNR;

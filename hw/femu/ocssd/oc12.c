@@ -721,8 +721,9 @@ static int oc12_read_tbls(FemuCtrl *n)
     return 0;
 }
 
-static uint16_t oc12_admin_cmd(FemuCtrl *n, NvmeCmd *cmd)
+static uint16_t oc12_admin_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
 {
+    (void)cqe;
     switch (cmd->opcode) {
     case OC12_ADM_CMD_IDENTITY:
         femu_debug("oc12_cmd_identity\n");
@@ -1113,4 +1114,3 @@ int nvme_register_ocssd12(FemuCtrl *n)
 
     return 0;
 }
-

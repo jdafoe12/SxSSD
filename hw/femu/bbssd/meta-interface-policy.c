@@ -365,35 +365,35 @@ static int parse_meta_envelope(const uint8_t *buffer, size_t buffer_len,
 }
 
 static int authenticate_meta_request(struct meta_policy_context *ctx,
-                                     FemuCtrl *n, NvmeCmd *cmd, uint8_t opcode,
+                                     struct NvmeCommandEvent *event,
+                                     struct FtlPolicyAPI *api,
                                      uint64_t *counter_out,
                                      uint8_t **plaintext_out,
                                      size_t *plaintext_len_out)
 {
     uint32_t request_len;
-    uint64_t prp1;
-    uint64_t prp2;
     uint8_t *request_buf = NULL;
     uint8_t *plaintext = NULL;
     struct meta_encrypted_request req;
+    uint8_t opcode;
     int rc = -1;
 
-    if (!ctx || !n || !cmd || !plaintext_out || !plaintext_len_out) {
+    if (!ctx || !event || !api || !event->cmd || !plaintext_out ||
+        !plaintext_len_out) {
         return -1;
     }
     if (!ctx->session_established) {
         return -1;
     }
 
-    request_len = le32_to_cpu(cmd->cdw12);
-    prp1 = le64_to_cpu(cmd->dptr.prp1);
-    prp2 = le64_to_cpu(cmd->dptr.prp2);
+    request_len = le32_to_cpu(event->cmd->cdw12);
     if (request_len < META_ENVELOPE_HEADER_SIZE) {
         return -1;
     }
+    opcode = event->opcode;
 
     request_buf = g_malloc0(request_len);
-    if (dma_write_prp(n, request_buf, request_len, prp1, prp2) != NVME_SUCCESS) {
+    if (api->read_cmd_buffer(event, request_buf, request_len) != NVME_SUCCESS) {
         goto cleanup;
     }
     if (parse_meta_envelope(request_buf, request_len, &req) != 0) {
@@ -973,14 +973,13 @@ static bool install_policy_condition(struct ssd *ssd, struct NvmeCommandEvent *e
     (void)ssd;
     (void)api;
     (void)context;
-    return !event->is_admin && event->opcode == NVME_CMD_INSTALL_POLICY;
+    return event->is_admin && event->opcode == NVME_CMD_INSTALL_POLICY;
 }
 
 static uint64_t install_policy_callback(struct ssd *ssd, struct NvmeCommandEvent *event,
                                         struct FtlPolicyAPI *api, void *context)
 {
     struct meta_policy_context *ctx = (struct meta_policy_context *)context;
-    FemuCtrl *n = event->ctrl;
     uint8_t *plaintext = NULL;
     size_t plaintext_len = 0;
     uint32_t policy_id;
@@ -993,10 +992,7 @@ static uint64_t install_policy_callback(struct ssd *ssd, struct NvmeCommandEvent
     uint8_t *payload = NULL;
     struct pba *blocks = NULL;
     int slot;
-
-    (void)api;
-
-    if (authenticate_meta_request(ctx, n, event->cmd, event->opcode,
+    if (authenticate_meta_request(ctx, event, api,
                                   NULL,
                                   &plaintext, &plaintext_len) != 0) {
         event->status = NVME_INVALID_FIELD | NVME_DNR;
@@ -1084,6 +1080,7 @@ cleanup:
 
 static int authenticate_inactive_policy_request(struct meta_policy_context *ctx,
                                                 struct NvmeCommandEvent *event,
+                                                struct FtlPolicyAPI *api,
                                                 uint8_t expected_opcode,
                                                 uint8_t **plaintext_out,
                                                 size_t *plaintext_len_out,
@@ -1102,7 +1099,7 @@ static int authenticate_inactive_policy_request(struct meta_policy_context *ctx,
     if (event->opcode != expected_opcode) {
         return -1;
     }
-    if (authenticate_meta_request(ctx, event->ctrl, event->cmd, event->opcode,
+    if (authenticate_meta_request(ctx, event, api,
                                   NULL,
                                   &plaintext, &plaintext_len) != 0) {
         return -1;
@@ -1141,7 +1138,7 @@ static bool update_policy_condition(struct ssd *ssd, struct NvmeCommandEvent *ev
     (void)ssd;
     (void)api;
     (void)context;
-    return !event->is_admin && event->opcode == NVME_CMD_UPDATE_POLICY;
+    return event->is_admin && event->opcode == NVME_CMD_UPDATE_POLICY;
 }
 
 static uint64_t update_policy_callback(struct ssd *ssd,
@@ -1157,7 +1154,7 @@ static uint64_t update_policy_callback(struct ssd *ssd,
 
     (void)api;
 
-    if (authenticate_inactive_policy_request(ctx, event, NVME_CMD_UPDATE_POLICY,
+    if (authenticate_inactive_policy_request(ctx, event, api, NVME_CMD_UPDATE_POLICY,
                                              &plaintext, &plaintext_len,
                                              &policy_id, &slot) != 0) {
         event->status = NVME_INVALID_FIELD | NVME_DNR;
@@ -1259,7 +1256,7 @@ static bool remove_policy_condition(struct ssd *ssd, struct NvmeCommandEvent *ev
     (void)ssd;
     (void)api;
     (void)context;
-    return !event->is_admin && event->opcode == NVME_CMD_REMOVE_POLICY;
+    return event->is_admin && event->opcode == NVME_CMD_REMOVE_POLICY;
 }
 
 static uint64_t remove_policy_callback(struct ssd *ssd,
@@ -1275,7 +1272,7 @@ static uint64_t remove_policy_callback(struct ssd *ssd,
 
     (void)api;
 
-    if (authenticate_inactive_policy_request(ctx, event, NVME_CMD_REMOVE_POLICY,
+    if (authenticate_inactive_policy_request(ctx, event, api, NVME_CMD_REMOVE_POLICY,
                                              &plaintext, &plaintext_len,
                                              &policy_id, &slot) != 0) {
         event->status = NVME_INVALID_FIELD | NVME_DNR;
@@ -1310,7 +1307,7 @@ static bool activate_policy_condition(struct ssd *ssd, struct NvmeCommandEvent *
     (void)ssd;
     (void)api;
     (void)context;
-    return !event->is_admin &&
+    return event->is_admin &&
            (event->opcode == NVME_CMD_ACTIVATE_POLICY ||
             event->opcode == NVME_CMD_DEACTIVATE_POLICY);
 }
@@ -1326,7 +1323,7 @@ static uint64_t activate_policy_callback(struct ssd *ssd, struct NvmeCommandEven
 
     (void)api;
 
-    if (authenticate_meta_request(ctx, event->ctrl, event->cmd, event->opcode,
+    if (authenticate_meta_request(ctx, event, api,
                                   NULL,
                                   &plaintext, &plaintext_len) != 0) {
         event->status = NVME_INVALID_FIELD | NVME_DNR;
@@ -1463,7 +1460,7 @@ static bool policy_attestation_condition(struct ssd *ssd, struct NvmeCommandEven
     (void)ssd;
     (void)api;
     (void)context;
-    return !event->is_admin &&
+    return event->is_admin &&
            (event->opcode == NVME_CMD_POLICY_ATTESTATION_SUBMIT ||
             event->opcode == NVME_CMD_POLICY_ATTESTATION_FETCH);
 }
@@ -1474,8 +1471,6 @@ static uint64_t policy_attestation_callback(struct ssd *ssd,
                                             void *context)
 {
     struct meta_policy_context *ctx = (struct meta_policy_context *)context;
-    FemuCtrl *n = event->ctrl;
-    NvmeCmd *cmd = event->cmd;
     uint8_t *plaintext = NULL;
     size_t plaintext_len = 0;
     uint64_t request_counter = 0;
@@ -1489,18 +1484,17 @@ static uint64_t policy_attestation_callback(struct ssd *ssd,
     struct policy_storage_desc desc;
     uint32_t response_len = 0;
 
-    (void)api;
     if (event->opcode == NVME_CMD_POLICY_ATTESTATION_FETCH) {
         if (!ctx->pending_attestation_response_valid) {
             event->status = NVME_INVALID_FIELD | NVME_DNR;
             return 0;
         }
 
-        if (dma_read_prp(n, ctx->pending_attestation_response,
-                         sizeof(ctx->pending_attestation_response),
-                         le64_to_cpu(cmd->dptr.prp1),
-                         le64_to_cpu(cmd->dptr.prp2)) != NVME_SUCCESS) {
-            event->status = NVME_DATA_TRAS_ERROR | NVME_DNR;
+        event->status = api->write_cmd_buffer(
+            event,
+            ctx->pending_attestation_response,
+            sizeof(ctx->pending_attestation_response));
+        if (event->status != NVME_SUCCESS) {
             return 0;
         }
 
@@ -1509,7 +1503,7 @@ static uint64_t policy_attestation_callback(struct ssd *ssd,
         return 0;
     }
 
-    if (authenticate_meta_request(ctx, n, cmd, event->opcode, &request_counter,
+    if (authenticate_meta_request(ctx, event, api, &request_counter,
                                   &plaintext, &plaintext_len) != 0) {
         event->status = NVME_INVALID_FIELD | NVME_DNR;
         return 0;
@@ -1592,7 +1586,7 @@ static bool init_session_condition(struct ssd *ssd, struct NvmeCommandEvent *eve
                                    struct FtlPolicyAPI *api, void *context)
 {
     (void)ssd; (void)api; (void)context;
-    return !event->is_admin &&
+    return event->is_admin &&
            (event->opcode == NVME_CMD_INIT_SESSION_SUBMIT ||
             event->opcode == NVME_CMD_INIT_SESSION_FETCH);
 }
@@ -1600,12 +1594,8 @@ static bool init_session_condition(struct ssd *ssd, struct NvmeCommandEvent *eve
 static uint64_t init_session_callback(struct ssd *ssd, struct NvmeCommandEvent *event,
                                       struct FtlPolicyAPI *api, void *context)
 {
-    (void)ssd; (void)api;
+    (void)ssd;
     struct meta_policy_context *ctx = (struct meta_policy_context *)context;
-    FemuCtrl *n = event->ctrl;
-    NvmeCmd *cmd = event->cmd;
-    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
-    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
     uint8_t request[INIT_SESSION_REQUEST_SIZE];
     uint8_t response[INIT_SESSION_RESPONSE_SIZE];
     uint8_t admin_init_message[1 + 32 + 1 + 8];
@@ -1617,8 +1607,8 @@ static uint64_t init_session_callback(struct ssd *ssd, struct NvmeCommandEvent *
     
     if (event->opcode == NVME_CMD_INIT_SESSION_SUBMIT) {
         /* Read request: admin_ephem_pub (32) + mode (1) + counter (8) + admin_sig (64). */
-        if (dma_write_prp(n, request, INIT_SESSION_REQUEST_SIZE, prp1, prp2) != NVME_SUCCESS) {
-            event->status = NVME_DATA_TRAS_ERROR | NVME_DNR;
+        event->status = api->read_cmd_buffer(event, request, INIT_SESSION_REQUEST_SIZE);
+        if (event->status != NVME_SUCCESS) {
             return 0;
         }
 
@@ -1673,9 +1663,9 @@ static uint64_t init_session_callback(struct ssd *ssd, struct NvmeCommandEvent *
             return 0;
         }
 
-        if (dma_read_prp(n, ctx->pending_response, INIT_SESSION_RESPONSE_SIZE, prp1, prp2)
-            != NVME_SUCCESS) {
-            event->status = NVME_DATA_TRAS_ERROR | NVME_DNR;
+        event->status = api->write_cmd_buffer(event, ctx->pending_response,
+                                              INIT_SESSION_RESPONSE_SIZE);
+        if (event->status != NVME_SUCCESS) {
             return 0;
         }
         ctx->pending_response_valid = false;
@@ -1695,6 +1685,7 @@ static uint64_t init_session_callback(struct ssd *ssd, struct NvmeCommandEvent *
 int m_interface_policy_init(struct ssd *ssd)
 {
     struct meta_policy_context *ctx = g_malloc0(sizeof(struct meta_policy_context));
+    struct FtlPolicyAPI *api = ssd ? ssd->policy_api : NULL;
     ctx->session_established = false;
     ctx->pending_response_valid = false;
     ctx->pending_attestation_response_valid = false;
@@ -1702,63 +1693,67 @@ int m_interface_policy_init(struct ssd *ssd)
     
     g_meta_ctx = ctx;
 
-    if (ftl_register_nvme_hook(ssd, NVME_CMD_INIT_SESSION_SUBMIT,
+    if (!api) {
+        return -1;
+    }
+
+    if (api->register_admin_hook(ssd, NVME_CMD_INIT_SESSION_SUBMIT,
                                init_session_condition,
                                init_session_callback, ctx) < 0) {
         fprintf(stderr, "[Meta] Failed to register INIT_SESSION submit hook\n");
         return -1;
     }
 
-    if (ftl_register_nvme_hook(ssd, NVME_CMD_INIT_SESSION_FETCH,
+    if (api->register_admin_hook(ssd, NVME_CMD_INIT_SESSION_FETCH,
                                init_session_condition,
                                init_session_callback, ctx) < 0) {
         fprintf(stderr, "[Meta] Failed to register INIT_SESSION fetch hook\n");
         return -1;
     }
 
-    if (ftl_register_nvme_hook(ssd, NVME_CMD_INSTALL_POLICY,
+    if (api->register_admin_hook(ssd, NVME_CMD_INSTALL_POLICY,
                                install_policy_condition,
                                install_policy_callback, ctx) < 0) {
         fprintf(stderr, "[Meta] Failed to register INSTALL_POLICY hook\n");
         return -1;
     }
 
-    if (ftl_register_nvme_hook(ssd, NVME_CMD_ACTIVATE_POLICY,
+    if (api->register_admin_hook(ssd, NVME_CMD_ACTIVATE_POLICY,
                                activate_policy_condition,
                                activate_policy_callback, ctx) < 0) {
         fprintf(stderr, "[Meta] Failed to register ACTIVATE_POLICY hook\n");
         return -1;
     }
 
-    if (ftl_register_nvme_hook(ssd, NVME_CMD_DEACTIVATE_POLICY,
+    if (api->register_admin_hook(ssd, NVME_CMD_DEACTIVATE_POLICY,
                                activate_policy_condition,
                                activate_policy_callback, ctx) < 0) {
         fprintf(stderr, "[Meta] Failed to register DEACTIVATE_POLICY hook\n");
         return -1;
     }
 
-    if (ftl_register_nvme_hook(ssd, NVME_CMD_UPDATE_POLICY,
+    if (api->register_admin_hook(ssd, NVME_CMD_UPDATE_POLICY,
                                update_policy_condition,
                                update_policy_callback, ctx) < 0) {
         fprintf(stderr, "[Meta] Failed to register UPDATE_POLICY hook\n");
         return -1;
     }
 
-    if (ftl_register_nvme_hook(ssd, NVME_CMD_REMOVE_POLICY,
+    if (api->register_admin_hook(ssd, NVME_CMD_REMOVE_POLICY,
                                remove_policy_condition,
                                remove_policy_callback, ctx) < 0) {
         fprintf(stderr, "[Meta] Failed to register REMOVE_POLICY hook\n");
         return -1;
     }
 
-    if (ftl_register_nvme_hook(ssd, NVME_CMD_POLICY_ATTESTATION_SUBMIT,
+    if (api->register_admin_hook(ssd, NVME_CMD_POLICY_ATTESTATION_SUBMIT,
                                policy_attestation_condition,
                                policy_attestation_callback, ctx) < 0) {
         fprintf(stderr, "[Meta] Failed to register POLICY_ATTESTATION_SUBMIT hook\n");
         return -1;
     }
 
-    if (ftl_register_nvme_hook(ssd, NVME_CMD_POLICY_ATTESTATION_FETCH,
+    if (api->register_admin_hook(ssd, NVME_CMD_POLICY_ATTESTATION_FETCH,
                                policy_attestation_condition,
                                policy_attestation_callback, ctx) < 0) {
         fprintf(stderr, "[Meta] Failed to register POLICY_ATTESTATION_FETCH hook\n");

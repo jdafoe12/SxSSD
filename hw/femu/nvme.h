@@ -1090,6 +1090,7 @@ typedef struct NvmeNamespace {
     } blk;
 
     void *state;
+    bool published;
 } NvmeNamespace;
 
 #define TYPE_NVME "femu"
@@ -1198,7 +1199,7 @@ typedef struct FemuExtCtrlOps {
     void     (*exit)(struct FemuCtrl *);
     uint16_t (*rw_check_req)(struct FemuCtrl *, NvmeCmd *, NvmeRequest *);
     int      (*start_ctrl)(struct FemuCtrl *);
-    uint16_t (*admin_cmd)(struct FemuCtrl *, NvmeCmd *);
+    uint16_t (*admin_cmd)(struct FemuCtrl *, NvmeCmd *, NvmeCqe *);
     uint16_t (*io_cmd)(struct FemuCtrl *, NvmeNamespace *, NvmeCmd *, NvmeRequest *);
     uint16_t (*get_log)(struct FemuCtrl *, NvmeCmd *);
 } FemuExtCtrlOps;
@@ -1223,6 +1224,10 @@ typedef struct FemuCtrl {
 
     const uint32_t  *iocs;
     uint8_t         csi;
+    void            *id_ns_csi;
+    size_t          id_ns_csi_len;
+    void            *id_ctrl_csi;
+    size_t          id_ctrl_csi_len;
     NvmeIdNsZoned   *id_ns_zoned;
     NvmeZone        *zone_array;
     QTAILQ_HEAD(, NvmeZone) exp_open_zones;

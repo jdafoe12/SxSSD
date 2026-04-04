@@ -11,6 +11,7 @@ struct FtlPolicyAPI;
 #define MAX_BACKEND_EVENT_HOOKS (256)
 #define MAX_PSWD_TRANSITION_HOOKS (64)
 #define MAX_BACKGROUND_HOOKS (64)
+#define MAX_ADMIN_HOOKS (256)
 
 /*
  * Backend (BBM) event hook types - for policies to react to backend read/write/erase events.

@@ -5,11 +5,87 @@
 #include "eswd-layout.h"
 #include "meta-interface-policy.h"
 #include <errno.h>
+#include <string.h>
 //#include "../backend/ftl-backend.h"
 
 //#define FEMU_DEBUG_FTL
 
 static void *ftl_thread(void *arg);
+
+static inline uint32_t eswd_lbas_per_page(struct ssd *ssd)
+{
+    return ssd->bbm->geom->secs_per_pg;
+}
+
+static inline uint32_t eswd_lba_size(struct ssd *ssd)
+{
+    return ssd->bbm->geom->secsz;
+}
+
+static inline uint64_t eswd_page_size_bytes(struct ssd *ssd)
+{
+    return (uint64_t)eswd_lbas_per_page(ssd) * eswd_lba_size(ssd);
+}
+
+static inline uint64_t eswd_capacity_lbas(struct ssd *ssd)
+{
+    return (uint64_t)ssd->eswd_layout.pgs_per_eswd * eswd_lbas_per_page(ssd);
+}
+
+static inline uint64_t eswd_start_lba(struct ssd *ssd, uint32_t eswd_id)
+{
+    return (uint64_t)eswd_id * eswd_capacity_lbas(ssd);
+}
+
+static inline uint64_t eswd_end_lba(struct ssd *ssd, uint32_t eswd_id)
+{
+    return eswd_start_lba(ssd, eswd_id) + eswd_capacity_lbas(ssd);
+}
+
+static inline void eswd_clear_stage(struct ssd *ssd, struct eswd *e)
+{
+    if (e->staged_page_buf) {
+        memset(e->staged_page_buf, 0, (size_t)eswd_page_size_bytes(ssd));
+    }
+    e->staged_page_lba = INVALID_LPN;
+    e->staged_valid_lbas = 0;
+}
+
+static uint64_t eswd_flush_staged_page(struct ssd *ssd, uint32_t eswd_id,
+                                       struct eswd *e, int64_t stime_ns)
+{
+    struct BbmEvent event = {0};
+    PseudoPpa ppa;
+    uint64_t page_size;
+
+    if (!e || e->staged_valid_lbas == 0) {
+        return 0;
+    }
+    if (e->wp_page_index >= ssd->eswd_layout.pgs_per_eswd) {
+        return 0;
+    }
+    if (eswd_id_to_ppa_wrapper(ssd, eswd_id, e->wp_page_index, &ppa) != 0) {
+        return 0;
+    }
+
+    page_size = eswd_page_size_bytes(ssd);
+    event.cmd = BBM_EVENT_WRITE;
+    event.type = BBM_EVENT_POLICY_IO;
+    event.count = 1;
+    event.stime = stime_ns;
+    bbm_raw_write(ssd->fb, ssd->bbm, e->staged_page_buf, &ppa, 1, page_size, &event);
+    mark_page_valid(ssd, &ppa);
+    e->wp_page_index++;
+    eswd_clear_stage(ssd, e);
+    return (uint64_t)event.lat;
+}
+
+static uint32_t eswd_stage_offset_lbas(struct ssd *ssd, const struct eswd *e,
+                                       uint64_t slba)
+{
+    (void)ssd;
+    return (uint32_t)(slba - e->staged_page_lba);
+}
 
 /* ======================================================== */
 /* FTL API functions for FTL policies to access NVMe request data */
@@ -175,6 +251,73 @@ const NvmeDsmRange *ftl_get_dsm_ranges(NvmeRequest *req, int *nr_ranges)
     return req ? req->dsm_ranges : NULL;
 }
 
+uint16_t ftl_read_cmd_buffer(struct NvmeCommandEvent *event, void *dst,
+                             uint32_t length)
+{
+    FemuCtrl *n;
+    NvmeCmd *cmd;
+
+    if (!event || !dst || length == 0) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    n = event->ctrl;
+    cmd = event->cmd;
+    if (!n || !cmd) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    if (dma_write_prp(n, dst, length,
+                      le64_to_cpu(cmd->dptr.prp1),
+                      le64_to_cpu(cmd->dptr.prp2)) != NVME_SUCCESS) {
+        return NVME_DATA_TRAS_ERROR | NVME_DNR;
+    }
+
+    return NVME_SUCCESS;
+}
+
+uint16_t ftl_write_cmd_buffer(struct NvmeCommandEvent *event, const void *src,
+                              uint32_t length)
+{
+    FemuCtrl *n;
+    NvmeCmd *cmd;
+
+    if (!event || !src || length == 0) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    n = event->ctrl;
+    cmd = event->cmd;
+    if (!n || !cmd) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    if (dma_read_prp(n, (uint8_t *)src, length,
+                     le64_to_cpu(cmd->dptr.prp1),
+                     le64_to_cpu(cmd->dptr.prp2)) != NVME_SUCCESS) {
+        return NVME_DATA_TRAS_ERROR | NVME_DNR;
+    }
+
+    return NVME_SUCCESS;
+}
+
+void ftl_set_completion_result_u64(struct NvmeCommandEvent *event,
+                                   uint64_t value)
+{
+    NvmeRequest *req;
+
+    if (!event) {
+        return;
+    }
+
+    req = event->req;
+    if (!req) {
+        return;
+    }
+
+    req->cqe.res64 = value;
+}
+
 int ftl_get_gc_thres_lines(struct ssd *ssd)
 {
     return (ssd && ssd->fb) ? ssd->fb->sp.gc_thres_lines : 0;
@@ -187,10 +330,10 @@ int ftl_get_gc_thres_lines_high(struct ssd *ssd)
 
 int ftl_get_page_status(struct ssd *ssd, const PseudoPpa *ppa)
 {
-    if (!ssd || !ssd->policy_api || !ssd->policy_api->bbm_api || !ppa) {
+    if (!ssd || !ssd->bbm || !ppa) {
         return -1;
     }
-    return ssd->policy_api->bbm_api->get_page_status(ssd->fb, ssd->bbm, ppa);
+    return bbm_get_page_status(ssd->fb, ssd->bbm, ppa);
 }
 
 /* ======================================================== */
@@ -230,6 +373,41 @@ int ftl_reactivate_nvme_hook(struct ssd *ssd, int hook_handle)
         return -1;
     }
     return pe_reactivate_nvme_hook(ssd->policy_engine, hook_handle);
+}
+
+int ftl_register_admin_hook(struct ssd *ssd, uint8_t opcode,
+                            NvmeHookCondition condition,
+                            NvmeHookCallback callback,
+                            void *context)
+{
+    if (!ssd || !callback || !ssd->policy_engine) {
+        return -1;
+    }
+    return pe_register_admin_hook(ssd->policy_engine, opcode, condition, callback, context);
+}
+
+int ftl_unregister_admin_hook(struct ssd *ssd, int hook_handle)
+{
+    if (!ssd || !ssd->policy_engine) {
+        return -1;
+    }
+    return pe_unregister_admin_hook(ssd->policy_engine, hook_handle);
+}
+
+int ftl_inactivate_admin_hook(struct ssd *ssd, int hook_handle)
+{
+    if (!ssd || !ssd->policy_engine) {
+        return -1;
+    }
+    return pe_inactivate_admin_hook(ssd->policy_engine, hook_handle);
+}
+
+int ftl_reactivate_admin_hook(struct ssd *ssd, int hook_handle)
+{
+    if (!ssd || !ssd->policy_engine) {
+        return -1;
+    }
+    return pe_reactivate_admin_hook(ssd->policy_engine, hook_handle);
 }
 
 /* ======================================================== */
@@ -419,8 +597,8 @@ uint64_t ftl_read_user_request(struct ssd *ssd, struct NvmeCommandEvent *event,
         .lat = 0,
     };
 
-    ssd->policy_api->bbm_api->read(ssd->fb, ssd->bbm, event->req,
-                                  ppa_list, (uint64_t)ppa_idx, page_size, &bbm_ev);
+    bbm_read(ssd->fb, ssd->bbm, event->req, ppa_list,
+             (uint64_t)ppa_idx, page_size, &bbm_ev);
 
     event->lat = (uint64_t)bbm_ev.lat;
     g_free(bbm_ev.status_list);
@@ -451,8 +629,7 @@ uint64_t ftl_write_user_request(struct ssd *ssd, NvmeRequest *req,
         .lat = 0,
     };
 
-    ssd->policy_api->bbm_api->write(ssd->fb, ssd->bbm, req,
-                                   ppa_list, ppa_cnt, page_size, &bbm_ev);
+    bbm_write(ssd->fb, ssd->bbm, req, ppa_list, ppa_cnt, page_size, &bbm_ev);
 
     g_free(bbm_ev.status_list);
     return (uint64_t)bbm_ev.lat;
@@ -520,6 +697,7 @@ static void ssd_init_eswds(struct ssd *ssd)
 {
     const struct eswd_layout *layout = &ssd->eswd_layout;
     uint32_t tt = layout->tt_eswds;
+    uint64_t page_size = eswd_page_size_bytes(ssd);
 
     ssd->tt_eswds = tt;
     ssd->eswds = g_malloc0(sizeof(struct eswd) * tt);
@@ -528,6 +706,10 @@ static void ssd_init_eswds(struct ssd *ssd)
         ssd->eswds[i].ipc = 0;
         ssd->eswds[i].vpc = 0;
         ssd->eswds[i].wp_page_index = 0;
+        ssd->eswds[i].wp_lba = eswd_start_lba(ssd, i);
+        ssd->eswds[i].staged_page_lba = INVALID_LPN;
+        ssd->eswds[i].staged_valid_lbas = 0;
+        ssd->eswds[i].staged_page_buf = g_malloc0((size_t)page_size);
     }
 }
 
@@ -577,7 +759,7 @@ void mark_page_invalid(struct ssd *ssd, PseudoPpa *ppa)
 {
     struct eswd *e = get_eswd(ssd, ppa);
 
-    ssd->policy_api->bbm_api->mark_page_invalid(ssd->fb, ssd->bbm, ppa);
+    bbm_mark_page_invalid(ssd->fb, ssd->bbm, ppa);
     if (!e) {
         ftl_err("BUG: mark_page_invalid: get_eswd returned NULL for ppa (ch=%d,lun=%d,pl=%d,blk=%d,pg=%d)\n",
                 ppa->g.ch, ppa->g.lun, ppa->g.pl, ppa->g.blk, ppa->g.pg);
@@ -596,7 +778,7 @@ void mark_page_valid(struct ssd *ssd, PseudoPpa *ppa)
 {
     struct eswd *e = get_eswd(ssd, ppa);
 
-    ssd->policy_api->bbm_api->mark_page_valid(ssd->fb, ssd->bbm, ppa);
+    bbm_mark_page_valid(ssd->fb, ssd->bbm, ppa);
     if (!e) {
         ftl_err("BUG: mark_page_valid: get_eswd returned NULL for ppa (ch=%d,lun=%d,pl=%d,blk=%d,pg=%d)\n",
                 ppa->g.ch, ppa->g.lun, ppa->g.pl, ppa->g.blk, ppa->g.pg);
@@ -665,6 +847,7 @@ void eswd_increment_wp(struct ssd *ssd, uint32_t eswd_id)
         return;
     }
     ssd->eswds[eswd_id].wp_page_index++;
+    ssd->eswds[eswd_id].wp_lba += eswd_lbas_per_page(ssd);
 }
 
 void eswd_reset(struct ssd *ssd, uint32_t eswd_id)
@@ -676,6 +859,267 @@ void eswd_reset(struct ssd *ssd, uint32_t eswd_id)
     e->ipc = 0;
     e->vpc = 0;
     e->wp_page_index = 0;
+    e->wp_lba = eswd_start_lba(ssd, eswd_id);
+    eswd_clear_stage(ssd, e);
+}
+
+uint64_t eswd_get_wp_lba(struct ssd *ssd, uint32_t eswd_id)
+{
+    if (eswd_id >= ssd->tt_eswds) {
+        return 0;
+    }
+    return ssd->eswds[eswd_id].wp_lba;
+}
+
+uint16_t eswd_check_seq_write(struct ssd *ssd, uint32_t eswd_id,
+                              uint64_t slba, uint32_t nlb)
+{
+    struct eswd *e;
+    uint64_t end_lba;
+
+    if (!ssd || eswd_id >= ssd->tt_eswds) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    if (nlb == 0) {
+        return NVME_SUCCESS;
+    }
+
+    e = &ssd->eswds[eswd_id];
+    end_lba = eswd_end_lba(ssd, eswd_id);
+    if (slba != e->wp_lba) {
+        return NVME_ZONE_INVALID_WRITE | NVME_DNR;
+    }
+    if (UINT64_MAX - slba < nlb || slba + nlb > end_lba) {
+        return NVME_ZONE_BOUNDARY_ERROR | NVME_DNR;
+    }
+    return NVME_SUCCESS;
+}
+
+uint16_t eswd_check_read_range(struct ssd *ssd, uint32_t eswd_id,
+                               uint64_t slba, uint32_t nlb)
+{
+    if (!ssd || eswd_id >= ssd->tt_eswds) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    if (nlb == 0) {
+        return NVME_SUCCESS;
+    }
+    if (slba < eswd_start_lba(ssd, eswd_id)) {
+        return NVME_LBA_RANGE | NVME_DNR;
+    }
+    if (UINT64_MAX - slba < nlb || slba + nlb > eswd_end_lba(ssd, eswd_id)) {
+        return NVME_ZONE_BOUNDARY_ERROR | NVME_DNR;
+    }
+    return NVME_SUCCESS;
+}
+
+uint64_t eswd_write_lbas(struct ssd *ssd, NvmeRequest *req,
+                         uint32_t eswd_id, uint64_t slba, uint32_t nlb,
+                         int64_t stime_ns)
+{
+    struct eswd *e;
+    uint8_t *req_data;
+    uint64_t req_size = 0;
+    uint64_t page_size;
+    uint32_t lba_size;
+    uint32_t page_lbas;
+    uint64_t lat = 0;
+    uint64_t data_off = 0;
+    uint64_t cur_lba = slba;
+    uint32_t remaining = nlb;
+
+    if (!ssd || eswd_id >= ssd->tt_eswds || !req) {
+        return 0;
+    }
+    if (eswd_check_seq_write(ssd, eswd_id, slba, nlb) != NVME_SUCCESS) {
+        return 0;
+    }
+
+    e = &ssd->eswds[eswd_id];
+    lba_size = eswd_lba_size(ssd);
+    page_lbas = eswd_lbas_per_page(ssd);
+    page_size = eswd_page_size_bytes(ssd);
+    req_data = ftl_copy_request_data(req, 0, (uint64_t)nlb * lba_size, &req_size);
+    if (!req_data || req_size < (uint64_t)nlb * lba_size) {
+        g_free(req_data);
+        return 0;
+    }
+
+    while (remaining > 0) {
+        uint32_t stage_off_lbas;
+        uint32_t copy_lbas;
+        uint64_t copy_bytes;
+
+        if (e->staged_valid_lbas == 0) {
+            e->staged_page_lba = cur_lba - (cur_lba % page_lbas);
+        }
+
+        stage_off_lbas = eswd_stage_offset_lbas(ssd, e, cur_lba);
+        copy_lbas = page_lbas - stage_off_lbas;
+        if (copy_lbas > remaining) {
+            copy_lbas = remaining;
+        }
+        copy_bytes = (uint64_t)copy_lbas * lba_size;
+        memcpy(e->staged_page_buf + (size_t)stage_off_lbas * lba_size,
+               req_data + data_off, (size_t)copy_bytes);
+
+        data_off += copy_bytes;
+        cur_lba += copy_lbas;
+        remaining -= copy_lbas;
+        e->staged_valid_lbas = stage_off_lbas + copy_lbas;
+        e->wp_lba += copy_lbas;
+
+        if (e->staged_valid_lbas == page_lbas) {
+            lat += eswd_flush_staged_page(ssd, eswd_id, e, stime_ns);
+            if (page_size == 0) {
+                break;
+            }
+        }
+    }
+
+    g_free(req_data);
+    return lat;
+}
+
+uint64_t eswd_read_lbas(struct ssd *ssd, NvmeRequest *req,
+                        uint32_t eswd_id, uint64_t slba, uint32_t nlb,
+                        int64_t stime_ns)
+{
+    struct eswd *e;
+    uint8_t *out;
+    uint8_t *page_buf;
+    uint64_t page_size;
+    uint32_t lba_size;
+    uint32_t page_lbas;
+    uint64_t total_bytes;
+    uint64_t lat = 0;
+    uint64_t out_off = 0;
+    uint64_t cur_lba = slba;
+    uint32_t remaining = nlb;
+
+    if (!ssd || eswd_id >= ssd->tt_eswds || !req) {
+        return 0;
+    }
+    if (eswd_check_read_range(ssd, eswd_id, slba, nlb) != NVME_SUCCESS) {
+        return 0;
+    }
+
+    e = &ssd->eswds[eswd_id];
+    lba_size = eswd_lba_size(ssd);
+    page_lbas = eswd_lbas_per_page(ssd);
+    page_size = eswd_page_size_bytes(ssd);
+    total_bytes = (uint64_t)nlb * lba_size;
+    out = g_malloc0((size_t)total_bytes);
+    page_buf = g_malloc0((size_t)page_size);
+    if (!out || !page_buf) {
+        g_free(out);
+        g_free(page_buf);
+        return 0;
+    }
+
+    while (remaining > 0) {
+        uint64_t page_lba = cur_lba - (cur_lba % page_lbas);
+        uint32_t page_off_lbas = (uint32_t)(cur_lba - page_lba);
+        uint32_t chunk_lbas = page_lbas - page_off_lbas;
+        uint64_t copy_bytes;
+        uint32_t page_index;
+
+        if (chunk_lbas > remaining) {
+            chunk_lbas = remaining;
+        }
+        copy_bytes = (uint64_t)chunk_lbas * lba_size;
+        page_index = (uint32_t)((page_lba - eswd_start_lba(ssd, eswd_id)) / page_lbas);
+
+        memset(page_buf, 0, (size_t)page_size);
+        if (page_index < e->wp_page_index) {
+            struct BbmEvent event = {0};
+            PseudoPpa ppa;
+
+            if (eswd_id_to_ppa_wrapper(ssd, eswd_id, page_index, &ppa) == 0) {
+                event.cmd = BBM_EVENT_READ;
+                event.type = BBM_EVENT_POLICY_IO;
+                event.count = 1;
+                event.stime = stime_ns;
+                bbm_raw_read(ssd->fb, ssd->bbm, page_buf, &ppa, 1, page_size, &event);
+                lat += (uint64_t)event.lat;
+            }
+        }
+
+        if (e->staged_valid_lbas > 0 && e->staged_page_lba == page_lba) {
+            memcpy(page_buf, e->staged_page_buf,
+                   (size_t)e->staged_valid_lbas * lba_size);
+        }
+
+        memcpy(out + out_off, page_buf + (size_t)page_off_lbas * lba_size,
+               (size_t)copy_bytes);
+        out_off += copy_bytes;
+        cur_lba += chunk_lbas;
+        remaining -= chunk_lbas;
+    }
+
+    (void)ftl_write_request_data(req, out, 0, total_bytes);
+    g_free(out);
+    g_free(page_buf);
+    return lat;
+}
+
+uint64_t read_page_buffer(struct ssd *ssd, const PseudoPpa *ppa,
+                          uint8_t *buffer, int64_t stime_ns)
+{
+    struct BbmEvent event = {0};
+    uint64_t page_size;
+    PseudoPpa local;
+
+    if (!ssd || !ppa || !buffer) {
+        return 0;
+    }
+    local = *ppa;
+    if (!valid_ppa(ssd, &local)) {
+        return 0;
+    }
+
+    page_size = eswd_page_size_bytes(ssd);
+    event.cmd = BBM_EVENT_READ;
+    event.type = BBM_EVENT_POLICY_IO;
+    event.count = 1;
+    event.stime = stime_ns;
+    bbm_raw_read(ssd->fb, ssd->bbm, buffer, &local, 1, page_size, &event);
+    return (uint64_t)event.lat;
+}
+
+uint64_t commit_page_to_eswd(struct ssd *ssd, uint32_t eswd_id,
+                             const uint8_t *buffer, PseudoPpa *out_ppa,
+                             int64_t stime_ns)
+{
+    struct BbmEvent event = {0};
+    struct eswd *e;
+    PseudoPpa ppa;
+    uint64_t page_size;
+
+    if (!ssd || eswd_id >= ssd->tt_eswds || !buffer) {
+        return 0;
+    }
+    e = &ssd->eswds[eswd_id];
+    if (e->wp_page_index >= ssd->eswd_layout.pgs_per_eswd) {
+        return 0;
+    }
+    if (eswd_id_to_ppa_wrapper(ssd, eswd_id, e->wp_page_index, &ppa) != 0) {
+        return 0;
+    }
+
+    page_size = eswd_page_size_bytes(ssd);
+    event.cmd = BBM_EVENT_WRITE;
+    event.type = BBM_EVENT_POLICY_IO;
+    event.count = 1;
+    event.stime = stime_ns;
+    bbm_raw_write(ssd->fb, ssd->bbm, (uint8_t *)buffer, &ppa, 1, page_size, &event);
+    mark_page_valid(ssd, &ppa);
+    e->wp_page_index++;
+    e->wp_lba += eswd_lbas_per_page(ssd);
+    if (out_ppa) {
+        *out_ppa = ppa;
+    }
+    return (uint64_t)event.lat;
 }
 
 /* eSWD layout query wrappers */
@@ -692,6 +1136,54 @@ int ppa_to_eswd_id_wrapper(struct ssd *ssd, const PseudoPpa *ppa, uint32_t *eswd
 int eswd_block_to_ppa_wrapper(struct ssd *ssd, uint32_t eswd_id, uint32_t block_index, PseudoPpa *ppa)
 {
     return eswd_block_to_ppa(&ssd->eswd_layout, ssd->bbm->geom, eswd_id, block_index, ppa);
+}
+
+int ftl_eswd_advance_wp_to_end(struct ssd *ssd, uint32_t eswd_id)
+{
+    if (!ssd || eswd_id >= ssd->tt_eswds) {
+        return -1;
+    }
+    ssd->eswds[eswd_id].wp_lba = eswd_end_lba(ssd, eswd_id);
+    return 0;
+}
+
+uint64_t ftl_eswd_erase_physical(struct ssd *ssd, uint32_t eswd_id, int64_t stime_ns)
+{
+    const struct eswd_layout *layout;
+    uint64_t maxlat = 0;
+    struct BbmEvent bbm_ev = {0};
+
+    if (!ssd || !ssd->fb || !ssd->bbm || eswd_id >= ssd->tt_eswds) {
+        return 0;
+    }
+    layout = &ssd->eswd_layout;
+    bbm_ev.cmd = BBM_EVENT_ERASE;
+    bbm_ev.type = BBM_EVENT_POLICY_IO;
+    bbm_ev.stime = stime_ns;
+    if (layout->blks_per_eswd > 0) {
+        bbm_ev.status_list = g_malloc0(sizeof(int) * (size_t)layout->blks_per_eswd);
+    }
+
+    for (uint32_t blk = 0; blk < layout->blks_per_eswd; blk++) {
+        PseudoPpa ppa;
+        PseudoPba pba;
+
+        if (eswd_block_to_ppa_wrapper(ssd, eswd_id, blk, &ppa) != 0) {
+            continue;
+        }
+        mark_block_free(ssd, &ppa);
+        pba.g.ch = ppa.g.ch;
+        pba.g.lun = ppa.g.lun;
+        pba.g.pl = ppa.g.pl;
+        pba.g.blk = ppa.g.blk;
+        bbm_raw_erase(ssd->fb, ssd->bbm, &pba, 1, &bbm_ev);
+        if ((uint64_t)bbm_ev.lat > maxlat) {
+            maxlat = (uint64_t)bbm_ev.lat;
+        }
+    }
+
+    g_free(bbm_ev.status_list);
+    return maxlat;
 }
 
 /* ======================================================== 
@@ -806,8 +1298,8 @@ int migrate_eswd_pages(struct ssd *ssd,
         dst_eswd->vpc++;
         
         /* Update backend validity (mechanism owns this) */
-        ssd->policy_api->bbm_api->mark_page_invalid(ssd->fb, ssd->bbm, &src_ppa);
-        ssd->policy_api->bbm_api->mark_page_valid(ssd->fb, ssd->bbm, &dst_ppa);
+        bbm_mark_page_invalid(ssd->fb, ssd->bbm, &src_ppa);
+        bbm_mark_page_valid(ssd->fb, ssd->bbm, &dst_ppa);
         
         /* Advance destination write pointer */
         dst_eswd->wp_page_index++;
@@ -831,7 +1323,7 @@ int migrate_eswd_pages(struct ssd *ssd,
         }
         
         /* Mark block as free in backend */
-        ssd->policy_api->bbm_api->mark_block_free(ssd->fb, ssd->bbm, &ppa);
+        bbm_mark_block_free(ssd->fb, ssd->bbm, &ppa);
         
         /* Simulate erase latency (critical for accurate GC performance) */
         if (spp->enable_gc_delay) {
@@ -849,7 +1341,7 @@ int migrate_eswd_pages(struct ssd *ssd,
             ppba.g.pl = ppa.g.pl;
             ppba.g.blk = ppa.g.blk;
             
-            ssd->policy_api->bbm_api->raw_erase(ssd->fb, ssd->bbm, &ppba, 1, &event);
+            bbm_raw_erase(ssd->fb, ssd->bbm, &ppba, 1, &event);
             
             /* Update LUN gc_endtime */
             struct nand_lun *src_lun = get_lun(ssd, &ppa);
@@ -1037,6 +1529,91 @@ static void ssd_init_ch(struct ssd *ssd, struct ssd_channel *ch)
     ch->busy = 0;
 }
 
+static void *ftl_dup_payload(const void *src, size_t len)
+{
+    void *dst;
+
+    if (!src || len == 0) {
+        return NULL;
+    }
+
+    dst = g_malloc0(len);
+    memcpy(dst, src, len);
+    return dst;
+}
+
+static uint32_t ftl_count_published_namespaces(FemuCtrl *n)
+{
+    uint32_t i;
+    uint32_t count = 0;
+
+    if (!n || !n->namespaces) {
+        return 0;
+    }
+
+    for (i = 0; i < n->num_namespaces; i++) {
+        if (n->namespaces[i].published) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+int configure_namespace_personality(struct ssd *ssd,
+                                    const struct NamespacePersonalityConfig *config)
+{
+    FemuCtrl *n;
+    NvmeNamespace *ns;
+    void *ns_csi_copy = NULL;
+    void *ctrl_csi_copy = NULL;
+
+    if (!ssd || !ssd->ctrl || !config) {
+        return -1;
+    }
+
+    n = ssd->ctrl;
+    if (!n->namespaces || n->num_namespaces == 0) {
+        return -1;
+    }
+    ns = &n->namespaces[0];
+    if (!ns) {
+        return -1;
+    }
+
+    if (config->ns_csi_data_len && !config->ns_csi_data) {
+        return -1;
+    }
+    if (config->ctrl_csi_data_len && !config->ctrl_csi_data) {
+        return -1;
+    }
+
+    ns_csi_copy = ftl_dup_payload(config->ns_csi_data, config->ns_csi_data_len);
+    ctrl_csi_copy = ftl_dup_payload(config->ctrl_csi_data, config->ctrl_csi_data_len);
+
+    g_free(n->id_ns_csi);
+    g_free(n->id_ctrl_csi);
+
+    n->csi = config->csi;
+    n->id_ns_csi = ns_csi_copy;
+    n->id_ns_csi_len = config->ns_csi_data_len;
+    n->id_ctrl_csi = ctrl_csi_copy;
+    n->id_ctrl_csi_len = config->ctrl_csi_data_len;
+
+    /* Preserve the legacy zoned pointer for existing identify paths that still
+     * special-case CSI_ZONED while keeping the installed payload generic. */
+    n->id_ns_zoned = (config->csi == NVME_CSI_ZONED) ? (NvmeIdNsZoned *)n->id_ns_csi : NULL;
+
+    ns->id_ns.nsze = cpu_to_le64(config->nsze);
+    ns->id_ns.ncap = cpu_to_le64(config->ncap);
+    ns->id_ns.nuse = cpu_to_le64(config->nuse);
+    ns->id_ns.noiob = config->noiob;
+    ns->published = true;
+    n->id_ctrl.nn = cpu_to_le32(ftl_count_published_namespaces(n));
+
+    return 0;
+}
+
 
 void ssd_init(FemuCtrl *n)
 {
@@ -1044,6 +1621,7 @@ void ssd_init(FemuCtrl *n)
    // struct ssdparams *spp = &ssd->fb->sp;
 
     ftl_assert(ssd);
+    ssd->ctrl = n;
 
     /* Initialize backend timing/error model */
     if (!ssd->fb) {
@@ -1091,7 +1669,16 @@ void ssd_init(FemuCtrl *n)
     ssd->policy_api->eswd_set_vpc_ipc = eswd_set_vpc_ipc;
     ssd->policy_api->eswd_increment_wp = eswd_increment_wp;
     ssd->policy_api->eswd_reset = eswd_reset;
-    
+    ssd->policy_api->eswd_get_wp_lba = eswd_get_wp_lba;
+    ssd->policy_api->eswd_check_seq_write = eswd_check_seq_write;
+    ssd->policy_api->eswd_check_read_range = eswd_check_read_range;
+    ssd->policy_api->eswd_write_lbas = eswd_write_lbas;
+    ssd->policy_api->eswd_read_lbas = eswd_read_lbas;
+    ssd->policy_api->read_page_buffer = read_page_buffer;
+    ssd->policy_api->commit_page_to_eswd = commit_page_to_eswd;
+    ssd->policy_api->eswd_advance_wp_to_end = ftl_eswd_advance_wp_to_end;
+    ssd->policy_api->eswd_erase_physical = ftl_eswd_erase_physical;
+
     /* eSWD layout query (mechanism owns layout) */
     ssd->policy_api->eswd_id_to_ppa = eswd_id_to_ppa_wrapper;
     ssd->policy_api->ppa_to_eswd_id = ppa_to_eswd_id_wrapper;
@@ -1121,6 +1708,9 @@ void ssd_init(FemuCtrl *n)
     ssd->policy_api->copy_request_data = ftl_copy_request_data;
     ssd->policy_api->write_request_data = ftl_write_request_data;
     ssd->policy_api->get_dsm_ranges = ftl_get_dsm_ranges;
+    ssd->policy_api->read_cmd_buffer = ftl_read_cmd_buffer;
+    ssd->policy_api->write_cmd_buffer = ftl_write_cmd_buffer;
+    ssd->policy_api->set_completion_result_u64 = ftl_set_completion_result_u64;
     ssd->policy_api->get_gc_thres_lines = ftl_get_gc_thres_lines;
     ssd->policy_api->get_gc_thres_lines_high = ftl_get_gc_thres_lines_high;
     ssd->policy_api->get_page_status = ftl_get_page_status;
@@ -1130,6 +1720,10 @@ void ssd_init(FemuCtrl *n)
     ssd->policy_api->unregister_nvme_hook = ftl_unregister_nvme_hook;
     ssd->policy_api->inactivate_nvme_hook = ftl_inactivate_nvme_hook;
     ssd->policy_api->reactivate_nvme_hook = ftl_reactivate_nvme_hook;
+    ssd->policy_api->register_admin_hook = ftl_register_admin_hook;
+    ssd->policy_api->unregister_admin_hook = ftl_unregister_admin_hook;
+    ssd->policy_api->inactivate_admin_hook = ftl_inactivate_admin_hook;
+    ssd->policy_api->reactivate_admin_hook = ftl_reactivate_admin_hook;
     ssd->policy_api->register_backend_hook = ftl_register_backend_hook;
     ssd->policy_api->unregister_backend_hook = ftl_unregister_backend_hook;
     ssd->policy_api->inactivate_backend_hook = ftl_inactivate_backend_hook;
@@ -1146,13 +1740,13 @@ void ssd_init(FemuCtrl *n)
     /* eSWD config (policy sets at init) */
     ssd->policy_api->set_eswd_config = set_eswd_config;
     ssd->policy_api->finalize_ftl_init = finalize_ftl_init;
+    ssd->policy_api->configure_namespace_personality = configure_namespace_personality;
 
     /* User read through BBM (mechanism builds PPA list via policy resolver and calls BBM) */
     ssd->policy_api->read_user_request = ftl_read_user_request;
     ssd->policy_api->write_user_request = ftl_write_user_request;
 
-    /* BBM API pass-through (mechanism provides backend operations) */
-    ssd->policy_api->bbm_api = ssd->bbm->policy_api;
+    /* BBM policy-visible pass-through intentionally disabled. */
 
     if (m_interface_policy_init(ssd) != 0) {
         fprintf(stderr, "[FTL] Failed to initialize meta interface policy\n");
@@ -1206,7 +1800,7 @@ struct nand_lun *get_lun(struct ssd *ssd, PseudoPpa *ppa)
 /* Backend clears per-block validity; policy calls this after cleaning a block (e.g. in migration). */
 void mark_block_free(struct ssd *ssd, PseudoPpa *ppa)
 {
-    ssd->policy_api->bbm_api->mark_block_free(ssd->fb, ssd->bbm, ppa);
+    bbm_mark_block_free(ssd->fb, ssd->bbm, ppa);
 }
 
 static void *ftl_thread(void *arg)

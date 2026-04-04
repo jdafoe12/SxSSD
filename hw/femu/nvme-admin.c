@@ -351,6 +351,10 @@ static inline NvmeNamespace *nvme_ns(FemuCtrl *n, uint32_t nsid)
         return NULL;
     }
 
+    if (!n->namespaces[nsid - 1].published) {
+        return NULL;
+    }
+
     return &n->namespaces[nsid - 1];
 }
 
@@ -407,7 +411,7 @@ static uint16_t nvme_identify_ns_csi(FemuCtrl *n, NvmeCmd *cmd)
     uint32_t nsid = le32_to_cpu(c->nsid);
     uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
     uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
-    int pgsz = n->page_size;
+    size_t pgsz = n->page_size;
 
     if (!nvme_nsid_valid(n, nsid) || nsid == NVME_NSID_BROADCAST) {
         return NVME_INVALID_NSID | NVME_DNR;
@@ -420,8 +424,13 @@ static uint16_t nvme_identify_ns_csi(FemuCtrl *n, NvmeCmd *cmd)
 
     if (c->csi == NVME_CSI_NVM && nvme_csi_has_nvm_support(ns)) {
         return nvme_rpt_empty_id_struct(n, cmd);
-    } else if (c->csi == NVME_CSI_ZONED && n->csi == NVME_CSI_ZONED) {
-        return dma_read_prp(n, (uint8_t *)n->id_ns_zoned, pgsz, prp1, prp2);
+    } else if (c->csi == n->csi && n->id_ns_csi && n->id_ns_csi_len > 0) {
+        if (n->id_ns_csi_len < pgsz) {
+            pgsz = n->id_ns_csi_len;
+        }
+        return dma_read_prp(n, (uint8_t *)n->id_ns_csi, (uint32_t)pgsz, prp1, prp2);
+    } else if (c->csi == NVME_CSI_ZONED && n->csi == NVME_CSI_ZONED && n->id_ns_zoned) {
+        return dma_read_prp(n, (uint8_t *)n->id_ns_zoned, (uint32_t)pgsz, prp1, prp2);
     }
 
     return NVME_INVALID_FIELD | NVME_DNR;
@@ -441,17 +450,24 @@ static uint16_t nvme_identify_ctrl_csi(FemuCtrl *n, NvmeCmd *cmd)
     NvmeIdentify *c = (NvmeIdentify *)cmd;
     uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
     uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
-
-    typedef struct NvmeIdCtrlZoned {
-        uint8_t     zasl;
-        uint8_t     rsvd1[4095];
-    } NvmeIdCtrlZoned;
-
-    NvmeIdCtrlZoned id = {};
+    size_t data_len;
 
     if (c->csi == NVME_CSI_NVM) {
         return nvme_rpt_empty_id_struct(n, cmd);
+    } else if (c->csi == n->csi && n->id_ctrl_csi && n->id_ctrl_csi_len > 0) {
+        data_len = n->id_ctrl_csi_len;
+        if (data_len > n->page_size) {
+            data_len = n->page_size;
+        }
+        return dma_read_prp(n, (uint8_t *)n->id_ctrl_csi, (uint32_t)data_len, prp1, prp2);
     } else if (c->csi == NVME_CSI_ZONED) {
+        typedef struct NvmeIdCtrlZoned {
+            uint8_t zasl;
+            uint8_t rsvd1[4095];
+        } NvmeIdCtrlZoned;
+
+        NvmeIdCtrlZoned id = {};
+
         if (n->zasl_bs) {
             id.zasl = n->zasl;
         }
@@ -1084,7 +1100,7 @@ static uint16_t nvme_admin_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
         return NVME_INVALID_OPCODE | NVME_DNR;
     default:
         if (n->ext_ops.admin_cmd) {
-            return n->ext_ops.admin_cmd(n, cmd);
+            return n->ext_ops.admin_cmd(n, cmd, cqe);
         }
 
         return NVME_INVALID_OPCODE | NVME_DNR;
@@ -1130,4 +1146,3 @@ void nvme_process_sq_admin(void *opaque)
         nvme_isr_notify_admin(cq);
     }
 }
-

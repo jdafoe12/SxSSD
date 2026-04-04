@@ -126,6 +126,9 @@ static void unregister_runtime_policy_hooks(struct policy_engine *pe,
     for (i = rec->nvme_hook_count - 1; i >= 0; i--) {
         pe_unregister_nvme_hook(pe, rec->nvme_hook_handles[i]);
     }
+    for (i = rec->admin_hook_count - 1; i >= 0; i--) {
+        pe_unregister_admin_hook(pe, rec->admin_hook_handles[i]);
+    }
     for (i = rec->backend_hook_count - 1; i >= 0; i--) {
         pe_unregister_backend_hook(pe, rec->backend_hook_handles[i]);
     }
@@ -137,6 +140,7 @@ static void unregister_runtime_policy_hooks(struct policy_engine *pe,
     }
 
     rec->nvme_hook_count = 0;
+    rec->admin_hook_count = 0;
     rec->backend_hook_count = 0;
     rec->pswd_hook_count = 0;
     rec->background_hook_count = 0;
@@ -291,6 +295,13 @@ struct policy_engine *pe_create(void)
         pe->nvme_hooks[i].callback = NULL;
         pe->nvme_hooks[i].context = NULL;
     }
+    for (int i = 0; i < MAX_ADMIN_HOOKS; i++) {
+        pe->admin_hooks[i].active = false;
+        pe->admin_hooks[i].opcode = 0;
+        pe->admin_hooks[i].condition = NULL;
+        pe->admin_hooks[i].callback = NULL;
+        pe->admin_hooks[i].context = NULL;
+    }
     for (int i = 0; i < MAX_BACKEND_EVENT_HOOKS; i++) {
         pe->backend_hooks[i].active = false;
         pe->backend_hooks[i].condition = NULL;
@@ -345,6 +356,28 @@ uint64_t pe_dispatch_nvme_cmd(struct policy_engine *pe, struct ssd *ssd, struct 
     return 0;
 }
 
+uint64_t pe_dispatch_admin_cmd(struct policy_engine *pe, struct ssd *ssd,
+                               struct NvmeCommandEvent *event)
+{
+    if (!pe || !ssd || !event) {
+        return 0;
+    }
+    for (int i = MAX_ADMIN_HOOKS - 1; i >= 0; i--) {
+        struct AdminHook *hook = &pe->admin_hooks[i];
+        if (!hook->active || !hook->callback || hook->opcode != event->opcode) {
+            continue;
+        }
+        bool should_fire = (hook->condition == NULL) ||
+            hook->condition(ssd, event, ssd->policy_api, hook->context);
+        if (should_fire) {
+            event->lat = hook->callback(ssd, event, ssd->policy_api, hook->context);
+            return event->lat;
+        }
+    }
+    event->lat = 0;
+    return 0;
+}
+
 void pe_dispatch_backend_event(struct policy_engine *pe, struct FtlBackend *fb,
                                struct bbm *ctx, struct FtlBackendEvent *event)
 {
@@ -357,9 +390,9 @@ void pe_dispatch_backend_event(struct policy_engine *pe, struct FtlBackend *fb,
             continue;
         }
         bool should_fire = (hook->condition == NULL) ||
-            hook->condition(event, ctx->policy_api, hook->context);
+            hook->condition(event, NULL, hook->context);
         if (should_fire) {
-            hook->callback(fb, ctx, event, ctx->policy_api, hook->context);
+            hook->callback(fb, ctx, event, NULL, hook->context);
         }
     }
 }
@@ -382,9 +415,9 @@ void pe_dispatch_pswd_transition(struct FtlBackend *fb,
             continue;
         }
         bool should_fire = (hook->condition == NULL) ||
-            hook->condition(event, ctx->policy_api, hook->context);
+            hook->condition(event, NULL, hook->context);
         if (should_fire) {
-            hook->callback(fb, ctx, event, ctx->policy_api, hook->context);
+            hook->callback(fb, ctx, event, NULL, hook->context);
         }
     }
 }
@@ -437,6 +470,33 @@ int pe_register_nvme_hook(struct policy_engine *pe, uint8_t opcode,
     return -1;
 }
 
+int pe_register_admin_hook(struct policy_engine *pe, uint8_t opcode,
+                           NvmeHookCondition condition,
+                           NvmeHookCallback callback,
+                           void *context)
+{
+    if (!pe || !callback) {
+        return -1;
+    }
+    for (int i = 0; i < MAX_ADMIN_HOOKS; i++) {
+        if (!pe->admin_hooks[i].callback) {
+            pe->admin_hooks[i].opcode = opcode;
+            pe->admin_hooks[i].condition = condition;
+            pe->admin_hooks[i].callback = callback;
+            pe->admin_hooks[i].context = context;
+            pe->admin_hooks[i].active = true;
+            if (pe->current_loading_policy >= 0) {
+                struct runtime_policy_record *rec =
+                    &pe->runtime_policies[pe->current_loading_policy];
+                record_owned_hook(pe, i, rec->admin_hook_handles,
+                                  &rec->admin_hook_count, MAX_ADMIN_HOOKS);
+            }
+            return i;
+        }
+    }
+    return -1;
+}
+
 int pe_unregister_nvme_hook(struct policy_engine *pe, int hook_handle)
 {
     if (!pe || hook_handle < 0 || hook_handle >= MAX_NVME_HOOKS) {
@@ -447,6 +507,19 @@ int pe_unregister_nvme_hook(struct policy_engine *pe, int hook_handle)
     pe->nvme_hooks[hook_handle].condition = NULL;
     pe->nvme_hooks[hook_handle].callback = NULL;
     pe->nvme_hooks[hook_handle].context = NULL;
+    return 0;
+}
+
+int pe_unregister_admin_hook(struct policy_engine *pe, int hook_handle)
+{
+    if (!pe || hook_handle < 0 || hook_handle >= MAX_ADMIN_HOOKS) {
+        return -1;
+    }
+    pe->admin_hooks[hook_handle].active = false;
+    pe->admin_hooks[hook_handle].opcode = 0;
+    pe->admin_hooks[hook_handle].condition = NULL;
+    pe->admin_hooks[hook_handle].callback = NULL;
+    pe->admin_hooks[hook_handle].context = NULL;
     return 0;
 }
 
@@ -466,6 +539,27 @@ int pe_reactivate_nvme_hook(struct policy_engine *pe, int hook_handle)
     }
     if (pe->nvme_hooks[hook_handle].callback) {
         pe->nvme_hooks[hook_handle].active = true;
+        return 0;
+    }
+    return -1;
+}
+
+int pe_inactivate_admin_hook(struct policy_engine *pe, int hook_handle)
+{
+    if (!pe || hook_handle < 0 || hook_handle >= MAX_ADMIN_HOOKS) {
+        return -1;
+    }
+    pe->admin_hooks[hook_handle].active = false;
+    return 0;
+}
+
+int pe_reactivate_admin_hook(struct policy_engine *pe, int hook_handle)
+{
+    if (!pe || hook_handle < 0 || hook_handle >= MAX_ADMIN_HOOKS) {
+        return -1;
+    }
+    if (pe->admin_hooks[hook_handle].callback) {
+        pe->admin_hooks[hook_handle].active = true;
         return 0;
     }
     return -1;
@@ -651,6 +745,21 @@ bool pe_has_nvme_hook(struct policy_engine *pe, uint8_t opcode)
         if (pe->nvme_hooks[i].active && 
             pe->nvme_hooks[i].callback && 
             pe->nvme_hooks[i].opcode == opcode) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool pe_has_admin_hook(struct policy_engine *pe, uint8_t opcode)
+{
+    if (!pe) {
+        return false;
+    }
+    for (int i = 0; i < MAX_ADMIN_HOOKS; i++) {
+        if (pe->admin_hooks[i].active &&
+            pe->admin_hooks[i].callback &&
+            pe->admin_hooks[i].opcode == opcode) {
             return true;
         }
     }

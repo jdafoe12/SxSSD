@@ -539,6 +539,7 @@ static inline void victim_eswd_set_pos(void *a, size_t pos)
 int init_policy(struct ssd *ssd, struct FtlPolicyAPI *api)
 {
     struct block_policy_context *ctx;
+    struct NamespacePersonalityConfig personality = {0};
     uint32_t tt_eswds;
     uint32_t i;
     struct eswd *first;
@@ -553,6 +554,16 @@ int init_policy(struct ssd *ssd, struct FtlPolicyAPI *api)
         api->set_eswd_config(ssd, &config);
     }
     if (api->finalize_ftl_init && api->finalize_ftl_init(ssd) != 0) {
+        return -1;
+    }
+
+    personality.csi = NVME_CSI_NVM;
+    personality.nsze = api->get_total_logical_pages(ssd);
+    personality.ncap = personality.nsze;
+    personality.nuse = personality.ncap;
+    personality.noiob = 0;
+    if (api->configure_namespace_personality &&
+        api->configure_namespace_personality(ssd, &personality) != 0) {
         return -1;
     }
 

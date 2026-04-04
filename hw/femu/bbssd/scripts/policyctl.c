@@ -675,11 +675,11 @@ static int parse_meta_envelope(const uint8_t *buffer, size_t buffer_len,
     return 0;
 }
 
-static int send_nvme_io_cmd_ex(const char *device, uint8_t opcode,
-                               void *buffer, uint32_t data_len,
-                               uint32_t cdw12, uint32_t cdw13)
+static int send_nvme_admin_cmd_ex(const char *device, uint8_t opcode,
+                                  void *buffer, uint32_t data_len,
+                                  uint32_t cdw12, uint32_t cdw13)
 {
-    struct nvme_passthru_cmd cmd = {0};
+    struct nvme_admin_cmd cmd = {0};
     int fd;
     int rc = -1;
 
@@ -690,13 +690,13 @@ static int send_nvme_io_cmd_ex(const char *device, uint8_t opcode,
     }
 
     cmd.opcode = opcode;
-    cmd.nsid = 1;
+    cmd.nsid = 0;
     cmd.addr = (uintptr_t)buffer;
     cmd.data_len = data_len;
     cmd.cdw12 = cdw12;
     cmd.cdw13 = cdw13;
 
-    if (ioctl(fd, NVME_IOCTL_IO_CMD, &cmd) != 0) {
+    if (ioctl(fd, NVME_IOCTL_ADMIN_CMD, &cmd) != 0) {
         perror("ioctl");
         goto cleanup;
     }
@@ -712,10 +712,10 @@ cleanup:
     return rc;
 }
 
-static int send_nvme_io_cmd(const char *device, uint8_t opcode,
-                            void *buffer, uint32_t data_len)
+static int send_nvme_admin_cmd(const char *device, uint8_t opcode,
+                               void *buffer, uint32_t data_len)
 {
-    return send_nvme_io_cmd_ex(device, opcode, buffer, data_len, data_len, 0);
+    return send_nvme_admin_cmd_ex(device, opcode, buffer, data_len, data_len, 0);
 }
 
 static int establish_session(const char *device, uint8_t session_mode,
@@ -759,14 +759,14 @@ static int establish_session(const char *device, uint8_t session_mode,
     request[32] = session_mode;
     encode_u64_le(counter, request + 33);
 
-    if (send_nvme_io_cmd(device, NVME_CMD_INIT_SESSION_SUBMIT,
+    if (send_nvme_admin_cmd(device, NVME_CMD_INIT_SESSION_SUBMIT,
                          request, INIT_SESSION_REQUEST_SIZE) != 0) {
         fprintf(stderr, "Failed to submit INIT_SESSION request\n");
         goto cleanup;
     }
 
     memset(response, 0, sizeof(response));
-    if (send_nvme_io_cmd(device, NVME_CMD_INIT_SESSION_FETCH,
+    if (send_nvme_admin_cmd(device, NVME_CMD_INIT_SESSION_FETCH,
                          response, INIT_SESSION_RESPONSE_SIZE) != 0) {
         fprintf(stderr, "Failed to fetch INIT_SESSION response\n");
         goto cleanup;
@@ -900,7 +900,7 @@ static int send_authenticated_meta_cmd(const char *device,
         return -1;
     }
 
-    if (send_nvme_io_cmd(device, opcode, request, request_len) != 0) {
+    if (send_nvme_admin_cmd(device, opcode, request, request_len) != 0) {
         goto cleanup;
     }
 
@@ -1052,7 +1052,7 @@ static int do_attestation(const char *device, uint32_t policy_id, uint32_t repor
         goto cleanup;
     }
 
-    if (send_nvme_io_cmd(device, NVME_CMD_POLICY_ATTESTATION_FETCH,
+    if (send_nvme_admin_cmd(device, NVME_CMD_POLICY_ATTESTATION_FETCH,
                          buffer, response_len) != 0) {
         goto cleanup;
     }

@@ -17,9 +17,34 @@
 #define CH_BITS  (7)
 
 enum {
+    NVME_SUCCESS = 0x0000,
+    NVME_INVALID_FIELD = 0x0002,
+    NVME_INTERNAL_DEV_ERROR = 0x0006,
+    NVME_DATA_TRAS_ERROR = 0x0004,
+    NVME_LBA_RANGE = 0x0080,
+    NVME_ZONE_BOUNDARY_ERROR = 0x01b8,
+    NVME_ZONE_FULL = 0x01b9,
+    NVME_ZONE_READ_ONLY = 0x01ba,
+    NVME_ZONE_OFFLINE = 0x01bb,
+    NVME_ZONE_INVALID_WRITE = 0x01bc,
+    NVME_ZONE_TOO_MANY_ACTIVE = 0x01bd,
+    NVME_ZONE_TOO_MANY_OPEN = 0x01be,
+    NVME_ZONE_INVAL_TRANSITION = 0x01bf,
+    NVME_DNR = 0x4000,
+};
+
+enum {
     NVME_CMD_WRITE = 0x01,
     NVME_CMD_READ = 0x02,
     NVME_CMD_DSM = 0x09,
+    NVME_CMD_ZONE_MGMT_SEND = 0x79,
+    NVME_CMD_ZONE_MGMT_RECV = 0x7a,
+    NVME_CMD_ZONE_APPEND = 0x7d,
+};
+
+enum {
+    NVME_CSI_NVM = 0x00,
+    NVME_CSI_ZONED = 0x02,
 };
 
 struct ppa {
@@ -115,6 +140,22 @@ struct eswd {
     int vpc;
     int ipc;
     uint32_t wp_page_index;
+    uint64_t wp_lba;
+    uint64_t staged_page_lba;
+    uint32_t staged_valid_lbas;
+    uint8_t *staged_page_buf;
+};
+
+struct NamespacePersonalityConfig {
+    uint8_t csi;
+    uint64_t nsze;
+    uint64_t ncap;
+    uint64_t nuse;
+    uint32_t noiob;
+    const void *ns_csi_data;
+    size_t ns_csi_data_len;
+    const void *ctrl_csi_data;
+    size_t ctrl_csi_data_len;
 };
 
 struct ssd;
@@ -216,6 +257,24 @@ struct FtlPolicyAPI {
     void (*eswd_set_vpc_ipc)(struct ssd *ssd, uint32_t eswd_id, int vpc, int ipc);
     void (*eswd_increment_wp)(struct ssd *ssd, uint32_t eswd_id);
     void (*eswd_reset)(struct ssd *ssd, uint32_t eswd_id);
+    uint64_t (*eswd_get_wp_lba)(struct ssd *ssd, uint32_t eswd_id);
+    uint16_t (*eswd_check_seq_write)(struct ssd *ssd, uint32_t eswd_id,
+                                     uint64_t slba, uint32_t nlb);
+    uint16_t (*eswd_check_read_range)(struct ssd *ssd, uint32_t eswd_id,
+                                      uint64_t slba, uint32_t nlb);
+    uint64_t (*eswd_write_lbas)(struct ssd *ssd, struct NvmeRequest *req,
+                                uint32_t eswd_id, uint64_t slba, uint32_t nlb,
+                                int64_t stime_ns);
+    uint64_t (*eswd_read_lbas)(struct ssd *ssd, struct NvmeRequest *req,
+                               uint32_t eswd_id, uint64_t slba, uint32_t nlb,
+                               int64_t stime_ns);
+    uint64_t (*read_page_buffer)(struct ssd *ssd, const PseudoPpa *ppa,
+                                 uint8_t *buffer, int64_t stime_ns);
+    uint64_t (*commit_page_to_eswd)(struct ssd *ssd, uint32_t eswd_id,
+                                    const uint8_t *buffer, PseudoPpa *out_ppa,
+                                    int64_t stime_ns);
+    int (*eswd_advance_wp_to_end)(struct ssd *ssd, uint32_t eswd_id);
+    uint64_t (*eswd_erase_physical)(struct ssd *ssd, uint32_t eswd_id, int64_t stime_ns);
     int (*eswd_id_to_ppa)(struct ssd *ssd, uint32_t eswd_id, uint32_t page_index, PseudoPpa *ppa);
     int (*ppa_to_eswd_id)(struct ssd *ssd, const PseudoPpa *ppa, uint32_t *eswd_id, uint32_t *page_index);
     int (*eswd_block_to_ppa)(struct ssd *ssd, uint32_t eswd_id, uint32_t block_index, PseudoPpa *ppa);
@@ -251,6 +310,12 @@ struct FtlPolicyAPI {
     uint64_t (*write_request_data)(struct NvmeRequest *req, const uint8_t *buffer,
                                    uint64_t offset, uint64_t length);
     const NvmeDsmRange *(*get_dsm_ranges)(struct NvmeRequest *req, int *nr_ranges);
+    uint16_t (*read_cmd_buffer)(struct NvmeCommandEvent *event, void *dst,
+                                uint32_t length);
+    uint16_t (*write_cmd_buffer)(struct NvmeCommandEvent *event, const void *src,
+                                 uint32_t length);
+    void (*set_completion_result_u64)(struct NvmeCommandEvent *event,
+                                      uint64_t value);
     int (*get_gc_thres_lines)(struct ssd *ssd);
     int (*get_gc_thres_lines_high)(struct ssd *ssd);
     int (*get_page_status)(struct ssd *ssd, const PseudoPpa *ppa);
@@ -261,6 +326,13 @@ struct FtlPolicyAPI {
     int (*unregister_nvme_hook)(struct ssd *ssd, int hook_handle);
     int (*inactivate_nvme_hook)(struct ssd *ssd, int hook_handle);
     int (*reactivate_nvme_hook)(struct ssd *ssd, int hook_handle);
+    int (*register_admin_hook)(struct ssd *ssd, uint8_t opcode,
+                               NvmeHookCondition condition,
+                               NvmeHookCallback callback,
+                               void *context);
+    int (*unregister_admin_hook)(struct ssd *ssd, int hook_handle);
+    int (*inactivate_admin_hook)(struct ssd *ssd, int hook_handle);
+    int (*reactivate_admin_hook)(struct ssd *ssd, int hook_handle);
     int (*register_backend_hook)(struct ssd *ssd, BackendEventHookCondition condition,
                                  BackendEventHookCallback callback, void *context);
     int (*unregister_backend_hook)(struct ssd *ssd, int hook_handle);
@@ -278,12 +350,14 @@ struct FtlPolicyAPI {
     int (*reactivate_background_hook)(struct ssd *ssd, int hook_handle);
     void (*set_eswd_config)(struct ssd *ssd, const struct eswd_config *config);
     int (*finalize_ftl_init)(struct ssd *ssd);
+    int (*configure_namespace_personality)(struct ssd *ssd,
+                                           const struct NamespacePersonalityConfig *config);
     void (*gc_update_mapping)(struct ssd *ssd, PseudoPpa *old_ppa, PseudoPpa *new_ppa);
     uint64_t (*read_user_request)(struct ssd *ssd, struct NvmeCommandEvent *event,
                                   ReadPpaResolver resolve_ppa, void *resolve_ctx);
     uint64_t (*write_user_request)(struct ssd *ssd, struct NvmeRequest *req,
                                    PseudoPpa *ppa_list, uint64_t ppa_cnt);
-    struct BbmPolicyAPI *bbm_api;
+    /* struct BbmPolicyAPI *bbm_api; */
 };
 
 typedef int (*policy_init_fn)(struct ssd *ssd, struct FtlPolicyAPI *api);

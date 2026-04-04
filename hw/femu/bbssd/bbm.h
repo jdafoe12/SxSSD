@@ -95,20 +95,21 @@ struct BbmEvent;
           Some of these functions should be internal! (i.e. only exposed to bbm.c and ftl.c) */
 struct BbmPolicyAPI {
     uint32_t version;  /* API version for compatibility checking */
-    
-    /* Address translation */
+
+    /*
+     * Policy-visible BBM operations are intentionally commented out for now.
+     * BBM remains a mechanism-owned layer; FTL and BBM code should call bbm_*()
+     * directly rather than exposing raw/media-management entry points to policy.
+     */
+#if 0
     struct pba (*get_maptbl_entry)(const struct bbm *ctx, const PseudoPba *ppba);
     bool (*is_reserved_blk)(const struct bbm *ctx, uint32_t blk);
-    
-    /* I/O operations - for host requests */
     int (*read)(struct FtlBackend *fb, const struct bbm *ctx,
                 struct NvmeRequest *req, PseudoPpa *ppas,
                 uint64_t ppa_count, uint64_t page_size, struct BbmEvent *event);
     int (*write)(struct FtlBackend *fb, const struct bbm *ctx,
                  struct NvmeRequest *req, PseudoPpa *ppas,
                  uint64_t ppa_count, uint64_t page_size, struct BbmEvent *event);
-    
-    /* Raw I/O operations - for policy/GC use */
     int (*raw_read)(struct FtlBackend *fb, const struct bbm *ctx,
                     uint8_t *buffer, PseudoPpa *ppas,
                     uint64_t ppa_count, uint64_t page_size, struct BbmEvent *event);
@@ -117,25 +118,20 @@ struct BbmPolicyAPI {
                      uint64_t ppa_count, uint64_t page_size, struct BbmEvent *event);
     int (*raw_erase)(struct FtlBackend *fb, const struct bbm *ctx,
                      PseudoPba *pbns, uint64_t blk_count, struct BbmEvent *event);
-    
-    /* Metadata queries */
     int (*get_erase_cnt)(const struct FtlBackend *fb, const struct bbm *ctx,
                          const PseudoPba *ppba);
-    
-    /* Bad block management operations */
     int (*mark_block_bad)(struct FtlBackend *fb, const struct bbm *ctx,
                           const struct ppa *ppa);
     int (*sanitize_block)(struct FtlBackend *fb, const struct bbm *ctx,
                           const struct ppa *ppa);
     int (*remap_block)(struct FtlBackend *fb, const struct bbm *ctx,
                        const struct ppa *ppa);
-
-    /* Page validity (backend-owned; BBM translates pseudo -> physical) */
     void (*mark_page_valid)(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
     void (*mark_page_invalid)(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
     void (*mark_block_free)(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
     int (*get_page_status)(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
     void (*get_block_vpc_ipc)(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa, int *vpc, int *ipc);
+#endif
 };
 
 /* Simple BBM context tracking reserved (OP) blocks per LUN. */
@@ -160,11 +156,10 @@ struct bbm {
     uint8_t *excluded_phys_blks;
     
     /*
-     * BBM Policy API - function pointer table for policies.
-     * Initialized at bbm_init() to point to implementated functions.
-     * Policies receive this API to interact with the BBM layer.
+     * BBM policy-visible API storage is intentionally disabled for now.
+     * Mechanism code should call bbm_*() directly.
      */
-    struct BbmPolicyAPI *policy_api;
+    /* struct BbmPolicyAPI *policy_api; */
 };
 
 int bbm_init(struct bbm *ctx, const BbCtrlParams *bbp, const struct ssdparams *phys);

@@ -920,8 +920,9 @@ static uint16_t oc20_set_log(FemuCtrl *n, NvmeCmd *cmd)
     }
 }
 
-static uint16_t oc20_admin_cmd(FemuCtrl *n, NvmeCmd *cmd)
+static uint16_t oc20_admin_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
 {
+    (void)cqe;
     switch (cmd->opcode) {
     case OC20_ADM_CMD_IDENTIFY:
         femu_debug("oc20_identify\n");
@@ -1388,4 +1389,3 @@ int nvme_register_ocssd20(FemuCtrl *n)
 
     return 0;
 }
-

@@ -25,6 +25,9 @@ struct block_policy_context {
     uint64_t *rmap;
     uint64_t tt_pgs_log;
     uint32_t cur_eswd_id;
+    uint32_t secs_per_pg;
+    uint32_t secsz;
+    uint64_t page_size;
     pqueue_t *victim_pq;
     QTAILQ_HEAD(free_eswd_list, eswd_free_node) free_list;
     QTAILQ_HEAD(full_eswd_list, eswd_full_node) full_list;
@@ -34,6 +37,8 @@ struct block_policy_context {
     int free_cnt;
     int victim_cnt;
     int full_cnt;
+    int gc_thres_eswds;       /* free_cnt low watermark: trigger background GC  */
+    int gc_thres_eswds_high;  /* free_cnt urgent watermark: GC before every write */
     struct FtlPolicyAPI *api;
     struct ssd *ssd;
 };

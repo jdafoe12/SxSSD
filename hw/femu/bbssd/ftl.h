@@ -262,10 +262,6 @@ struct ssd_channel {
 //                        * this defines the channel bandwith
 //                        */
 
-//    // double gc_thres_pcent;
-//    // int gc_thres_lines;
-//    // double gc_thres_pcent_high;
-//    // int gc_thres_lines_high;
 //    // bool enable_gc_delay;
 
 //     /* below are all calculated values */
@@ -304,9 +300,10 @@ struct eswd {
     int ipc;           /* invalid page count in this eSWD */
     uint32_t wp_page_index;  /* next page to write in this eSWD (0..pgs_per_eswd-1) */
     uint64_t wp_lba;         /* host-visible sequential write pointer for this eSWD */
-    uint64_t staged_page_lba;    /* absolute LBA of the staged physical page */
-    uint32_t staged_valid_lbas;  /* number of valid LBAs currently staged */
-    uint8_t *staged_page_buf;    /* one physical page buffer owned by the mechanism */
+    /* Per-eSWD staging buffer: accumulates sub-page LBAs until a full page is ready */
+    uint8_t  *staged_page_buf;
+    uint64_t  staged_page_lba;   /* absolute LBA of the page currently being staged */
+    uint32_t  staged_valid_lbas; /* number of LBAs written into staged_page_buf so far */
 };
 
 /*struct nand_cmd {
@@ -399,17 +396,8 @@ struct FtlPolicyAPI {
                                      uint64_t slba, uint32_t nlb);
     uint16_t (*eswd_check_read_range)(struct ssd *ssd, uint32_t eswd_id,
                                       uint64_t slba, uint32_t nlb);
-    uint64_t (*eswd_write_lbas)(struct ssd *ssd, NvmeRequest *req,
-                                uint32_t eswd_id, uint64_t slba, uint32_t nlb,
-                                int64_t stime_ns);
-    uint64_t (*eswd_read_lbas)(struct ssd *ssd, NvmeRequest *req,
-                               uint32_t eswd_id, uint64_t slba, uint32_t nlb,
-                               int64_t stime_ns);
     uint64_t (*read_page_buffer)(struct ssd *ssd, const PseudoPpa *ppa,
                                  uint8_t *buffer, int64_t stime_ns);
-    uint64_t (*commit_page_to_eswd)(struct ssd *ssd, uint32_t eswd_id,
-                                    const uint8_t *buffer, PseudoPpa *out_ppa,
-                                    int64_t stime_ns);
     /*
      * Advance eSWD write pointer from its current index to pgs_per_eswd (zone full / finish).
      * Returns 0 on success, -1 on invalid eswd_id or layout error.
@@ -476,8 +464,6 @@ struct FtlPolicyAPI {
                                  uint32_t length);
     void (*set_completion_result_u64)(struct NvmeCommandEvent *event,
                                       uint64_t value);
-    int (*get_gc_thres_lines)(struct ssd *ssd);
-    int (*get_gc_thres_lines_high)(struct ssd *ssd);
     int (*get_page_status)(struct ssd *ssd, const PseudoPpa *ppa);
 
     /* Hook registration (mechanism provides event system, policy attaches handlers) */
@@ -517,9 +503,6 @@ struct FtlPolicyAPI {
     int (*configure_namespace_personality)(struct ssd *ssd,
                                            const struct NamespacePersonalityConfig *config);
 
-    /* GC mapping update (policy provides; mechanism calls when migrating a page in legacy GC path) */
-    void (*gc_update_mapping)(struct ssd *ssd, PseudoPpa *old_ppa, PseudoPpa *new_ppa);
-
     /*
      * User read through BBM: builds PPA list from event LPN range using the policy's
      * resolve callback, performs BBM read (pseudo→physical, backend I/O, event dispatch),
@@ -527,8 +510,26 @@ struct FtlPolicyAPI {
      */
     uint64_t (*read_user_request)(struct ssd *ssd, struct NvmeCommandEvent *event,
                                   ReadPpaResolver resolve_ppa, void *resolve_ctx);
-    uint64_t (*write_user_request)(struct ssd *ssd, NvmeRequest *req,
-                                  PseudoPpa *ppa_list, uint64_t ppa_cnt);
+    /*
+     * Unified sequential write API: stages nlb LBAs from buf (at slba) into the
+     * per-eSWD staging buffer and programs a page to flash when the buffer is full.
+     * ppa_out (may be NULL) receives the PseudoPpa of the page just written.
+     */
+    uint64_t (*write_seq_lbas)(struct ssd *ssd, uint32_t eswd_id,
+                               uint64_t slba, const uint8_t *buf, uint32_t nlb,
+                               PseudoPpa *ppa_out, int64_t stime_ns);
+    /*
+     * Staged-aware page read: serves from the eSWD staging buffer if the requested
+     * page is currently staged; otherwise reads the committed page from flash.
+     */
+    uint64_t (*read_eswd_page)(struct ssd *ssd, uint32_t eswd_id,
+                               uint64_t page_lba, uint8_t *buf_out,
+                               int64_t stime_ns);
+    /*
+     * Effective write pointer: wp_lba + any partially-staged LBAs not yet on flash.
+     * Use instead of eswd_get_wp_lba when comparing against host-visible write state.
+     */
+    uint64_t (*eswd_get_effective_wp_lba)(struct ssd *ssd, uint32_t eswd_id);
 
     /* BBM API pass-through intentionally disabled; mechanism calls bbm_* directly. */
     /* struct BbmPolicyAPI *bbm_api; */
@@ -591,8 +592,13 @@ void ftl_fill_admin_nvme_event(struct ssd *ssd, FemuCtrl *n, NvmeCmd *cmd,
                                struct NvmeCommandEvent *event);
 uint64_t ftl_read_user_request(struct ssd *ssd, struct NvmeCommandEvent *event,
                                ReadPpaResolver resolve_ppa, void *resolve_ctx);
-uint64_t ftl_write_user_request(struct ssd *ssd, NvmeRequest *req,
-                                PseudoPpa *ppa_list, uint64_t ppa_cnt);
+uint64_t ftl_write_seq_lbas(struct ssd *ssd, uint32_t eswd_id,
+                             uint64_t slba, const uint8_t *buf, uint32_t nlb,
+                             PseudoPpa *ppa_out, int64_t stime_ns);
+uint64_t ftl_read_eswd_page(struct ssd *ssd, uint32_t eswd_id,
+                            uint64_t page_lba, uint8_t *buf_out,
+                            int64_t stime_ns);
+uint64_t ftl_eswd_get_effective_wp_lba(struct ssd *ssd, uint32_t eswd_id);
 
 /* ========== Mechanism API: eSWD query and state operations ========== */
 struct eswd *get_eswd_by_id(struct ssd *ssd, uint32_t eswd_id);
@@ -610,17 +616,8 @@ uint16_t eswd_check_seq_write(struct ssd *ssd, uint32_t eswd_id,
                               uint64_t slba, uint32_t nlb);
 uint16_t eswd_check_read_range(struct ssd *ssd, uint32_t eswd_id,
                                uint64_t slba, uint32_t nlb);
-uint64_t eswd_write_lbas(struct ssd *ssd, NvmeRequest *req,
-                         uint32_t eswd_id, uint64_t slba, uint32_t nlb,
-                         int64_t stime_ns);
-uint64_t eswd_read_lbas(struct ssd *ssd, NvmeRequest *req,
-                        uint32_t eswd_id, uint64_t slba, uint32_t nlb,
-                        int64_t stime_ns);
 uint64_t read_page_buffer(struct ssd *ssd, const PseudoPpa *ppa,
                           uint8_t *buffer, int64_t stime_ns);
-uint64_t commit_page_to_eswd(struct ssd *ssd, uint32_t eswd_id,
-                             const uint8_t *buffer, PseudoPpa *out_ppa,
-                             int64_t stime_ns);
 
 /* eSWD layout query wrappers */
 int eswd_id_to_ppa_wrapper(struct ssd *ssd, uint32_t eswd_id, uint32_t page_index, PseudoPpa *ppa);
@@ -732,8 +729,6 @@ uint16_t ftl_write_cmd_buffer(struct NvmeCommandEvent *event, const void *src,
                               uint32_t length);
 void ftl_set_completion_result_u64(struct NvmeCommandEvent *event,
                                    uint64_t value);
-int ftl_get_gc_thres_lines(struct ssd *ssd);
-int ftl_get_gc_thres_lines_high(struct ssd *ssd);
 int ftl_get_page_status(struct ssd *ssd, const PseudoPpa *ppa);
 
 /* NVMe hook management (opcode-keyed, condition + callback) */

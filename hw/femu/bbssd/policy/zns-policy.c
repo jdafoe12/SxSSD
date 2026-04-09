@@ -134,6 +134,7 @@ static inline bool zns_zone_wp_valid(const struct zns_policy_zone *zone)
            zone->state != ZNS_POLICY_ZONE_STATE_OFFLINE;
 }
 
+// Check if the command LBA range is within the total LBA range of the namespace
 static uint16_t zns_check_bounds(struct zns_policy_context *ctx, uint64_t slba,
                                  uint32_t nlb)
 {
@@ -273,6 +274,7 @@ static void zns_maybe_finish_zone(struct zns_policy_context *ctx,
     }
 }
 
+
 static uint64_t zns_do_write(struct zns_policy_context *ctx,
                              struct NvmeCommandEvent *event, bool append)
 {
@@ -282,7 +284,10 @@ static uint64_t zns_do_write(struct zns_policy_context *ctx,
     struct zns_policy_zone *zone;
     uint64_t write_slba;
     uint16_t status;
-    uint64_t lat;
+    uint64_t lat = 0;
+    uint8_t *req_buf;
+    uint64_t req_size = 0;
+    uint64_t cur_lba;
 
     status = zns_check_bounds(ctx, cmd_slba, nlb);
     if (status != NVME_SUCCESS) {
@@ -324,9 +329,20 @@ static uint64_t zns_do_write(struct zns_policy_context *ctx,
         return 0;
     }
 
-    lat = ctx->api->eswd_write_lbas(ctx->ssd, event->req, zone->eswd_id,
-                                    append ? write_slba : cmd_slba, nlb,
-                                    (int64_t)event->stime);
+    req_buf = ctx->api->copy_request_data(event->req, 0,
+                                          (uint64_t)nlb * ctx->lbasz, &req_size);
+    if (!req_buf || req_size < (uint64_t)nlb * ctx->lbasz) {
+        free(req_buf);
+        zns_set_status(event, NVME_INTERNAL_DEV_ERROR | NVME_DNR);
+        return 0;
+    }
+
+    cur_lba = append ? write_slba : cmd_slba;
+    lat = ctx->api->write_seq_lbas(ctx->ssd, zone->eswd_id,
+                                    cur_lba, req_buf, nlb,
+                                    NULL, (int64_t)event->stime);
+
+    free(req_buf);
 
     if (append) {
         ctx->api->set_completion_result_u64(event, write_slba);
@@ -343,6 +359,15 @@ static uint64_t zns_read_callback(struct ssd *ssd, struct NvmeCommandEvent *even
     struct zns_policy_context *ctx = (struct zns_policy_context *)context;
     struct zns_policy_zone *zone;
     uint16_t status;
+    uint64_t effective_wp;
+    uint64_t page_size;
+    uint64_t total_bytes;
+    uint8_t *out;
+    uint8_t *page_buf;
+    uint64_t cur_lba;
+    uint32_t remaining;
+    uint64_t out_off;
+    uint64_t lat = 0;
 
     (void)ssd;
     (void)api;
@@ -368,17 +393,60 @@ static uint64_t zns_read_callback(struct ssd *ssd, struct NvmeCommandEvent *even
         zns_set_status(event, NVME_ZONE_BOUNDARY_ERROR | NVME_DNR);
         return 0;
     }
-    status = ctx->api->eswd_check_read_range(ctx->ssd, zone->eswd_id,
-                                             event->lba, (uint32_t)event->nsecs);
-    if (status != NVME_SUCCESS) {
-        zns_set_status(event, status);
+
+    /*
+     * Range check against effective WP: includes staged-but-not-yet-flushed
+     * LBAs that the mechanism's wp_lba does not reflect until page flush.
+     */
+    effective_wp = ctx->api->eswd_get_effective_wp_lba(ctx->ssd, zone->eswd_id);
+    if (event->lba + event->nsecs > effective_wp) {
+        zns_set_status(event, NVME_ZONE_BOUNDARY_ERROR | NVME_DNR);
         return 0;
     }
 
+    page_size   = (uint64_t)ctx->lbas_per_page * ctx->lbasz;
+    total_bytes = (uint64_t)event->nsecs * ctx->lbasz;
+    out      = calloc(1, total_bytes);
+    page_buf = calloc(1, page_size);
+    if (!out || !page_buf) {
+        free(out);
+        free(page_buf);
+        zns_set_status(event, NVME_INTERNAL_DEV_ERROR | NVME_DNR);
+        return 0;
+    }
+
+    cur_lba   = event->lba;
+    remaining = (uint32_t)event->nsecs;
+    out_off   = 0;
+
+    while (remaining > 0) {
+        uint64_t page_lba = cur_lba - (cur_lba % ctx->lbas_per_page);
+        uint32_t page_off_lbas = (uint32_t)(cur_lba - page_lba);
+        uint32_t chunk_lbas = ctx->lbas_per_page - page_off_lbas;
+        uint64_t copy_bytes;
+
+        if (chunk_lbas > remaining) {
+            chunk_lbas = remaining;
+        }
+        copy_bytes = (uint64_t)chunk_lbas * ctx->lbasz;
+
+        memset(page_buf, 0, page_size);
+        lat += ctx->api->read_eswd_page(ctx->ssd, zone->eswd_id, page_lba,
+                                        page_buf, (int64_t)event->stime);
+
+        memcpy(out + out_off,
+               page_buf + (size_t)page_off_lbas * ctx->lbasz,
+               copy_bytes);
+        out_off   += copy_bytes;
+        cur_lba   += chunk_lbas;
+        remaining -= chunk_lbas;
+    }
+
+    ctx->api->write_request_data(event->req, out, 0, total_bytes);
+    free(out);
+    free(page_buf);
     zns_set_status(event, NVME_SUCCESS);
-    return ctx->api->eswd_read_lbas(ctx->ssd, event->req, zone->eswd_id,
-                                    event->lba, (uint32_t)event->nsecs,
-                                    (int64_t)event->stime);
+    return lat;
 }
 
 static uint16_t zns_open_zone(struct zns_policy_context *ctx, struct zns_policy_zone *zone)

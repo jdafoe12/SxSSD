@@ -141,9 +141,6 @@ struct eswd {
     int ipc;
     uint32_t wp_page_index;
     uint64_t wp_lba;
-    uint64_t staged_page_lba;
-    uint32_t staged_valid_lbas;
-    uint8_t *staged_page_buf;
 };
 
 struct NamespacePersonalityConfig {
@@ -262,17 +259,8 @@ struct FtlPolicyAPI {
                                      uint64_t slba, uint32_t nlb);
     uint16_t (*eswd_check_read_range)(struct ssd *ssd, uint32_t eswd_id,
                                       uint64_t slba, uint32_t nlb);
-    uint64_t (*eswd_write_lbas)(struct ssd *ssd, struct NvmeRequest *req,
-                                uint32_t eswd_id, uint64_t slba, uint32_t nlb,
-                                int64_t stime_ns);
-    uint64_t (*eswd_read_lbas)(struct ssd *ssd, struct NvmeRequest *req,
-                               uint32_t eswd_id, uint64_t slba, uint32_t nlb,
-                               int64_t stime_ns);
     uint64_t (*read_page_buffer)(struct ssd *ssd, const PseudoPpa *ppa,
                                  uint8_t *buffer, int64_t stime_ns);
-    uint64_t (*commit_page_to_eswd)(struct ssd *ssd, uint32_t eswd_id,
-                                    const uint8_t *buffer, PseudoPpa *out_ppa,
-                                    int64_t stime_ns);
     int (*eswd_advance_wp_to_end)(struct ssd *ssd, uint32_t eswd_id);
     uint64_t (*eswd_erase_physical)(struct ssd *ssd, uint32_t eswd_id, int64_t stime_ns);
     int (*eswd_id_to_ppa)(struct ssd *ssd, uint32_t eswd_id, uint32_t page_index, PseudoPpa *ppa);
@@ -316,8 +304,7 @@ struct FtlPolicyAPI {
                                  uint32_t length);
     void (*set_completion_result_u64)(struct NvmeCommandEvent *event,
                                       uint64_t value);
-    int (*get_gc_thres_lines)(struct ssd *ssd);
-    int (*get_gc_thres_lines_high)(struct ssd *ssd);
+    
     int (*get_page_status)(struct ssd *ssd, const PseudoPpa *ppa);
     int (*register_nvme_hook)(struct ssd *ssd, uint8_t opcode,
                               NvmeHookCondition condition,
@@ -352,11 +339,28 @@ struct FtlPolicyAPI {
     int (*finalize_ftl_init)(struct ssd *ssd);
     int (*configure_namespace_personality)(struct ssd *ssd,
                                            const struct NamespacePersonalityConfig *config);
-    void (*gc_update_mapping)(struct ssd *ssd, PseudoPpa *old_ppa, PseudoPpa *new_ppa);
     uint64_t (*read_user_request)(struct ssd *ssd, struct NvmeCommandEvent *event,
                                   ReadPpaResolver resolve_ppa, void *resolve_ctx);
-    uint64_t (*write_user_request)(struct ssd *ssd, struct NvmeRequest *req,
-                                   PseudoPpa *ppa_list, uint64_t ppa_cnt);
+    /*
+     * Unified sequential write API: stages nlb LBAs from buf (at slba) into the
+     * per-eSWD staging buffer and programs a page to flash when the buffer is full.
+     * ppa_out (may be NULL) receives the PseudoPpa of the page just written.
+     */
+    uint64_t (*write_seq_lbas)(struct ssd *ssd, uint32_t eswd_id,
+                               uint64_t slba, const uint8_t *buf, uint32_t nlb,
+                               PseudoPpa *ppa_out, int64_t stime_ns);
+    /*
+     * Staged-aware page read: serves from the eSWD staging buffer if the requested
+     * page is currently staged; otherwise reads the committed page from flash.
+     */
+    uint64_t (*read_eswd_page)(struct ssd *ssd, uint32_t eswd_id,
+                               uint64_t page_lba, uint8_t *buf_out,
+                               int64_t stime_ns);
+    /*
+     * Effective write pointer: wp_lba + any partially-staged LBAs not yet on flash.
+     * Use instead of eswd_get_wp_lba when comparing against host-visible write state.
+     */
+    uint64_t (*eswd_get_effective_wp_lba)(struct ssd *ssd, uint32_t eswd_id);
     /* struct BbmPolicyAPI *bbm_api; */
 };
 

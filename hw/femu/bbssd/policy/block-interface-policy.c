@@ -547,7 +547,9 @@ int init_policy(struct ssd *ssd, struct FtlPolicyAPI *api)
     }
 
     personality.csi = NVME_CSI_NVM;
-    personality.nsze = api->get_total_logical_pages(ssd) * (uint64_t)geom->secs_per_pg;
+    /* Match regular FEMU: advertise the controller namespace size, not the
+     * internal BBSSD geometry-derived logical page count. nsze is in 512B LBAs. */
+    personality.nsze = api->get_advertised_nsze_lbas(ssd);
     personality.ncap = personality.nsze;
     personality.nuse = personality.ncap;
     personality.noiob = 0;

@@ -845,6 +845,11 @@ uint64_t get_total_logical_pages(struct ssd *ssd)
     return ssd->bbm->geom->tt_pgs_log;
 }
 
+uint64_t get_advertised_nsze_lbas(struct ssd *ssd)
+{
+    return (ssd && ssd->ctrl) ? (ssd->ctrl->ns_size / 512) : 0;
+}
+
 const struct bbm_geom *get_bbm_geom(struct ssd *ssd)
 {
     return (ssd && ssd->bbm) ? ssd->bbm->geom : NULL;
@@ -1688,6 +1693,7 @@ void ssd_init(FemuCtrl *n)
     ssd->policy_api->get_eswd_wp_index = get_eswd_wp_index;
     ssd->policy_api->get_total_eswds = get_total_eswds;
     ssd->policy_api->get_total_logical_pages = get_total_logical_pages;
+    ssd->policy_api->get_advertised_nsze_lbas = get_advertised_nsze_lbas;
     ssd->policy_api->get_bbm_geom = get_bbm_geom;
     ssd->policy_api->get_eswd_layout = get_eswd_layout;
     

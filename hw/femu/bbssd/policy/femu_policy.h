@@ -251,6 +251,7 @@ struct FtlPolicyAPI {
     uint32_t (*get_eswd_wp_index)(struct ssd *ssd, uint32_t eswd_id);
     uint32_t (*get_total_eswds)(struct ssd *ssd);
     uint64_t (*get_total_logical_pages)(struct ssd *ssd);
+    uint64_t (*get_advertised_nsze_lbas)(struct ssd *ssd);
     const struct bbm_geom *(*get_bbm_geom)(struct ssd *ssd);
     const struct eswd_layout *(*get_eswd_layout)(struct ssd *ssd);
     void (*eswd_set_vpc_ipc)(struct ssd *ssd, uint32_t eswd_id, int vpc, int ipc);

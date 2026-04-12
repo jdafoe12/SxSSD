@@ -386,6 +386,7 @@ struct FtlPolicyAPI {
     uint32_t (*get_eswd_wp_index)(struct ssd *ssd, uint32_t eswd_id);
     uint32_t (*get_total_eswds)(struct ssd *ssd);
     uint64_t (*get_total_logical_pages)(struct ssd *ssd);
+    uint64_t (*get_advertised_nsze_lbas)(struct ssd *ssd);
     const struct bbm_geom *(*get_bbm_geom)(struct ssd *ssd);
     const struct eswd_layout *(*get_eswd_layout)(struct ssd *ssd);
     
@@ -684,6 +685,7 @@ uint64_t ppa_to_pgidx(struct ssd *ssd, PseudoPpa *ppa);
 PseudoPpa get_maptbl_ent(struct ssd *ssd, uint64_t lpn);
 void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, PseudoPpa *ppa);
 uint64_t get_total_logical_pages(struct ssd *ssd);
+uint64_t get_advertised_nsze_lbas(struct ssd *ssd);
 
 /* Address validation */
 bool valid_lpn(struct ssd *ssd, uint64_t lpn);

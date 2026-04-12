@@ -592,16 +592,6 @@ static int nvme_register_extensions(FemuCtrl *n)
     return 0;
 }
 
-static uint64_t bbssd_logical_bytes(const BbCtrlParams *bbp)
-{
-    /* Exposed/logical capacity matches the configured geometry, as in normal FEMU.
-     * OP space is added physically on top of this geometry instead of shrinking it. */
-    uint64_t blks_per_lun_log = (uint64_t)bbp->blks_per_pl * bbp->pls_per_lun;
-    uint64_t total_blks_log = blks_per_lun_log * bbp->luns_per_ch * bbp->nchs;
-    return (uint64_t)bbp->secsz * bbp->secs_per_pg * bbp->pgs_per_blk *
-           total_blks_log;
-}
-
 static int64_t bbssd_physical_bytes(const BbCtrlParams *bbp)
 {
     uint64_t blks_per_pl_phys = bbp->blks_per_pl;
@@ -650,13 +640,12 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     
     bs_size = ((int64_t)n->memsz) * 1024 * 1024;
     ls_size = ((int64_t)n->memsz) * 1024 * 1024;
-    /* Josh: in BBSSD mode, we have overprovisioned blocks,
-     * so that we only expose the logical capacity to the guest. 
+    /* In BBSSD mode, keep the larger physical backend from geometry/OP,
+     * but advertise the configured namespace size just like regular FEMU.
      */
     if (BBSSD(n)) {
         const BbCtrlParams *bbp = &n->bb_params;
         bs_size = bbssd_physical_bytes(bbp);
-        ls_size = bbssd_logical_bytes(bbp);
     }
 
     /* There are problems with this call. The backend should 
@@ -673,12 +662,7 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     n->completed = 0;
     n->start_time = time(NULL);
     n->reg_size = pow2ceil(0x1004 + 2 * (n->nr_io_queues + 1) * 4);
-    /*
-     * n->ns_size is the namespace size in bytes. Here, it is set to correspond to the logical capacity
-     * (i.e. the physical capacity minus the overprovisioned blocks in BBSSD mode).
-     * During namespace initialization, the number of LBAs is derived. 
-     * This (nsze) is then used to check that requests from above are within the logical capacity.
-     */
+    /* n->ns_size is the advertised namespace size in bytes. */
     n->ns_size = ls_size / (uint64_t)n->num_namespaces;
 
     /* Coperd: [1..nr_io_queues] are used as IO queues */

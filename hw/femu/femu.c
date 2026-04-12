@@ -594,14 +594,9 @@ static int nvme_register_extensions(FemuCtrl *n)
 
 static uint64_t bbssd_logical_bytes(const BbCtrlParams *bbp)
 {
-    /* compute logical capacity excluding overprovisioned blocks */
-    int blks_per_pl_phys = bbp->blks_per_pl;
-    int reserved = (blks_per_pl_phys * bbp->op_pct) / 100; /* implicit floor by integer division */
-    if (reserved >= blks_per_pl_phys && blks_per_pl_phys > 0) {
-        reserved = blks_per_pl_phys - 1; /* leave at least one logical block */
-    }
-    int blks_per_pl_log = blks_per_pl_phys - reserved; /* overprovisioning is at the per-plane level */
-    uint64_t blks_per_lun_log = (uint64_t)blks_per_pl_log * bbp->pls_per_lun; /* overprovisioning is at the per-plane level */
+    /* Exposed/logical capacity matches the configured geometry, as in normal FEMU.
+     * OP space is added physically on top of this geometry instead of shrinking it. */
+    uint64_t blks_per_lun_log = (uint64_t)bbp->blks_per_pl * bbp->pls_per_lun;
     uint64_t total_blks_log = blks_per_lun_log * bbp->luns_per_ch * bbp->nchs;
     return (uint64_t)bbp->secsz * bbp->secs_per_pg * bbp->pgs_per_blk *
            total_blks_log;
@@ -609,8 +604,15 @@ static uint64_t bbssd_logical_bytes(const BbCtrlParams *bbp)
 
 static int64_t bbssd_physical_bytes(const BbCtrlParams *bbp)
 {
-    /* Physical capacity ignores overprovisioning; use raw geometry. */
-    uint64_t blks_per_lun_phys = (uint64_t)bbp->blks_per_pl * bbp->pls_per_lun;
+    uint64_t blks_per_pl_phys = bbp->blks_per_pl;
+
+    if (bbp->op_pct > 0 && bbp->op_pct < 100) {
+        uint64_t denom = (uint64_t)(100 - bbp->op_pct);
+        blks_per_pl_phys = ((uint64_t)bbp->blks_per_pl * 100 + denom - 1) / denom;
+    }
+
+    /* Physical capacity includes the extra OP blocks added on top of the exposed geometry. */
+    uint64_t blks_per_lun_phys = blks_per_pl_phys * bbp->pls_per_lun;
     uint64_t total_blks_phys = blks_per_lun_phys * bbp->luns_per_ch * bbp->nchs;
     return (int64_t)bbp->secsz * bbp->secs_per_pg * bbp->pgs_per_blk *
            total_blks_phys;

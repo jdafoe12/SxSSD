@@ -5,6 +5,8 @@
 
 int ftl_backend_init(struct FtlBackend *fb, SsdDramBackend *mbe, const BbCtrlParams *bbp)
 {
+    uint64_t blks_per_pl_phys;
+
     if (!fb || !bbp) {
         return -1;
     }
@@ -17,7 +19,15 @@ int ftl_backend_init(struct FtlBackend *fb, SsdDramBackend *mbe, const BbCtrlPar
     spp->secsz       = bbp->secsz;
     spp->secs_per_pg = bbp->secs_per_pg;
     spp->pgs_per_blk = bbp->pgs_per_blk;
-    spp->blks_per_pl = bbp->blks_per_pl;
+    blks_per_pl_phys = bbp->blks_per_pl;
+    if (bbp->op_pct > 0 && bbp->op_pct < 100) {
+        uint64_t denom = (uint64_t)(100 - bbp->op_pct);
+        blks_per_pl_phys = ((uint64_t)bbp->blks_per_pl * 100 + denom - 1) / denom;
+    }
+
+    /* The configured geometry is host-visible/logical. Expand the physical backend
+     * to include OP blocks on top so exposed capacity matches normal FEMU. */
+    spp->blks_per_pl = (int)blks_per_pl_phys;
     spp->pls_per_lun = bbp->pls_per_lun;
     spp->luns_per_ch = bbp->luns_per_ch;
     spp->nchs        = bbp->nchs;

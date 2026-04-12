@@ -152,6 +152,13 @@ static void rotate_if_full(struct block_policy_context *ctx)
     uint32_t pgs_per_eswd = ctx->api->get_eswd_layout(ctx->ssd)->pgs_per_eswd;
 
     if (wp >= pgs_per_eswd && switch_to_next_eswd(ctx) < 0) {
+        fprintf(stderr,
+                "[block-policy] FATAL: out of free eSWDs while rotating write pointer "
+                "(cur_eswd=%u free_cnt=%d victim_cnt=%d full_cnt=%d). "
+                "This usually means the host filled the published namespace to the point "
+                "that no overprovisioned space remained, so GC had no reclaimable victim "
+                "during the initial fill phase.\n",
+                ctx->cur_eswd_id, ctx->free_cnt, ctx->victim_cnt, ctx->full_cnt);
         abort();
     }
 }
@@ -293,12 +300,33 @@ static bool resolve_read_ppa(void *opaque, struct ssd *ssd, uint64_t lpn, Pseudo
     return true;
 }
 
+static void block_update_mapping_after_write(void *opaque, struct ssd *ssd,
+                                             uint64_t lpn,
+                                             const PseudoPpa *new_ppa)
+{
+    struct block_policy_context *ctx = opaque;
+    PseudoPpa old_ppa = get_maptbl_ent(ctx, lpn);
+    PseudoPpa new_ppa_local = *new_ppa;
+
+    (void)ssd;
+    if (ctx->api->mapped_ppa(&old_ppa)) {
+        mark_page_invalid(ctx, &old_ppa);
+        set_rmap_ent(ctx, INVALID_LPN, &old_ppa);
+    }
+    set_maptbl_ent(ctx, lpn, &new_ppa_local);
+}
+
 static uint64_t block_write(struct ssd *ssd, struct NvmeCommandEvent *event)
 {
     struct block_policy_context *ctx = get_policy_ctx(ssd);
+    const struct eswd_layout *layout = ctx->api->get_eswd_layout(ctx->ssd);
     uint8_t *req_buf;
     uint64_t req_size = 0;
-    uint64_t lat = 0;
+    uint64_t max_lat = 0;
+    uint64_t cur_lba;
+    uint64_t end_lba;
+    uint64_t data_off_bytes = 0;
+    uint32_t pgs_per_eswd;
 
     assert(ctx);
 
@@ -316,62 +344,57 @@ static uint64_t block_write(struct ssd *ssd, struct NvmeCommandEvent *event)
         return 0;
     }
 
-    for (uint64_t lpn = event->start_lpn; lpn <= event->end_lpn; lpn++) {
-        uint64_t page_start_lba = lpn * ctx->secs_per_pg;
-        uint64_t page_end_lba = page_start_lba + ctx->secs_per_pg;
-        uint64_t write_start = event->lba > page_start_lba ? event->lba : page_start_lba;
-        uint64_t write_end = (event->lba + event->nsecs) < page_end_lba ?
-                             (event->lba + event->nsecs) : page_end_lba;
-        uint64_t req_lba_off;
-        uint64_t page_lba_off;
-        uint64_t copy_lbas;
-        uint64_t copy_bytes;
-        uint8_t *page_buf;
-        PseudoPpa old_ppa;
-        PseudoPpa new_ppa;
+    cur_lba = event->lba;
+    end_lba = event->lba + event->nsecs;
+    pgs_per_eswd = layout ? layout->pgs_per_eswd : 0;
 
-        if (write_start >= write_end) {
-            continue;
-        }
+    while (cur_lba < end_lba && pgs_per_eswd > 0) {
+        uint32_t wp = ctx->api->get_eswd_wp_index(ctx->ssd, ctx->cur_eswd_id);
+        uint32_t avail_pages;
+        uint64_t cur_lpn;
+        uint64_t chunk_end_lpn;
+        uint64_t chunk_end_lba;
+        uint32_t chunk_nlb;
+        uint64_t lat;
 
-        page_buf = calloc(1, (size_t)ctx->page_size);
-        if (!page_buf) {
-            continue;
-        }
-
-        /* RMW: read old page first so unmodified sectors are preserved */
-        old_ppa = get_maptbl_ent(ctx, lpn);
-        if (ctx->api->mapped_ppa(&old_ppa) && ctx->api->valid_ppa(ctx->ssd, &old_ppa)) {
-            lat += ctx->api->read_page_buffer(ctx->ssd, &old_ppa, page_buf, (int64_t)event->stime);
-        }
-
-        req_lba_off = write_start - event->lba;
-        page_lba_off = write_start - page_start_lba;
-        copy_lbas = write_end - write_start;
-        copy_bytes = copy_lbas * ctx->secsz;
-        memcpy(page_buf + page_lba_off * ctx->secsz,
-               req_buf + req_lba_off * ctx->secsz,
-               (size_t)copy_bytes);
-
-        new_ppa.ppa = INVALID_PPA;
-        lat += ctx->api->write_seq_lbas(ctx->ssd, ctx->cur_eswd_id,
-                                         page_start_lba, page_buf,
-                                         (uint32_t)ctx->secs_per_pg,
-                                         &new_ppa, (int64_t)event->stime);
-        if (ctx->api->valid_ppa(ctx->ssd, &new_ppa)) {
-            if (ctx->api->mapped_ppa(&old_ppa)) {
-                mark_page_invalid(ctx, &old_ppa);
-                set_rmap_ent(ctx, INVALID_LPN, &old_ppa);
-            }
-            set_maptbl_ent(ctx, lpn, &new_ppa);
+        if (wp >= pgs_per_eswd) {
             rotate_if_full(ctx);
+            continue;
         }
 
-        free(page_buf);
+        avail_pages = pgs_per_eswd - wp;
+        cur_lpn = cur_lba / ctx->secs_per_pg;
+        chunk_end_lpn = cur_lpn + avail_pages - 1;
+        if (chunk_end_lpn > event->end_lpn) {
+            chunk_end_lpn = event->end_lpn;
+        }
+
+        chunk_end_lba = (chunk_end_lpn + 1) * (uint64_t)ctx->secs_per_pg;
+        if (chunk_end_lba > end_lba) {
+            chunk_end_lba = end_lba;
+        }
+        chunk_nlb = (uint32_t)(chunk_end_lba - cur_lba);
+        if (chunk_nlb == 0) {
+            break;
+        }
+
+        lat = ctx->api->write_host_lbas(ctx->ssd, ctx->cur_eswd_id,
+                                        cur_lba,
+                                        req_buf + data_off_bytes,
+                                        chunk_nlb,
+                                        block_update_mapping_after_write, ctx,
+                                        (int64_t)event->stime);
+        if (lat > max_lat) {
+            max_lat = lat;
+        }
+
+        data_off_bytes += (uint64_t)chunk_nlb * ctx->secsz;
+        cur_lba = chunk_end_lba;
+        rotate_if_full(ctx);
     }
 
     free(req_buf);
-    return lat;
+    return max_lat;
 }
 
 static uint64_t block_trim(struct ssd *ssd, struct NvmeCommandEvent *event)
@@ -524,7 +547,7 @@ int init_policy(struct ssd *ssd, struct FtlPolicyAPI *api)
     }
 
     personality.csi = NVME_CSI_NVM;
-    personality.nsze = api->get_total_logical_pages(ssd);
+    personality.nsze = api->get_total_logical_pages(ssd) * (uint64_t)geom->secs_per_pg;
     personality.ncap = personality.nsze;
     personality.nuse = personality.ncap;
     personality.noiob = 0;

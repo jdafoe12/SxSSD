@@ -172,6 +172,8 @@ struct AdminHook {
  * Used by read_user_request() to build the PPA list and call BBM read.
  */
 typedef bool (*ReadPpaResolver)(void *ctx, struct ssd *ssd, uint64_t lpn, PseudoPpa *out);
+typedef void (*WritePpaCommitCallback)(void *ctx, struct ssd *ssd, uint64_t lpn,
+                                       const PseudoPpa *new_ppa);
 
 // enum {
 //     NAND_READ =  0,
@@ -511,9 +513,22 @@ struct FtlPolicyAPI {
     uint64_t (*read_user_request)(struct ssd *ssd, struct NvmeCommandEvent *event,
                                   ReadPpaResolver resolve_ppa, void *resolve_ctx);
     /*
+     * Unified host-write API shared by block and ZNS policies.
+     *
+     * Full-page sequential ranges are written directly with request-style latency
+     * semantics. Partial pages are staged in the eSWD buffer until a later write
+     * fills the page. on_page_commit (may be NULL) fires once per committed page.
+     */
+    uint64_t (*write_host_lbas)(struct ssd *ssd, uint32_t eswd_id,
+                                uint64_t slba, const uint8_t *buf, uint32_t nlb,
+                                WritePpaCommitCallback on_page_commit,
+                                void *commit_ctx, int64_t stime_ns);
+    /*
      * Unified sequential write API: stages nlb LBAs from buf (at slba) into the
-     * per-eSWD staging buffer and programs a page to flash when the buffer is full.
-     * ppa_out (may be NULL) receives the PseudoPpa of the page just written.
+     * per-eSWD staging buffer and programs pages to flash when they become full.
+     * ppa_out (may be NULL) receives the last PseudoPpa written by this call.
+     * The returned latency preserves request-visible semantics: it is 0 if no page
+     * is committed, otherwise the maximum latency among pages committed by the call.
      */
     uint64_t (*write_seq_lbas)(struct ssd *ssd, uint32_t eswd_id,
                                uint64_t slba, const uint8_t *buf, uint32_t nlb,
@@ -592,6 +607,10 @@ void ftl_fill_admin_nvme_event(struct ssd *ssd, FemuCtrl *n, NvmeCmd *cmd,
                                struct NvmeCommandEvent *event);
 uint64_t ftl_read_user_request(struct ssd *ssd, struct NvmeCommandEvent *event,
                                ReadPpaResolver resolve_ppa, void *resolve_ctx);
+uint64_t ftl_write_host_lbas(struct ssd *ssd, uint32_t eswd_id,
+                             uint64_t slba, const uint8_t *buf, uint32_t nlb,
+                             WritePpaCommitCallback on_page_commit,
+                             void *commit_ctx, int64_t stime_ns);
 uint64_t ftl_write_seq_lbas(struct ssd *ssd, uint32_t eswd_id,
                              uint64_t slba, const uint8_t *buf, uint32_t nlb,
                              PseudoPpa *ppa_out, int64_t stime_ns);

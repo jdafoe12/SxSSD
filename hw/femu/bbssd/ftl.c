@@ -43,91 +43,228 @@ static inline uint64_t eswd_end_lba(struct ssd *ssd, uint32_t eswd_id)
 }
 
 /*
- * Private physical-write primitive: program one page-sized buffer to the given
- * PseudoPpa via bbm_raw_write, then mark the page valid. Called only by
- * ftl_write_seq_lbas once a full page has been staged.
+ * Private physical-write primitive: program one or more page-sized buffers to the
+ * given PseudoPpas via bbm_raw_write, then mark the pages valid.
  */
-static uint64_t ftl_write_page_raw(struct ssd *ssd, const uint8_t *buffer,
-                                   PseudoPpa *ppa, int64_t stime_ns)
+static uint64_t ftl_write_pages_raw(struct ssd *ssd, const uint8_t *buffer,
+                                    PseudoPpa *ppas, uint32_t page_count,
+                                    int64_t stime_ns)
 {
     struct BbmEvent event = {0};
     uint64_t page_size = eswd_page_size_bytes(ssd);
 
+    if (!ssd || !buffer || !ppas || page_count == 0) {
+        return 0;
+    }
+
     event.cmd = BBM_EVENT_WRITE;
     event.type = BBM_EVENT_POLICY_IO;
-    event.count = 1;
+    event.count = page_count;
     event.stime = stime_ns;
-    bbm_raw_write(ssd->fb, ssd->bbm, (uint8_t *)buffer, ppa, 1, page_size, &event);
-    mark_page_valid(ssd, ppa);
+    bbm_raw_write(ssd->fb, ssd->bbm, (uint8_t *)buffer, ppas, page_count,
+                  page_size, &event);
+    for (uint32_t i = 0; i < page_count; i++) {
+        mark_page_valid(ssd, &ppas[i]);
+    }
     return (uint64_t)event.lat;
 }
 
-/*
- * Unified sequential write API for policies.
- *
- * Stages nlb LBAs from buf (starting at slba) into the per-eSWD staging buffer.
- * When the staging buffer holds a full page, the page is programmed to flash,
- * the eSWD write pointer is advanced, and (if ppa_out != NULL) the written
- * PseudoPpa is returned to the caller (needed by block policy for its map table).
- *
- * Enforces sequential writes at the eSWD level: slba must align with the current
- * page boundary of the staging buffer.  Returns accumulated flash latency (0 while
- * the page is not yet full).
- */
-uint64_t ftl_write_seq_lbas(struct ssd *ssd, uint32_t eswd_id,
-                             uint64_t slba, const uint8_t *buf, uint32_t nlb,
-                             PseudoPpa *ppa_out, int64_t stime_ns)
+static uint64_t ftl_write_direct_pages(struct ssd *ssd, uint32_t eswd_id,
+                                       const uint8_t *buffer, uint32_t page_count,
+                                       uint64_t start_lpn,
+                                       WritePpaCommitCallback on_page_commit,
+                                       void *commit_ctx,
+                                       PseudoPpa *ppa_out,
+                                       int64_t stime_ns)
 {
-    uint32_t lbas_per_page = eswd_lbas_per_page(ssd);
-    uint32_t lba_size      = eswd_lba_size(ssd);
-    uint64_t lat = 0;
-    uint32_t remaining = nlb;
-    uint64_t cur_lba   = slba;
-    uint64_t data_off  = 0;
     struct eswd *e;
+    PseudoPpa *ppas;
+    uint32_t pages_until_end;
+    uint64_t lat;
 
-    if (!ssd || eswd_id >= ssd->tt_eswds || !buf) {
+    if (!ssd || eswd_id >= ssd->tt_eswds || !buffer || !page_count) {
         return 0;
     }
     e = &ssd->eswds[eswd_id];
-
-    while (remaining > 0) {
-        /* If no staging is active, start a new staged page at the current WP page */
-        if (e->staged_valid_lbas == 0) {
-            e->staged_page_lba = cur_lba - (cur_lba % lbas_per_page);
-            memset(e->staged_page_buf, 0, (size_t)lbas_per_page * lba_size);
-        }
-
-        uint32_t stage_off = (uint32_t)(cur_lba - e->staged_page_lba);
-        uint32_t copy_lbas = lbas_per_page - stage_off;
-        if (copy_lbas > remaining) {
-            copy_lbas = remaining;
-        }
-
-        memcpy(e->staged_page_buf + (size_t)stage_off * lba_size,
-               buf + data_off,
-               (size_t)copy_lbas * lba_size);
-
-        data_off  += (uint64_t)copy_lbas * lba_size;
-        cur_lba   += copy_lbas;
-        remaining -= copy_lbas;
-        e->staged_valid_lbas = stage_off + copy_lbas;
-
-        /* Full page ready: resolve PPA, program flash, advance WP */
-        if (e->staged_valid_lbas == lbas_per_page) {
-            PseudoPpa ppa;
-            if (eswd_id_to_ppa_wrapper(ssd, eswd_id, e->wp_page_index, &ppa) == 0) {
-                lat += ftl_write_page_raw(ssd, e->staged_page_buf, &ppa, stime_ns);
-                eswd_increment_wp(ssd, eswd_id);
-                if (ppa_out) {
-                    *ppa_out = ppa;
-                }
-            }
-            e->staged_valid_lbas = 0;
-        }
+    pages_until_end = ssd->eswd_layout.pgs_per_eswd - e->wp_page_index;
+    if (page_count > pages_until_end) {
+        page_count = pages_until_end;
+    }
+    if (!page_count) {
+        return 0;
     }
 
+    ppas = g_malloc0(sizeof(*ppas) * page_count);
+    for (uint32_t i = 0; i < page_count; i++) {
+        if (eswd_id_to_ppa_wrapper(ssd, eswd_id, e->wp_page_index + i, &ppas[i]) != 0) {
+            page_count = i;
+            break;
+        }
+    }
+    if (!page_count) {
+        g_free(ppas);
+        return 0;
+    }
+
+    lat = ftl_write_pages_raw(ssd, buffer, ppas, page_count, stime_ns);
+    for (uint32_t i = 0; i < page_count; i++) {
+        uint64_t lpn = start_lpn + i;
+
+        if (ppa_out) {
+            *ppa_out = ppas[i];
+        }
+        if (on_page_commit) {
+            on_page_commit(commit_ctx, ssd, lpn, &ppas[i]);
+        }
+        eswd_increment_wp(ssd, eswd_id);
+    }
+    g_free(ppas);
     return lat;
+}
+
+static uint64_t ftl_flush_staged_page(struct ssd *ssd, uint32_t eswd_id,
+                                      struct eswd *e, uint64_t page_lpn,
+                                      WritePpaCommitCallback on_page_commit,
+                                      void *commit_ctx,
+                                      PseudoPpa *ppa_out,
+                                      int64_t stime_ns)
+{
+    PseudoPpa ppa;
+    uint64_t lat;
+
+    if (!ssd || !e || e->staged_valid_lbas != eswd_lbas_per_page(ssd)) {
+        return 0;
+    }
+    if (eswd_id_to_ppa_wrapper(ssd, eswd_id, e->wp_page_index, &ppa) != 0) {
+        return 0;
+    }
+
+    lat = ftl_write_pages_raw(ssd, e->staged_page_buf, &ppa, 1, stime_ns);
+    eswd_increment_wp(ssd, eswd_id);
+    e->staged_valid_lbas = 0;
+    if (ppa_out) {
+        *ppa_out = ppa;
+    }
+    if (on_page_commit) {
+        on_page_commit(commit_ctx, ssd, page_lpn, &ppa);
+    }
+    return lat;
+}
+
+struct ftl_last_ppa_ctx {
+    PseudoPpa *ppa_out;
+};
+
+static void ftl_record_last_ppa(void *opaque, struct ssd *ssd, uint64_t lpn,
+                                const PseudoPpa *new_ppa)
+{
+    struct ftl_last_ppa_ctx *ctx = opaque;
+
+    (void)ssd;
+    (void)lpn;
+    if (ctx && ctx->ppa_out) {
+        *ctx->ppa_out = *new_ppa;
+    }
+}
+
+uint64_t ftl_write_host_lbas(struct ssd *ssd, uint32_t eswd_id,
+                             uint64_t slba, const uint8_t *buf, uint32_t nlb,
+                             WritePpaCommitCallback on_page_commit,
+                             void *commit_ctx, int64_t stime_ns)
+{
+    uint32_t lbas_per_page;
+    uint32_t lba_size;
+    uint64_t page_size;
+    uint64_t max_lat = 0;
+    uint32_t remaining;
+    uint64_t cur_lba;
+    uint64_t data_off;
+    struct eswd *e;
+
+    if (!ssd || eswd_id >= ssd->tt_eswds || !buf || nlb == 0) {
+        return 0;
+    }
+
+    lbas_per_page = eswd_lbas_per_page(ssd);
+    lba_size = eswd_lba_size(ssd);
+    page_size = eswd_page_size_bytes(ssd);
+    remaining = nlb;
+    cur_lba = slba;
+    data_off = 0;
+    e = &ssd->eswds[eswd_id];
+
+    while (remaining > 0) {
+        uint64_t page_lba = cur_lba - (cur_lba % lbas_per_page);
+        uint64_t page_lpn = page_lba / lbas_per_page;
+        uint32_t page_off = (uint32_t)(cur_lba - page_lba);
+        uint32_t chunk_lbas = lbas_per_page - page_off;
+        bool full_page;
+
+        if (chunk_lbas > remaining) {
+            chunk_lbas = remaining;
+        }
+        full_page = (page_off == 0 && chunk_lbas == lbas_per_page);
+
+        if (e->staged_valid_lbas == 0 && full_page) {
+            uint32_t pages_until_end = ssd->eswd_layout.pgs_per_eswd - e->wp_page_index;
+            uint32_t direct_pages = remaining / lbas_per_page;
+            uint64_t lat;
+
+            if (direct_pages > pages_until_end) {
+                direct_pages = pages_until_end;
+            }
+            if (direct_pages > 0) {
+                lat = ftl_write_direct_pages(ssd, eswd_id,
+                                             buf + data_off, direct_pages,
+                                             page_lpn, on_page_commit, commit_ctx,
+                                             NULL, stime_ns);
+                if (lat > max_lat) {
+                    max_lat = lat;
+                }
+                cur_lba += (uint64_t)direct_pages * lbas_per_page;
+                remaining -= direct_pages * lbas_per_page;
+                data_off += (uint64_t)direct_pages * page_size;
+                continue;
+            }
+        }
+
+        {
+            uint64_t lat;
+
+            if (e->staged_valid_lbas == 0) {
+                e->staged_page_lba = page_lba;
+                memset(e->staged_page_buf, 0, (size_t)page_size);
+            }
+
+            memcpy(e->staged_page_buf + (size_t)page_off * lba_size,
+                   buf + data_off,
+                   (size_t)chunk_lbas * lba_size);
+            e->staged_valid_lbas = page_off + chunk_lbas;
+
+            lat = ftl_flush_staged_page(ssd, eswd_id, e, page_lpn,
+                                        on_page_commit, commit_ctx, NULL,
+                                        stime_ns);
+            if (lat > max_lat) {
+                max_lat = lat;
+            }
+        }
+
+        cur_lba += chunk_lbas;
+        remaining -= chunk_lbas;
+        data_off += (uint64_t)chunk_lbas * lba_size;
+    }
+
+    return max_lat;
+}
+
+uint64_t ftl_write_seq_lbas(struct ssd *ssd, uint32_t eswd_id,
+                            uint64_t slba, const uint8_t *buf, uint32_t nlb,
+                            PseudoPpa *ppa_out, int64_t stime_ns)
+{
+    struct ftl_last_ppa_ctx ctx = { .ppa_out = ppa_out };
+    return ftl_write_host_lbas(ssd, eswd_id, slba, buf, nlb,
+                               ppa_out ? ftl_record_last_ppa : NULL, &ctx,
+                               stime_ns);
 }
 
 /*
@@ -1161,7 +1298,9 @@ int migrate_eswd_pages(struct ssd *ssd,
         read_event.type = BBM_EVENT_POLICY_IO;
         read_event.count = 1;
         read_event.status_list = NULL;
-        read_event.stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        /* Match original FEMU GC timing: submission time is driven by backend
+         * availability state, not fresh wall-clock sampling per page. */
+        read_event.stime = 0;
         read_event.lat = 0;
         bbm_raw_read(ssd->fb, ssd->bbm, NULL, &src_ppa, 1, page_size, &read_event);
             
@@ -1170,7 +1309,7 @@ int migrate_eswd_pages(struct ssd *ssd,
         write_event.type = BBM_EVENT_POLICY_IO;
         write_event.count = 1;
         write_event.status_list = NULL;
-        write_event.stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        write_event.stime = 0;
         write_event.lat = 0;
         bbm_raw_write(ssd->fb, ssd->bbm, NULL, &dst_ppa, 1, page_size, &write_event);
             
@@ -1219,7 +1358,7 @@ int migrate_eswd_pages(struct ssd *ssd,
             event.type = BBM_EVENT_POLICY_IO;
             event.count = 1;
             event.status_list = NULL;
-            event.stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            event.stime = 0;
             event.lat = 0;
             
             PseudoPba ppba;
@@ -1626,6 +1765,7 @@ void ssd_init(FemuCtrl *n)
 
     /* User I/O through BBM (mechanism builds PPA list via policy resolver and calls BBM) */
     ssd->policy_api->read_user_request = ftl_read_user_request;
+    ssd->policy_api->write_host_lbas   = ftl_write_host_lbas;
     ssd->policy_api->write_seq_lbas    = ftl_write_seq_lbas;
     ssd->policy_api->read_eswd_page    = ftl_read_eswd_page;
     ssd->policy_api->eswd_get_effective_wp_lba = ftl_eswd_get_effective_wp_lba;

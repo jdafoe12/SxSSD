@@ -29,6 +29,9 @@ static bool bbm_valid_phys_pba(const struct bbm *ctx, const struct pba *pba)
 
 int bbm_init(struct bbm *ctx, const BbCtrlParams *bbp, const struct ssdparams *phys)
 {
+    uint32_t blks_per_pl_log;
+    uint32_t blks_per_pl_phys;
+
     if (!ctx || !bbp || !phys) {
         return -1;
     }
@@ -37,13 +40,10 @@ int bbm_init(struct bbm *ctx, const BbCtrlParams *bbp, const struct ssdparams *p
     ctx->geom = g_malloc0(sizeof(struct bbm_geom));
     struct bbm_geom *g = ctx->geom;
 
-    /* Calculate overprovisioning */
-    uint32_t blks_per_pl_phys = bbp->blks_per_pl;
-    ctx->reserved_per_lun = (blks_per_pl_phys * bbp->op_pct) / 100;
-    if (ctx->reserved_per_lun >= blks_per_pl_phys && blks_per_pl_phys > 0) {
-        ctx->reserved_per_lun = blks_per_pl_phys - 1;
-    }
-    uint32_t blks_per_pl_log = blks_per_pl_phys - ctx->reserved_per_lun;
+    /* The configured geometry is logical/exposed. OP is added physically on top. */
+    blks_per_pl_log = bbp->blks_per_pl;
+    blks_per_pl_phys = phys->blks_per_pl;
+    ctx->reserved_per_lun = blks_per_pl_phys - blks_per_pl_log;
 
     /* Populate logical geometry (after overprovisioning). */
     g->blks_per_pl_log = blks_per_pl_log;

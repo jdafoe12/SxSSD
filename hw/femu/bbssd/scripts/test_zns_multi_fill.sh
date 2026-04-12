@@ -3,9 +3,10 @@ set -euo pipefail
 
 DEVICE="${1:-/dev/nvme0n1}"
 PASSES="${PASSES:-5}"
-NUMJOBS="${NUMJOBS:-8}"
-BS="${BS:-256k}"
+NUMJOBS="${NUMJOBS:-2}"
+BS="${BS:-64k}"
 IOENGINE="${IOENGINE:-psync}"
+REGION_PCTS="${REGION_PCTS:-50}"
 
 fail() {
     echo "[zns-multifill] ERROR: $*" >&2
@@ -14,6 +15,22 @@ fail() {
 
 require_cmd() {
     command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
+}
+
+bytes_to_fio_arg() {
+    local bytes="$1"
+
+    if [ "$bytes" -le 0 ]; then
+        return 1
+    fi
+
+    if [ $((bytes % 1048576)) -eq 0 ]; then
+        printf '%sm' "$((bytes / 1048576))"
+    elif [ $((bytes % 1024)) -eq 0 ]; then
+        printf '%sk' "$((bytes / 1024))"
+    else
+        printf '%s' "$bytes"
+    fi
 }
 
 if [ "${EUID}" -ne 0 ]; then
@@ -44,39 +61,51 @@ ZONE_SIZE_LBAS=$((ZSZE_HEX))
 ZONE_SIZE_BYTES=$((ZONE_SIZE_LBAS * LBA_SIZE))
 [ "$ZONE_SIZE_BYTES" -gt 0 ] || fail "Computed zone size is zero"
 
-if [ $((ZONE_SIZE_BYTES % 1048576)) -eq 0 ]; then
-    FIO_ZONE_SIZE_ARG="$((ZONE_SIZE_BYTES / 1048576))m"
-elif [ $((ZONE_SIZE_BYTES % 1024)) -eq 0 ]; then
-    FIO_ZONE_SIZE_ARG="$((ZONE_SIZE_BYTES / 1024))k"
-else
-    FIO_ZONE_SIZE_ARG="$ZONE_SIZE_BYTES"
-fi
+FIO_ZONE_SIZE_ARG="$(bytes_to_fio_arg "$ZONE_SIZE_BYTES")"
+FIO_DEVICE_SIZE_ARG="$(bytes_to_fio_arg "$DEVICE_SIZE_BYTES")"
+TOTAL_ZONES=$((DEVICE_SIZE_BYTES / ZONE_SIZE_BYTES))
+[ "$TOTAL_ZONES" -gt 0 ] || fail "Computed total zone count is zero"
 
-if [ $((DEVICE_SIZE_BYTES % 1048576)) -eq 0 ]; then
-    FIO_DEVICE_SIZE_ARG="$((DEVICE_SIZE_BYTES / 1048576))m"
-elif [ $((DEVICE_SIZE_BYTES % 1024)) -eq 0 ]; then
-    FIO_DEVICE_SIZE_ARG="$((DEVICE_SIZE_BYTES / 1024))k"
-else
-    FIO_DEVICE_SIZE_ARG="$DEVICE_SIZE_BYTES"
-fi
+echo "[zns-multifill] device=$DEVICE passes=$PASSES jobs=$NUMJOBS bs=$BS zone_size=$FIO_ZONE_SIZE_ARG device_size=$FIO_DEVICE_SIZE_ARG region_pcts=\"$REGION_PCTS\""
 
-echo "[zns-multifill] device=$DEVICE passes=$PASSES jobs=$NUMJOBS bs=$BS zone_size=$FIO_ZONE_SIZE_ARG device_size=$FIO_DEVICE_SIZE_ARG"
+for pct in $REGION_PCTS; do
+    case "$pct" in
+        ''|*[!0-9]*)
+            fail "Invalid percentage in REGION_PCTS: $pct"
+            ;;
+    esac
 
-for pass in $(seq 1 "$PASSES"); do
-    echo "[zns-multifill] Pass $pass/$PASSES: resetting all zones"
-    blkzone reset "$DEVICE"
+    [ "$pct" -ge 1 ] && [ "$pct" -le 100 ] || fail "Percentage out of range in REGION_PCTS: $pct"
 
-    echo "[zns-multifill] Pass $pass/$PASSES: filling device once"
-    fio --name="zns_fill_pass_${pass}" \
-        --filename="$DEVICE" \
-        --ioengine="$IOENGINE" \
-        --direct=1 \
-        --rw=write \
-        --bs="$BS" \
-        --zonemode=zbd \
-        --zonesize="$FIO_ZONE_SIZE_ARG" \
-        --size="$FIO_DEVICE_SIZE_ARG" \
-        --numjobs="$NUMJOBS" \
-        --max_open_zones="$NUMJOBS" \
-        --group_reporting
+    REGION_ZONES=$((TOTAL_ZONES * pct / 100))
+    if [ "$REGION_ZONES" -lt 1 ]; then
+        REGION_ZONES=1
+    fi
+
+    REGION_BYTES=$((REGION_ZONES * ZONE_SIZE_BYTES))
+    REGION_ARG="$(bytes_to_fio_arg "$REGION_BYTES")"
+    CYCLES_PER_PASS=$(((DEVICE_SIZE_BYTES + REGION_BYTES - 1) / REGION_BYTES))
+    echo "[zns-multifill] region=${pct}% zones=${REGION_ZONES}/${TOTAL_ZONES} size=${REGION_ARG} cycles_per_pass=${CYCLES_PER_PASS}"
+
+    for pass in $(seq 1 "$PASSES"); do
+        for cycle in $(seq 1 "$CYCLES_PER_PASS"); do
+            echo "[zns-multifill] region=${pct}% pass $pass/$PASSES cycle $cycle/$CYCLES_PER_PASS: resetting all zones"
+            blkzone reset "$DEVICE"
+
+            echo "[zns-multifill] region=${pct}% pass $pass/$PASSES cycle $cycle/$CYCLES_PER_PASS: writing region"
+            fio --name="zns_fill_${pct}pct_pass_${pass}_cycle_${cycle}" \
+                --filename="$DEVICE" \
+                --ioengine="$IOENGINE" \
+                --direct=1 \
+                --rw=write \
+                --bs="$BS" \
+                --zonemode=zbd \
+                --zonesize="$FIO_ZONE_SIZE_ARG" \
+                --offset=0 \
+                --size="$REGION_ARG" \
+                --numjobs="$NUMJOBS" \
+                --max_open_zones="$NUMJOBS" \
+                --group_reporting
+        done
+    done
 done

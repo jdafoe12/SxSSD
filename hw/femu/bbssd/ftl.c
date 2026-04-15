@@ -4,6 +4,7 @@
 #include "eswd-config.h"
 #include "eswd-layout.h"
 #include "meta-interface-policy.h"
+#include "qemu/timer.h"
 #include <errno.h>
 #include <string.h>
 //#include "../backend/ftl-backend.h"
@@ -1782,6 +1783,11 @@ void ssd_init(FemuCtrl *n)
         fprintf(stderr, "[FTL] Failed to initialize meta interface policy\n");
     }
 
+    ftl_assert(n->bb_params.host_mhz > 0);
+    ftl_assert(n->bb_params.ctrl_mhz > 0);
+    ssd->cpu_scale_factor =
+        (double)n->bb_params.host_mhz / n->bb_params.ctrl_mhz;
+
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
                        QEMU_THREAD_JOINABLE);
 }
@@ -1860,8 +1866,17 @@ static void *ftl_thread(void *arg)
             ftl_assert(req);
             {
                 struct NvmeCommandEvent nvme_event;
+                uint64_t cpu_t0;
+                uint64_t cpu_t1;
+                uint64_t cpu_overhead_ns;
+
                 ftl_fill_nvme_event(ssd, req, &nvme_event);
+                cpu_t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
                 lat = pe_dispatch_nvme_cmd(ssd->policy_engine, ssd, &nvme_event);
+                cpu_t1 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                cpu_overhead_ns = (uint64_t)((cpu_t1 - cpu_t0) *
+                                             ssd->cpu_scale_factor);
+                lat += cpu_overhead_ns;
             }
 
             req->reqlat = lat;

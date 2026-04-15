@@ -1,6 +1,7 @@
 #include "../nvme.h"
 #include "./ftl.h"
 #include "./policy-engine.h"
+#include "qemu/timer.h"
 
 static void bb_init_ctrl_str(FemuCtrl *n)
 {
@@ -166,7 +167,22 @@ static uint16_t bb_admin_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
                 .status = NVME_SUCCESS,
             };
 
-            pe_dispatch_admin_cmd(ssd->policy_engine, ssd, &event);
+            {
+                uint64_t cpu_t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                uint64_t cpu_t1;
+
+                pe_dispatch_admin_cmd(ssd->policy_engine, ssd, &event);
+                cpu_t1 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                if (ssd->cpu_scale_factor > 1.0) {
+                    uint64_t extra_ns = (uint64_t)((cpu_t1 - cpu_t0) *
+                                                   (ssd->cpu_scale_factor - 1.0));
+                    uint64_t deadline = cpu_t1 + extra_ns;
+
+                    while (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) < deadline) {
+                        /* spin */
+                    }
+                }
+            }
             return event.status;
         }
         return NVME_INVALID_OPCODE | NVME_DNR;

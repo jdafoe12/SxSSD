@@ -592,6 +592,13 @@ struct ssd { // This needs to be dissected and probably renamed
      * Policies receive this API to interact with FTL layer.
      */
     struct FtlPolicyAPI *policy_api;
+
+    /*
+     * CPU frequency scaling factor: host_mhz / ctrl_mhz.
+     * Applied to policy dispatch wall-clock time to model a slower SSD
+     * controller CPU.
+     */
+    double cpu_scale_factor;
 };
 
 void ssd_init(FemuCtrl *n);

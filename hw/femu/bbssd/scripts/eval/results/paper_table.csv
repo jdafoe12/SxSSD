@@ -1,0 +1,9 @@
+command,size,normal,confidential
+\texttt{INIT\_SESSION},--,1.337,1.132
+\texttt{INSTALL\_POLICY},6,0.927,0.920
+\texttt{UPDATE\_POLICY},6,1.492,1.468
+\texttt{REMOVE\_POLICY},6,0.881,0.896
+\texttt{ACTIVATE\_POLICY},6,128.777,132.965
+\texttt{DEACTIVATE\_POLICY},6,1.177,1.154
+\texttt{POLICY\_ATTESTATION (S)},--,0.223,0.244
+\texttt{POLICY\_ATTESTATION (C)},6,0.315,0.344

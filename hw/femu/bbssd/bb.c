@@ -1,6 +1,7 @@
 #include "../nvme.h"
 #include "./ftl.h"
 #include "./policy-engine.h"
+#include "qemu/timer.h"
 
 static void bb_init_ctrl_str(FemuCtrl *n)
 {
@@ -91,28 +92,15 @@ static uint16_t bb_nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
 static uint16_t bb_custom_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
                                NvmeRequest *req)
 {
-    /* Minimal parsing - just enough to route to FTL thread */
-    /* Policy hook will handle all command-specific logic */
-    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
-    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
-    uint32_t phase = le32_to_cpu(cmd->cdw10);
-    
-    /* Store opcode in request for ftl_fill_nvme_event() */
-    req->cmd = *cmd;  /* Copy entire command for CDW10-CDW15 access */
-    req->slba = 0;    /* Custom commands may not use SLBA */
-    req->nlb = 0;     /* Custom commands may not use NLB */
-    req->is_write = 0; /* Policy determines data direction */
+    (void)n;
+    (void)ns;
+    /* Store full command for ftl_fill_nvme_event() so CDW10-CDW15 and PRPs
+     * are accessible to the policy hook via event->cmd. */
+    req->cmd = *cmd;
+    req->slba = 0;
+    req->nlb = 0;
+    req->is_write = 0;
     req->status = NVME_SUCCESS;
-
-    printf("FEMU: bb_custom_cmd opcode=0x%02x phase=%u prp1=0x%llx prp2=0x%llx\n",
-           cmd->opcode, phase,
-           (unsigned long long)prp1,
-           (unsigned long long)prp2);
-    
-    /* If command has data transfer, map PRP/SGL */
-    /* For now, assume no automatic buffer mapping - policy uses buffer API */
-    /* Policies can use copy_request_data/write_request_data for data access */
-    
     return NVME_SUCCESS;
 }
 
@@ -166,7 +154,20 @@ static uint16_t bb_admin_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
                 .status = NVME_SUCCESS,
             };
 
-            pe_dispatch_admin_cmd(ssd->policy_engine, ssd, &event);
+            {
+                uint64_t cpu_t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                pe_dispatch_admin_cmd(ssd->policy_engine, ssd, &event);
+                uint64_t cpu_t1 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                /* Busy-wait for the scaled remainder so the total time the
+                 * guest observes equals raw_ns * cpu_scale_factor, matching
+                 * the expire_time injection done for I/O commands. */
+                uint64_t extra_ns = (uint64_t)((cpu_t1 - cpu_t0) *
+                                               (ssd->cpu_scale_factor - 1.0));
+                uint64_t deadline = cpu_t1 + extra_ns;
+                while (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) < deadline) {
+                    /* spin */
+                }
+            }
             return event.status;
         }
         return NVME_INVALID_OPCODE | NVME_DNR;

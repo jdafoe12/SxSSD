@@ -1,5 +1,7 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
+#include <stdbool.h>
 #include <linux/nvme_ioctl.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -10,6 +12,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define NVME_CMD_INIT_SESSION_SUBMIT  0x93
@@ -42,6 +45,7 @@
 
 #define POLICYCTL_COUNTER_PATH "/tmp/policyctl-session-counter"
 #define POLICYCTL_SESSION_STATE_PATH "/tmp/policyctl-session-state"
+#define POLICYCTL_TIMING_CSV_ENV "FEMU_META_POLICYCTL_TIMING_CSV"
 
 static const uint8_t ADMIN_PRIVATE_KEY[32] = {
     0x52, 0x07, 0xa0, 0x35, 0x1e, 0x25, 0x06, 0xd2, 0x9b, 0x23, 0x79, 0xb8,
@@ -83,6 +87,107 @@ struct policy_attestation_report {
     uint8_t reserved[2];
     uint8_t hash[POLICY_ATTESTATION_RESPONSE_HASH_SIZE];
 };
+
+struct policyctl_timing_row {
+    const char *command;
+    const char *mode;
+    const char *detail;
+    uint32_t policy_size_bytes;
+    uint32_t policy_size_pages;
+    uint64_t elapsed_ns;
+};
+
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+
+    return ((uint64_t)ts.tv_sec * 1000000000ULL) + (uint64_t)ts.tv_nsec;
+}
+
+static const char *mode_name(uint8_t mode)
+{
+    switch (mode) {
+    case SESSION_MODE_CONFIDENTIAL:
+        return "confidential";
+    case SESSION_MODE_NORMAL:
+    default:
+        return "normal";
+    }
+}
+
+static const char *report_name(uint32_t report_type)
+{
+    switch (report_type) {
+    case POLICY_ATTESTATION_REPORT_CONSISTENCY:
+        return "consistency";
+    case POLICY_ATTESTATION_REPORT_SECURITY:
+    default:
+        return "security";
+    }
+}
+
+static const char *opcode_name(uint8_t opcode)
+{
+    switch (opcode) {
+    case NVME_CMD_INSTALL_POLICY:
+        return "install";
+    case NVME_CMD_UPDATE_POLICY:
+        return "update";
+    case NVME_CMD_ACTIVATE_POLICY:
+        return "activate";
+    case NVME_CMD_DEACTIVATE_POLICY:
+        return "deactivate";
+    case NVME_CMD_REMOVE_POLICY:
+        return "remove";
+    default:
+        return "unknown";
+    }
+}
+
+static void append_timing_row(const struct policyctl_timing_row *row)
+{
+    const char *path;
+    FILE *fp;
+    struct stat st;
+    bool need_header = false;
+
+    if (!row) {
+        return;
+    }
+
+    path = getenv(POLICYCTL_TIMING_CSV_ENV);
+    if (!path || !*path) {
+        return;
+    }
+
+    if (stat(path, &st) != 0 || st.st_size == 0) {
+        need_header = true;
+    }
+
+    fp = fopen(path, "a");
+    if (!fp) {
+        return;
+    }
+
+    if (need_header) {
+        fprintf(fp, "ts_ns,command,mode,detail,policy_size_bytes,policy_size_pages,elapsed_ns\n");
+    }
+
+    fprintf(fp,
+            "%" PRIu64 ",%s,%s,%s,%u,%u,%" PRIu64 "\n",
+            now_ns(),
+            row->command ? row->command : "",
+            row->mode ? row->mode : "",
+            row->detail ? row->detail : "",
+            row->policy_size_bytes,
+            row->policy_size_pages,
+            row->elapsed_ns);
+    fclose(fp);
+}
 
 static void encode_u64_le(uint64_t value, uint8_t out[8])
 {
@@ -689,12 +794,12 @@ static int send_nvme_admin_cmd_ex(const char *device, uint8_t opcode,
         return -1;
     }
 
-    cmd.opcode = opcode;
-    cmd.nsid = 0;
-    cmd.addr = (uintptr_t)buffer;
+    cmd.opcode   = opcode;
+    cmd.nsid     = 0;
+    cmd.addr     = (uintptr_t)buffer;
     cmd.data_len = data_len;
-    cmd.cdw12 = cdw12;
-    cmd.cdw13 = cdw13;
+    cmd.cdw12    = cdw12;
+    cmd.cdw13    = cdw13;
 
     if (ioctl(fd, NVME_IOCTL_ADMIN_CMD, &cmd) != 0) {
         perror("ioctl");
@@ -713,7 +818,7 @@ cleanup:
 }
 
 static int send_nvme_admin_cmd(const char *device, uint8_t opcode,
-                               void *buffer, uint32_t data_len)
+                                void *buffer, uint32_t data_len)
 {
     return send_nvme_admin_cmd_ex(device, opcode, buffer, data_len, data_len, 0);
 }
@@ -1015,11 +1120,13 @@ cleanup:
 static int do_attestation(const char *device, uint32_t policy_id, uint32_t report_type)
 {
     struct policy_session session = {0};
+    struct policyctl_timing_row row = {0};
     uint8_t plaintext[POLICY_ATTESTATION_REQUEST_PLAINTEXT_SIZE];
     uint8_t *buffer = NULL;
     uint32_t response_len = META_ENVELOPE_HEADER_SIZE +
                             POLICY_ATTESTATION_RESPONSE_PLAINTEXT_SIZE;
     uint64_t counter;
+    uint64_t start_ns = now_ns();
     struct policy_attestation_report report = {0};
     int rc = -1;
 
@@ -1082,6 +1189,11 @@ static int do_attestation(const char *device, uint32_t policy_id, uint32_t repor
     rc = 0;
 
 cleanup:
+    row.command = "attest";
+    row.mode = mode_name(session.mode);
+    row.detail = report_name(report_type);
+    row.elapsed_ns = now_ns() - start_ns;
+    append_timing_row(&row);
     if (buffer) {
         OPENSSL_cleanse(buffer, response_len);
         free(buffer);
@@ -1095,6 +1207,8 @@ cleanup:
 static int do_session(const char *device, uint8_t session_mode)
 {
     struct policy_session session = {0};
+    struct policyctl_timing_row row = {0};
+    uint64_t start_ns = now_ns();
     int rc;
 
     rc = establish_session(device, session_mode, &session);
@@ -1102,6 +1216,11 @@ static int do_session(const char *device, uint8_t session_mode)
         fprintf(stderr, "Failed to persist session state\n");
         rc = -1;
     }
+    row.command = "session";
+    row.mode = mode_name(session_mode);
+    row.detail = "submit_fetch";
+    row.elapsed_ns = now_ns() - start_ns;
+    append_timing_row(&row);
     OPENSSL_cleanse(&session, sizeof(session));
     return rc;
 }
@@ -1112,17 +1231,21 @@ static int do_policy_image_cmd(const char *device, uint8_t opcode,
 {
     struct stat st;
     struct policy_session session = {0};
+    struct policyctl_timing_row row = {0};
     int policy_fd = -1;
     uint8_t *policy = NULL;
     uint8_t *plaintext = NULL;
     ssize_t read_rc;
-    size_t plaintext_len;
+    size_t plaintext_len = 0;
+    uint64_t start_ns = now_ns();
     int rc = -1;
+    uint32_t policy_size_bytes = 0;
 
     if (stat(policy_path, &st) != 0 || st.st_size <= 0 || st.st_size > UINT32_MAX) {
         fprintf(stderr, "Invalid policy image: %s\n", policy_path);
         return -1;
     }
+    policy_size_bytes = (uint32_t)st.st_size;
 
     if (load_session_state(&session) != 0) {
         fprintf(stderr, "No active session. Run: policyctl --mode normal|confidential session <device>\n");
@@ -1159,6 +1282,13 @@ static int do_policy_image_cmd(const char *device, uint8_t opcode,
                                      plaintext, plaintext_len);
 
 cleanup:
+    row.command = opcode_name(opcode);
+    row.mode = mode_name(session.mode);
+    row.detail = "payload";
+    row.policy_size_bytes = policy_size_bytes;
+    row.policy_size_pages = (policy_size_bytes + 4095U) / 4096U;
+    row.elapsed_ns = now_ns() - start_ns;
+    append_timing_row(&row);
     if (policy_fd >= 0) {
         close(policy_fd);
     }
@@ -1191,7 +1321,9 @@ static int do_update(const char *device, const char *policy_path,
 static int do_simple_opcode(const char *device, uint8_t opcode, uint32_t policy_id)
 {
     struct policy_session session = {0};
+    struct policyctl_timing_row row = {0};
     uint8_t plaintext[4];
+    uint64_t start_ns = now_ns();
     int rc;
 
     if (load_session_state(&session) != 0) {
@@ -1201,6 +1333,11 @@ static int do_simple_opcode(const char *device, uint8_t opcode, uint32_t policy_
 
     encode_u32_le(policy_id, plaintext);
     rc = send_authenticated_meta_cmd(device, &session, opcode, plaintext, sizeof(plaintext));
+    row.command = opcode_name(opcode);
+    row.mode = mode_name(session.mode);
+    row.detail = "submit";
+    row.elapsed_ns = now_ns() - start_ns;
+    append_timing_row(&row);
     OPENSSL_cleanse(&session, sizeof(session));
     OPENSSL_cleanse(plaintext, sizeof(plaintext));
     return rc;

@@ -592,6 +592,14 @@ struct ssd { // This needs to be dissected and probably renamed
      * Policies receive this API to interact with FTL layer.
      */
     struct FtlPolicyAPI *policy_api;
+
+    /*
+     * CPU frequency scaling factor: host_mhz / ctrl_mhz.
+     * Applied to wall-clock time of pe_dispatch_nvme_cmd to model a slower
+     * embedded SSD controller CPU. Set at ssd_init from BbCtrlParams.
+     * A value of 0.0 disables CPU overhead injection entirely.
+     */
+    double cpu_scale_factor;
 };
 
 void ssd_init(FemuCtrl *n);

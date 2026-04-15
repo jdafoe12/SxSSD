@@ -1782,6 +1782,12 @@ void ssd_init(FemuCtrl *n)
         fprintf(stderr, "[FTL] Failed to initialize meta interface policy\n");
     }
 
+    /* CPU frequency scaling: host_mhz / ctrl_mhz scales measured policy
+     * dispatch time to model a slower embedded SSD controller.
+     * ctrl_mhz == 0 is guarded; set ctrl_mhz == host_mhz for no scaling. */
+    ftl_assert(n->bb_params.ctrl_mhz > 0);
+    ssd->cpu_scale_factor = (double)n->bb_params.host_mhz / n->bb_params.ctrl_mhz;
+
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
                        QEMU_THREAD_JOINABLE);
 }
@@ -1861,7 +1867,11 @@ static void *ftl_thread(void *arg)
             {
                 struct NvmeCommandEvent nvme_event;
                 ftl_fill_nvme_event(ssd, req, &nvme_event);
+                uint64_t cpu_t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
                 lat = pe_dispatch_nvme_cmd(ssd->policy_engine, ssd, &nvme_event);
+                uint64_t cpu_t1 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                uint64_t cpu_overhead_ns = (uint64_t)((cpu_t1 - cpu_t0) * ssd->cpu_scale_factor);
+                lat += cpu_overhead_ns;
             }
 
             req->reqlat = lat;

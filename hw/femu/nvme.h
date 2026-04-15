@@ -1171,6 +1171,9 @@ typedef struct BbCtrlParams {
     int gc_thres_pcent;
     int gc_thres_pcent_high;
     int op_pct; /* overprovision percentage (0-100), logical space excludes this */
+
+    uint32_t host_mhz; /* host CPU frequency in MHz (for CPU scaling) */
+    uint32_t ctrl_mhz; /* target SSD controller CPU frequency in MHz */
 } BbCtrlParams;
 
 typedef struct ZNSCtrlParams {

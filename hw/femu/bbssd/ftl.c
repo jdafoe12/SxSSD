@@ -12,6 +12,7 @@
 //#define FEMU_DEBUG_FTL
 
 static void *ftl_thread(void *arg);
+static struct ssd_stats *ftl_get_stats(struct ssd *ssd);
 
 static inline uint32_t eswd_lbas_per_page(struct ssd *ssd)
 {
@@ -43,19 +44,52 @@ static inline uint64_t eswd_end_lba(struct ssd *ssd, uint32_t eswd_id)
     return eswd_start_lba(ssd, eswd_id) + eswd_capacity_lbas(ssd);
 }
 
+static inline uint64_t ftl_now_ns(void)
+{
+    return qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+}
+
+static bool ftl_get_oob_range(struct ssd *ssd, int oob_handle,
+                              size_t *offset_out, size_t *len_out)
+{
+    if (!ssd || !ssd->fb || oob_handle < 0) {
+        return false;
+    }
+    return ftl_backend_get_oob_policy_info(ssd->fb, oob_handle,
+                                           offset_out, len_out) == 0;
+}
+
 /*
  * Private physical-write primitive: program one or more page-sized buffers to the
  * given PseudoPpas via bbm_raw_write, then mark the pages valid.
  */
 static uint64_t ftl_write_pages_raw(struct ssd *ssd, const uint8_t *buffer,
                                     PseudoPpa *ppas, uint32_t page_count,
+                                    int oob_handle,
+                                    WritePageOobCallback fill_oob,
+                                    void *oob_ctx,
+                                    uint64_t start_lpn,
                                     int64_t stime_ns)
 {
     struct BbmEvent event = {0};
     uint64_t page_size = eswd_page_size_bytes(ssd);
-
+    uint8_t *oob_pages = NULL;
+    size_t oob_offset = 0;
+    size_t oob_len = 0;
     if (!ssd || !buffer || !ppas || page_count == 0) {
         return 0;
+    }
+
+    if (fill_oob && ftl_get_oob_range(ssd, oob_handle, &oob_offset, &oob_len) &&
+        oob_len > 0) {
+        oob_pages = g_malloc0((size_t)page_count * oob_len);
+        if (!oob_pages) {
+            return 0;
+        }
+        for (uint32_t i = 0; i < page_count; i++) {
+            fill_oob(oob_ctx, ssd, start_lpn + i, oob_pages + ((size_t)i * oob_len),
+                     (uint32_t)oob_len);
+        }
     }
 
     event.cmd = BBM_EVENT_WRITE;
@@ -63,16 +97,21 @@ static uint64_t ftl_write_pages_raw(struct ssd *ssd, const uint8_t *buffer,
     event.count = page_count;
     event.stime = stime_ns;
     bbm_raw_write(ssd->fb, ssd->bbm, (uint8_t *)buffer, ppas, page_count,
-                  page_size, &event);
+                  page_size, oob_pages, oob_offset, oob_len, &event);
+    g_free(oob_pages);
     for (uint32_t i = 0; i < page_count; i++) {
         mark_page_valid(ssd, &ppas[i]);
     }
+    ssd->stats.phys_page_programs += page_count;
     return (uint64_t)event.lat;
 }
 
 static uint64_t ftl_write_direct_pages(struct ssd *ssd, uint32_t eswd_id,
                                        const uint8_t *buffer, uint32_t page_count,
                                        uint64_t start_lpn,
+                                       int oob_handle,
+                                       WritePageOobCallback fill_oob,
+                                       void *oob_ctx,
                                        WritePpaCommitCallback on_page_commit,
                                        void *commit_ctx,
                                        PseudoPpa *ppa_out,
@@ -82,7 +121,6 @@ static uint64_t ftl_write_direct_pages(struct ssd *ssd, uint32_t eswd_id,
     PseudoPpa *ppas;
     uint32_t pages_until_end;
     uint64_t lat;
-
     if (!ssd || eswd_id >= ssd->tt_eswds || !buffer || !page_count) {
         return 0;
     }
@@ -96,6 +134,9 @@ static uint64_t ftl_write_direct_pages(struct ssd *ssd, uint32_t eswd_id,
     }
 
     ppas = g_malloc0(sizeof(*ppas) * page_count);
+    if (!ppas) {
+        return 0;
+    }
     for (uint32_t i = 0; i < page_count; i++) {
         if (eswd_id_to_ppa_wrapper(ssd, eswd_id, e->wp_page_index + i, &ppas[i]) != 0) {
             page_count = i;
@@ -107,7 +148,8 @@ static uint64_t ftl_write_direct_pages(struct ssd *ssd, uint32_t eswd_id,
         return 0;
     }
 
-    lat = ftl_write_pages_raw(ssd, buffer, ppas, page_count, stime_ns);
+    lat = ftl_write_pages_raw(ssd, buffer, ppas, page_count, oob_handle,
+                              fill_oob, oob_ctx, start_lpn, stime_ns);
     for (uint32_t i = 0; i < page_count; i++) {
         uint64_t lpn = start_lpn + i;
 
@@ -125,6 +167,9 @@ static uint64_t ftl_write_direct_pages(struct ssd *ssd, uint32_t eswd_id,
 
 static uint64_t ftl_flush_staged_page(struct ssd *ssd, uint32_t eswd_id,
                                       struct eswd *e, uint64_t page_lpn,
+                                      int oob_handle,
+                                      WritePageOobCallback fill_oob,
+                                      void *oob_ctx,
                                       WritePpaCommitCallback on_page_commit,
                                       void *commit_ctx,
                                       PseudoPpa *ppa_out,
@@ -140,7 +185,8 @@ static uint64_t ftl_flush_staged_page(struct ssd *ssd, uint32_t eswd_id,
         return 0;
     }
 
-    lat = ftl_write_pages_raw(ssd, e->staged_page_buf, &ppa, 1, stime_ns);
+    lat = ftl_write_pages_raw(ssd, e->staged_page_buf, &ppa, 1, oob_handle,
+                              fill_oob, oob_ctx, page_lpn, stime_ns);
     eswd_increment_wp(ssd, eswd_id);
     e->staged_valid_lbas = 0;
     if (ppa_out) {
@@ -170,6 +216,11 @@ static void ftl_record_last_ppa(void *opaque, struct ssd *ssd, uint64_t lpn,
 
 uint64_t ftl_write_host_lbas(struct ssd *ssd, uint32_t eswd_id,
                              uint64_t slba, const uint8_t *buf, uint32_t nlb,
+                             ReadPpaResolver resolve_old_ppa,
+                             void *resolve_ctx,
+                             int oob_handle,
+                             WritePageOobCallback fill_oob,
+                             void *oob_ctx,
                              WritePpaCommitCallback on_page_commit,
                              void *commit_ctx, int64_t stime_ns)
 {
@@ -194,6 +245,78 @@ uint64_t ftl_write_host_lbas(struct ssd *ssd, uint32_t eswd_id,
     data_off = 0;
     e = &ssd->eswds[eswd_id];
 
+    if (resolve_old_ppa) {
+        uint8_t *page_buf = g_malloc0(page_size);
+
+        if (!page_buf) {
+            return max_lat;
+        }
+
+        while (remaining > 0) {
+            uint64_t page_lba = cur_lba - (cur_lba % lbas_per_page);
+            uint64_t page_lpn = page_lba / lbas_per_page;
+            uint32_t page_off = (uint32_t)(cur_lba - page_lba);
+            uint32_t chunk_lbas = lbas_per_page - page_off;
+            uint64_t lat;
+            bool handled = false;
+
+            if (chunk_lbas > remaining) {
+                chunk_lbas = remaining;
+            }
+            if (page_off == 0 && chunk_lbas == lbas_per_page) {
+                uint32_t pages_until_end = ssd->eswd_layout.pgs_per_eswd - e->wp_page_index;
+                uint32_t direct_pages = remaining / lbas_per_page;
+
+                if (direct_pages > pages_until_end) {
+                    direct_pages = pages_until_end;
+                }
+                if (direct_pages > 0) {
+                    lat = ftl_write_direct_pages(ssd, eswd_id,
+                                                 buf + data_off, direct_pages,
+                                                 page_lpn, oob_handle, fill_oob, oob_ctx,
+                                                 on_page_commit, commit_ctx,
+                                                 NULL, stime_ns);
+                    if (lat > max_lat) {
+                        max_lat = lat;
+                    }
+                    cur_lba += (uint64_t)direct_pages * lbas_per_page;
+                    remaining -= direct_pages * lbas_per_page;
+                    data_off += (uint64_t)direct_pages * page_size;
+                    handled = true;
+                    continue;
+                }
+            }
+            if (!handled) {
+                PseudoPpa old_ppa;
+
+                memset(page_buf, 0, page_size);
+                if (resolve_old_ppa &&
+                    resolve_old_ppa(resolve_ctx, ssd, page_lpn, &old_ppa) &&
+                    valid_ppa(ssd, &old_ppa)) {
+                    read_page_buffer(ssd, &old_ppa, page_buf, -1, NULL, stime_ns);
+                }
+                memcpy(page_buf + (size_t)page_off * lba_size,
+                       buf + data_off,
+                       (size_t)chunk_lbas * lba_size);
+                lat = ftl_write_direct_pages(ssd, eswd_id,
+                                             page_buf, 1, page_lpn,
+                                             oob_handle, fill_oob, oob_ctx,
+                                             on_page_commit, commit_ctx,
+                                             NULL, stime_ns);
+            }
+            if (lat > max_lat) {
+                max_lat = lat;
+            }
+
+            cur_lba += chunk_lbas;
+            remaining -= chunk_lbas;
+            data_off += (uint64_t)chunk_lbas * lba_size;
+        }
+
+        g_free(page_buf);
+        return max_lat;
+    }
+
     while (remaining > 0) {
         uint64_t page_lba = cur_lba - (cur_lba % lbas_per_page);
         uint64_t page_lpn = page_lba / lbas_per_page;
@@ -217,7 +340,8 @@ uint64_t ftl_write_host_lbas(struct ssd *ssd, uint32_t eswd_id,
             if (direct_pages > 0) {
                 lat = ftl_write_direct_pages(ssd, eswd_id,
                                              buf + data_off, direct_pages,
-                                             page_lpn, on_page_commit, commit_ctx,
+                                             page_lpn, oob_handle, fill_oob, oob_ctx,
+                                             on_page_commit, commit_ctx,
                                              NULL, stime_ns);
                 if (lat > max_lat) {
                     max_lat = lat;
@@ -243,6 +367,7 @@ uint64_t ftl_write_host_lbas(struct ssd *ssd, uint32_t eswd_id,
             e->staged_valid_lbas = page_off + chunk_lbas;
 
             lat = ftl_flush_staged_page(ssd, eswd_id, e, page_lpn,
+                                        oob_handle, fill_oob, oob_ctx,
                                         on_page_commit, commit_ctx, NULL,
                                         stime_ns);
             if (lat > max_lat) {
@@ -260,10 +385,15 @@ uint64_t ftl_write_host_lbas(struct ssd *ssd, uint32_t eswd_id,
 
 uint64_t ftl_write_seq_lbas(struct ssd *ssd, uint32_t eswd_id,
                             uint64_t slba, const uint8_t *buf, uint32_t nlb,
+                            int oob_handle,
+                            WritePageOobCallback fill_oob,
+                            void *oob_ctx,
                             PseudoPpa *ppa_out, int64_t stime_ns)
 {
     struct ftl_last_ppa_ctx ctx = { .ppa_out = ppa_out };
     return ftl_write_host_lbas(ssd, eswd_id, slba, buf, nlb,
+                               NULL, NULL,
+                               oob_handle, fill_oob, oob_ctx,
                                ppa_out ? ftl_record_last_ppa : NULL, &ctx,
                                stime_ns);
 }
@@ -307,7 +437,8 @@ uint64_t ftl_read_eswd_page(struct ssd *ssd, uint32_t eswd_id,
     if (eswd_id_to_ppa_wrapper(ssd, eswd_id, page_index, &ppa) != 0) {
         return 0;
     }
-    return read_page_buffer(ssd, &ppa, buf_out, stime_ns);
+    ssd->stats.phys_page_reads++;
+    return read_page_buffer(ssd, &ppa, buf_out, -1, NULL, stime_ns);
 }
 
 /*
@@ -565,6 +696,15 @@ int ftl_get_page_status(struct ssd *ssd, const PseudoPpa *ppa)
         return -1;
     }
     return bbm_get_page_status(ssd->fb, ssd->bbm, ppa);
+}
+
+int ftl_register_oob_region(struct ssd *ssd, const char *name,
+                            uint32_t size, int *handle_out)
+{
+    if (!ssd || !ssd->fb || !name || !handle_out || size == 0) {
+        return -1;
+    }
+    return ftl_backend_register_oob_policy(ssd->fb, name, size, handle_out);
 }
 
 /* ======================================================== */
@@ -1129,11 +1269,15 @@ uint16_t eswd_check_read_range(struct ssd *ssd, uint32_t eswd_id,
 }
 
 uint64_t read_page_buffer(struct ssd *ssd, const PseudoPpa *ppa,
-                          uint8_t *buffer, int64_t stime_ns)
+                          uint8_t *buffer,
+                          int oob_handle, void *oob_buf,
+                          int64_t stime_ns)
 {
     struct BbmEvent event = {0};
     uint64_t page_size;
     PseudoPpa local;
+    size_t oob_offset = 0;
+    size_t oob_len = 0;
 
     if (!ssd || !ppa || !buffer) {
         return 0;
@@ -1148,7 +1292,13 @@ uint64_t read_page_buffer(struct ssd *ssd, const PseudoPpa *ppa,
     event.type = BBM_EVENT_POLICY_IO;
     event.count = 1;
     event.stime = stime_ns;
-    bbm_raw_read(ssd->fb, ssd->bbm, buffer, &local, 1, page_size, &event);
+    if (!oob_buf || !ftl_get_oob_range(ssd, oob_handle, &oob_offset, &oob_len)) {
+        oob_buf = NULL;
+        oob_offset = 0;
+        oob_len = 0;
+    }
+    bbm_raw_read(ssd->fb, ssd->bbm, buffer, &local, 1, page_size,
+                 oob_buf, oob_offset, oob_len, &event);
     return (uint64_t)event.lat;
 }
 
@@ -1251,6 +1401,17 @@ int migrate_eswd_pages(struct ssd *ssd,
         ftl_err("BUG: migrate from eSWD %u to itself\n", src_eswd_id);
     }
 
+    uint64_t page_size = ssd->fb->sp.secs_per_pg * ssd->fb->sp.secsz;
+    size_t full_oob_len = ssd->fb->oob_size_per_page;
+    uint8_t *page_buf = g_malloc0(page_size);
+    uint8_t *oob_buf = full_oob_len ? g_malloc0(full_oob_len) : NULL;
+
+    if (!page_buf || (full_oob_len && !oob_buf)) {
+        g_free(page_buf);
+        g_free(oob_buf);
+        return -1;
+    }
+
     /* Iterate through all pages in source eSWD */
     for (uint32_t page_idx = 0; page_idx < layout->pgs_per_eswd; page_idx++) {
         PseudoPpa src_ppa, dst_ppa;
@@ -1272,17 +1433,23 @@ int migrate_eswd_pages(struct ssd *ssd,
                 int rc = callbacks->on_destination_full(policy_ctx, dst_eswd_id, &new_dest_id);
                 if (rc < 0) {
                     ftl_err("Migration failed: destination full and on_destination_full returned %d\n", rc);
+                    g_free(page_buf);
+                    g_free(oob_buf);
                     return -1;
                 }
                 dst_eswd_id = new_dest_id;
                 dst_eswd = get_eswd_by_id(ssd, dst_eswd_id);
                 if (!dst_eswd) {
                     ftl_err("Migration failed: invalid new destination %u\n", dst_eswd_id);
+                    g_free(page_buf);
+                    g_free(oob_buf);
                     return -1;
                 }
             } else {
                 ftl_err("Migration failed: dst_eswd %u wp_index %u invalid (no on_destination_full)\n",
                         dst_eswd_id, dst_eswd->wp_page_index);
+                g_free(page_buf);
+                g_free(oob_buf);
                 return -1;
             }
         }
@@ -1291,13 +1458,14 @@ int migrate_eswd_pages(struct ssd *ssd,
         if (eswd_page_to_ppa(layout, geom, dst_eswd_id, dst_eswd->wp_page_index, &dst_ppa) != 0) {
             ftl_err("Migration failed: dst_eswd %u wp_index %u invalid\n", 
                     dst_eswd_id, dst_eswd->wp_page_index);
+            g_free(page_buf);
+            g_free(oob_buf);
             return -1;
         }
         
         /* Perform the actual migration (read + write) with timing simulation */
 
         struct BbmEvent read_event, write_event;
-        uint64_t page_size = ssd->fb->sp.secs_per_pg * ssd->fb->sp.secsz;
             
         /* Read from source */
         read_event.cmd = BBM_EVENT_READ;
@@ -1308,7 +1476,8 @@ int migrate_eswd_pages(struct ssd *ssd,
          * availability state, not fresh wall-clock sampling per page. */
         read_event.stime = 0;
         read_event.lat = 0;
-        bbm_raw_read(ssd->fb, ssd->bbm, NULL, &src_ppa, 1, page_size, &read_event);
+        bbm_raw_read(ssd->fb, ssd->bbm, page_buf, &src_ppa, 1, page_size,
+                     oob_buf, 0, full_oob_len, &read_event);
             
         /* Write to destination */
         write_event.cmd = BBM_EVENT_WRITE;
@@ -1317,7 +1486,8 @@ int migrate_eswd_pages(struct ssd *ssd,
         write_event.status_list = NULL;
         write_event.stime = 0;
         write_event.lat = 0;
-        bbm_raw_write(ssd->fb, ssd->bbm, NULL, &dst_ppa, 1, page_size, &write_event);
+        bbm_raw_write(ssd->fb, ssd->bbm, page_buf, &dst_ppa, 1, page_size,
+                      oob_buf, 0, full_oob_len, &write_event);
             
         /* Update LUN gc_endtime */
         struct nand_lun *dst_lun = get_lun(ssd, &dst_ppa);
@@ -1344,6 +1514,9 @@ int migrate_eswd_pages(struct ssd *ssd,
         
         migrated_count++;
     }
+
+    g_free(page_buf);
+    g_free(oob_buf);
 
     /* After migrating valid pages, erase the source eSWD blocks (mechanism completes the migration) */
     const struct ssdparams *spp = &ssd->fb->sp;
@@ -1742,6 +1915,7 @@ void ssd_init(FemuCtrl *n)
     ssd->policy_api->write_cmd_buffer = ftl_write_cmd_buffer;
     ssd->policy_api->set_completion_result_u64 = ftl_set_completion_result_u64;
     ssd->policy_api->get_page_status = ftl_get_page_status;
+    ssd->policy_api->register_oob_region = ftl_register_oob_region;
 
     /* Hook registration (mechanism provides event system) */
     ssd->policy_api->register_nvme_hook = ftl_register_nvme_hook;
@@ -1776,6 +1950,7 @@ void ssd_init(FemuCtrl *n)
     ssd->policy_api->write_seq_lbas    = ftl_write_seq_lbas;
     ssd->policy_api->read_eswd_page    = ftl_read_eswd_page;
     ssd->policy_api->eswd_get_effective_wp_lba = ftl_eswd_get_effective_wp_lba;
+    ssd->policy_api->get_stats                 = ftl_get_stats;
 
     /* BBM policy-visible pass-through intentionally disabled. */
 
@@ -1839,6 +2014,60 @@ void mark_block_free(struct ssd *ssd, PseudoPpa *ppa)
     bbm_mark_block_free(ssd->fb, ssd->bbm, ppa);
 }
 
+static struct ssd_stats *ftl_get_stats(struct ssd *ssd)
+{
+    return &ssd->stats;
+}
+
+void ssd_stats_reset(struct ssd *ssd)
+{
+    memset(&ssd->stats, 0, sizeof(ssd->stats));
+}
+
+void ssd_stats_dump_json(struct ssd *ssd, uint32_t run_id)
+{
+    const char *dir = getenv(FEMU_STATS_DIR_ENV);
+    char path[512];
+    FILE *f;
+
+    if (!dir || !*dir) {
+        printf("FEMU: ssd_stats_dump_json: %s not set, skipping dump\n",
+               FEMU_STATS_DIR_ENV);
+        return;
+    }
+
+    snprintf(path, sizeof(path), "%s/stats_%u.json", dir, run_id);
+    f = fopen(path, "w");
+    if (!f) {
+        printf("FEMU: ssd_stats_dump_json: failed to open %s: %s\n",
+               path, strerror(errno));
+        return;
+    }
+
+    fprintf(f, "{\n");
+    fprintf(f, "  \"run_id\": %u,\n", run_id);
+    fprintf(f, "  \"host_read_cmds\": %lu,\n",      ssd->stats.host_read_cmds);
+    fprintf(f, "  \"host_write_cmds\": %lu,\n",     ssd->stats.host_write_cmds);
+    fprintf(f, "  \"host_trim_cmds\": %lu,\n",      ssd->stats.host_trim_cmds);
+    fprintf(f, "  \"host_read_sectors\": %lu,\n",   ssd->stats.host_read_sectors);
+    fprintf(f, "  \"host_write_sectors\": %lu,\n",  ssd->stats.host_write_sectors);
+    fprintf(f, "  \"host_trim_sectors\": %lu,\n",   ssd->stats.host_trim_sectors);
+    fprintf(f, "  \"phys_page_reads\": %lu,\n",     ssd->stats.phys_page_reads);
+    fprintf(f, "  \"phys_page_programs\": %lu,\n",  ssd->stats.phys_page_programs);
+    fprintf(f, "  \"block_erases\": %lu,\n",         ssd->stats.block_erases);
+    fprintf(f, "  \"gc_invocations\": %lu,\n",       ssd->stats.gc_invocations);
+    fprintf(f, "  \"gc_pages_migrated\": %lu,\n",    ssd->stats.gc_pages_migrated);
+    fprintf(f, "  \"foreground_gc_count\": %lu,\n",  ssd->stats.foreground_gc_count);
+    fprintf(f, "  \"background_gc_count\": %lu,\n",  ssd->stats.background_gc_count);
+    fprintf(f, "  \"gc_time_ns\": %lu,\n",            ssd->stats.gc_time_ns);
+    fprintf(f, "  \"policy_dispatch_time_ns\": %lu,\n", ssd->stats.policy_dispatch_time_ns);
+    fprintf(f, "  \"bytes_copied\": %lu\n",          ssd->stats.bytes_copied);
+    fprintf(f, "}\n");
+
+    fclose(f);
+    printf("FEMU: stats dumped to %s\n", path);
+}
+
 static void *ftl_thread(void *arg)
 {
     FemuCtrl *n = (FemuCtrl *)arg;
@@ -1871,11 +2100,31 @@ static void *ftl_thread(void *arg)
                 uint64_t cpu_overhead_ns;
 
                 ftl_fill_nvme_event(ssd, req, &nvme_event);
+
+                /* Host I/O counters */
+                switch (nvme_event.opcode) {
+                case NVME_CMD_READ:
+                    ssd->stats.host_read_cmds++;
+                    ssd->stats.host_read_sectors += nvme_event.nsecs;
+                    break;
+                case NVME_CMD_WRITE:
+                    ssd->stats.host_write_cmds++;
+                    ssd->stats.host_write_sectors += nvme_event.nsecs;
+                    break;
+                case NVME_CMD_DSM:
+                    ssd->stats.host_trim_cmds++;
+                    ssd->stats.host_trim_sectors += nvme_event.nsecs;
+                    break;
+                default:
+                    break;
+                }
+
                 cpu_t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
                 lat = pe_dispatch_nvme_cmd(ssd->policy_engine, ssd, &nvme_event);
                 cpu_t1 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
                 cpu_overhead_ns = (uint64_t)((cpu_t1 - cpu_t0) *
                                              ssd->cpu_scale_factor);
+                ssd->stats.policy_dispatch_time_ns += (cpu_t1 - cpu_t0);
                 lat += cpu_overhead_ns;
             }
 

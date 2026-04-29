@@ -85,6 +85,11 @@ int ftl_backend_init(struct FtlBackend *fb, SsdDramBackend *mbe, const BbCtrlPar
     fb->page_validity = g_malloc0((size_t)(spp->tt_blks * spp->pgs_per_blk));
     /* all pages start FREE (0) */
 
+    fb->oob_size_per_page = 32;
+    fb->oob_used_per_page = 0;
+    fb->oob_policy_count = 0;
+    fb->oob_buf = g_malloc0((size_t)spp->tt_pgs * fb->oob_size_per_page);
+
     fb->pswd_transition_notify = NULL;
     fb->pswd_transition_notify_ctx = NULL;
 
@@ -256,7 +261,8 @@ static void pswd_do_transition(struct FtlBackend *fb, uint64_t blkidx, enum pswd
     }
 }
 
-static uint64_t *build_offset_list(const struct ssdparams *spp, struct ppa *ppa_list, uint64_t ppa_count,
+static uint64_t *build_offset_list(const struct ssdparams *spp,
+                                   struct ppa *ppa_list, uint64_t ppa_count,
                                    uint64_t page_size)
 {
     if (!spp || !ppa_list || !ppa_count) {
@@ -264,6 +270,10 @@ static uint64_t *build_offset_list(const struct ssdparams *spp, struct ppa *ppa_
     }
 
     uint64_t *offset_list = g_malloc0(sizeof(uint64_t) * ppa_count);
+
+    if (!offset_list) {
+        return NULL;
+    }
     for (uint64_t i = 0; i < ppa_count; ++i) {
         offset_list[i] = ppa2pgidx(spp, &ppa_list[i]) * page_size;
     }
@@ -560,7 +570,6 @@ int ftl_backend_read(struct FtlBackend *fb, NvmeRequest *req, struct ppa *ppa_li
         fill_read_event(fb, event, ppa_list, ppa_count, lat);
     }
     g_free(offset_list);
-
     return 0;
 }
 
@@ -612,7 +621,6 @@ int ftl_backend_write(struct FtlBackend *fb, NvmeRequest *req, struct ppa *ppa_l
     g_free(valid);
 
     g_free(temp_buf);
-
     int lat = ftl_backend_latency(fb, ppa_list, ppa_count, event);
     if (event) {
         fill_write_event(fb, event, ppa_list, ppa_count, lat);
@@ -626,6 +634,7 @@ int ftl_backend_write(struct FtlBackend *fb, NvmeRequest *req, struct ppa *ppa_l
 
 int ftl_backend_raw_read(struct FtlBackend *fb, uint8_t *buffer, struct ppa *ppa_list,
                          uint64_t ppa_count, uint64_t page_size,
+                         void *oob_buf, size_t oob_offset, size_t oob_len,
                          struct FtlBackendEvent *event)
 {
     /* buffer may be NULL for timing-only simulation (e.g. GC); still simulate latency */
@@ -644,6 +653,15 @@ int ftl_backend_raw_read(struct FtlBackend *fb, uint8_t *buffer, struct ppa *ppa
         }
         g_free(offset_list);
     }
+    if (oob_buf && fb->oob_buf && oob_len > 0 &&
+        oob_offset + oob_len <= fb->oob_size_per_page) {
+        for (uint64_t i = 0; i < ppa_count; ++i) {
+            uint64_t page_idx = ppa2pgidx(&fb->sp, &ppa_list[i]);
+            size_t base = (size_t)page_idx * fb->oob_size_per_page + oob_offset;
+
+            memcpy((uint8_t *)oob_buf + i * oob_len, fb->oob_buf + base, oob_len);
+        }
+    }
 
     int lat = ftl_backend_latency(fb, ppa_list, ppa_count, event);
     if (event) {
@@ -655,10 +673,10 @@ int ftl_backend_raw_read(struct FtlBackend *fb, uint8_t *buffer, struct ppa *ppa
 
 int ftl_backend_raw_write(struct FtlBackend *fb, uint8_t *buffer, struct ppa *ppa_list,
                           uint64_t ppa_count, uint64_t page_size,
+                          const void *oob_buf, size_t oob_offset, size_t oob_len,
                           struct FtlBackendEvent *event)
 {
     const struct ssdparams *spp = &fb->sp;
-
     if (!fb || !ppa_list || !ppa_count || !page_size) {
         return 0;
     }
@@ -679,7 +697,6 @@ int ftl_backend_raw_write(struct FtlBackend *fb, uint8_t *buffer, struct ppa *pp
             event->status_list[i] = st;
         }
     }
-
     /* Copy data only for valid pages */
     if (buffer && fb->mbe) {
         for (uint64_t i = 0; i < ppa_count; ++i) {
@@ -690,8 +707,21 @@ int ftl_backend_raw_write(struct FtlBackend *fb, uint8_t *buffer, struct ppa *pp
                    page_size);
         }
     }
-    g_free(valid);
+    if (oob_buf && fb->oob_buf && oob_len > 0 &&
+        oob_offset + oob_len <= fb->oob_size_per_page) {
+        for (uint64_t i = 0; i < ppa_count; ++i) {
+            uint64_t page_idx;
+            size_t base;
 
+            if (!valid[i]) {
+                continue;
+            }
+            page_idx = ppa2pgidx(&fb->sp, &ppa_list[i]);
+            base = (size_t)page_idx * fb->oob_size_per_page + oob_offset;
+            memcpy(fb->oob_buf + base, (const uint8_t *)oob_buf + i * oob_len, oob_len);
+        }
+    }
+    g_free(valid);
     int lat = ftl_backend_latency(fb, ppa_list, ppa_count, event);
     if (event) {
         fill_write_event(fb, event, ppa_list, ppa_count, lat);
@@ -785,6 +815,29 @@ int ftl_backend_register_oob_policy(struct FtlBackend *fb,
     fb->oob_policy_count++;
     
     *policy_handle_out = handle;
+    return 0;
+}
+
+int ftl_backend_get_oob_policy_info(struct FtlBackend *fb,
+                                    int policy_handle,
+                                    size_t *offset_out,
+                                    size_t *size_out)
+{
+    struct OobPolicyRegistration *reg;
+
+    if (!fb || policy_handle < 0 || policy_handle >= fb->oob_policy_count) {
+        return -1;
+    }
+    reg = &fb->oob_policies[policy_handle];
+    if (!reg->active) {
+        return -1;
+    }
+    if (offset_out) {
+        *offset_out = reg->offset;
+    }
+    if (size_out) {
+        *size_out = reg->required_size;
+    }
     return 0;
 }
 

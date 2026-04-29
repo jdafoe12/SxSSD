@@ -176,6 +176,7 @@ bool bbm_is_mappable_to_host(const struct bbm *ctx, const struct pba *pba);
 bool bbm_is_excluded_phys_blk(const struct bbm *ctx, const struct pba *pba);
 int bbm_exclude_phys_blk_from_mapping(struct bbm *ctx, const struct pba *pba);
 int bbm_include_phys_blk_in_mapping(struct bbm *ctx, const struct pba *pba);
+int bbm_translate_ppa(const struct bbm *ctx, const PseudoPpa *pppa, struct ppa *out);
 
 // Need raw functions and non-raw functions, like in the backend. (raw serve policies, while non-raw serve the host.)
 
@@ -212,10 +213,14 @@ int bbm_write(struct FtlBackend *fb, const struct bbm *ctx,
 /* These are for direct operations on the FTL backend, without involving the host. */
 int bbm_raw_read(struct FtlBackend *fb, const struct bbm *ctx,
                  uint8_t *buffer, PseudoPpa *ppas,
-                 uint64_t ppa_count, uint64_t page_size, struct BbmEvent *event);
+                 uint64_t ppa_count, uint64_t page_size,
+                 void *oob_buf, size_t oob_offset, size_t oob_len,
+                 struct BbmEvent *event);
 int bbm_raw_write(struct FtlBackend *fb, const struct bbm *ctx,
                   uint8_t *buffer, PseudoPpa *ppas,
-                  uint64_t ppa_count, uint64_t page_size, struct BbmEvent *event);
+                  uint64_t ppa_count, uint64_t page_size,
+                  const void *oob_buf, size_t oob_offset, size_t oob_len,
+                  struct BbmEvent *event);
 int bbm_raw_erase(struct FtlBackend *fb, const struct bbm *ctx,
                   PseudoPba *pbns, uint64_t blk_count,
                   struct BbmEvent *event);

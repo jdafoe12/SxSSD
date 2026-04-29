@@ -50,6 +50,24 @@ FEMU_OPTIONS=${FEMU_OPTIONS}",gc_thres_pcent_high=${gc_thres_pcent_high}"
 
 echo ${FEMU_OPTIONS}
 
+# Host-shared results directory exposed to the guest via 9p.
+# Guest mount command:
+#   sudo mkdir -p /mnt/femu-host-results
+#   sudo mount -t 9p -o trans=virtio,version=9p2000.L femu_host_results /mnt/femu-host-results
+if [[ -z "${FEMU_HOST_RESULTS_DIR:-}" ]]; then
+    FEMU_HOST_RESULTS_DIR="$(realpath "$(dirname "$0")/../hw/femu/bbssd/workload-eval/workload_sets/results")"
+fi
+mkdir -p "$FEMU_HOST_RESULTS_DIR"
+echo "FEMU host results dir: $FEMU_HOST_RESULTS_DIR"
+
+# Stats output directory: FEMU writes stats_<run_id>.json here directly (host-side path).
+# Override by setting FEMU_STATS_DIR in the environment before running this script.
+if [[ -z "${FEMU_STATS_DIR:-}" ]]; then
+    FEMU_STATS_DIR="${FEMU_HOST_RESULTS_DIR}/stats"
+fi
+mkdir -p "$FEMU_STATS_DIR"
+echo "FEMU stats dir: $FEMU_STATS_DIR"
+
 if [[ ! -e "$OSIMGF" ]]; then
 	echo ""
 	echo "VM disk image couldn't be found ..."
@@ -59,12 +77,13 @@ if [[ ! -e "$OSIMGF" ]]; then
 	exit
 fi
 
-sudo ./qemu-system-x86_64 \
+sudo env FEMU_STATS_DIR="${FEMU_STATS_DIR}" ./qemu-system-x86_64 \
     -name "FEMU-BBSSD-VM" \
     -enable-kvm \
     -cpu host \
     -smp 4 \
     -m 4G \
+    -virtfs local,path="$FEMU_HOST_RESULTS_DIR",mount_tag=femu_host_results,security_model=none,id=femu_host_results \
     -device virtio-scsi-pci,id=scsi0 \
     -device scsi-hd,drive=hd0 \
     -drive file=$OSIMGF,if=none,aio=native,cache=none,format=qcow2,id=hd0 \

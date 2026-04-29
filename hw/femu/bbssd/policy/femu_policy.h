@@ -155,6 +155,33 @@ struct NamespacePersonalityConfig {
     size_t ctrl_csi_data_len;
 };
 
+/* Per-run statistics counters; reset/dumped via bb_flip FEMU_STATS_RESET/DUMP. */
+struct ssd_stats {
+    /* Host I/O command counts */
+    uint64_t host_read_cmds;
+    uint64_t host_write_cmds;
+    uint64_t host_trim_cmds;
+    /* Host I/O sector counts */
+    uint64_t host_read_sectors;
+    uint64_t host_write_sectors;
+    uint64_t host_trim_sectors;
+    /* Physical page / block operations */
+    uint64_t phys_page_reads;
+    uint64_t phys_page_programs;
+    uint64_t block_erases;
+    /* GC activity */
+    uint64_t gc_invocations;
+    uint64_t gc_pages_migrated;
+    uint64_t foreground_gc_count;
+    uint64_t background_gc_count;
+    uint64_t gc_time_ns;
+    bool     gc_active;
+    /* Policy-engine overhead */
+    uint64_t policy_dispatch_time_ns;
+    /* Data copy volume */
+    uint64_t bytes_copied;
+};
+
 struct ssd;
 struct bbm;
 struct BbmPolicyAPI;
@@ -193,6 +220,8 @@ typedef void (*MigrationResultCallback)(uint64_t lpn, PseudoPpa *old_ppa,
 typedef bool (*ReadPpaResolver)(void *ctx, struct ssd *ssd, uint64_t lpn, PseudoPpa *out);
 typedef void (*WritePpaCommitCallback)(void *ctx, struct ssd *ssd, uint64_t lpn,
                                        const PseudoPpa *new_ppa);
+typedef void (*WritePageOobCallback)(void *ctx, struct ssd *ssd, uint64_t lpn,
+                                     void *oob_buf, uint32_t oob_len);
 
 typedef bool (*NvmeHookCondition)(struct ssd *ssd,
                                   struct NvmeCommandEvent *event,
@@ -263,7 +292,9 @@ struct FtlPolicyAPI {
     uint16_t (*eswd_check_read_range)(struct ssd *ssd, uint32_t eswd_id,
                                       uint64_t slba, uint32_t nlb);
     uint64_t (*read_page_buffer)(struct ssd *ssd, const PseudoPpa *ppa,
-                                 uint8_t *buffer, int64_t stime_ns);
+                                 uint8_t *buffer,
+                                 int oob_handle, void *oob_buf,
+                                 int64_t stime_ns);
     int (*eswd_advance_wp_to_end)(struct ssd *ssd, uint32_t eswd_id);
     uint64_t (*eswd_erase_physical)(struct ssd *ssd, uint32_t eswd_id, int64_t stime_ns);
     int (*eswd_id_to_ppa)(struct ssd *ssd, uint32_t eswd_id, uint32_t page_index, PseudoPpa *ppa);
@@ -309,6 +340,8 @@ struct FtlPolicyAPI {
                                       uint64_t value);
     
     int (*get_page_status)(struct ssd *ssd, const PseudoPpa *ppa);
+    int (*register_oob_region)(struct ssd *ssd, const char *name,
+                               uint32_t size, int *handle_out);
     int (*register_nvme_hook)(struct ssd *ssd, uint8_t opcode,
                               NvmeHookCondition condition,
                               NvmeHookCallback callback,
@@ -347,12 +380,21 @@ struct FtlPolicyAPI {
     /*
      * Unified host-write API shared by block and ZNS policies.
      *
-     * Full-page sequential ranges are written directly with request-style latency
-     * semantics. Partial pages are staged in the eSWD buffer until a later write
-     * fills the page. on_page_commit (may be NULL) fires once per committed page.
+     * If resolve_old_ppa is NULL, the write follows sequential/ZNS semantics:
+     * full-page sequential ranges may be written directly while partial pages are
+     * staged until full. If resolve_old_ppa is non-NULL, each touched logical page
+     * is committed immediately; partial-page writes are reconstructed into a full
+     * page image by reading the currently mapped page through resolve_old_ppa and
+     * overlaying the incoming host bytes. on_page_commit (may be NULL) fires once
+     * per committed page.
      */
     uint64_t (*write_host_lbas)(struct ssd *ssd, uint32_t eswd_id,
                                 uint64_t slba, const uint8_t *buf, uint32_t nlb,
+                                ReadPpaResolver resolve_old_ppa,
+                                void *resolve_ctx,
+                                int oob_handle,
+                                WritePageOobCallback fill_oob,
+                                void *oob_ctx,
                                 WritePpaCommitCallback on_page_commit,
                                 void *commit_ctx, int64_t stime_ns);
     /*
@@ -364,6 +406,9 @@ struct FtlPolicyAPI {
      */
     uint64_t (*write_seq_lbas)(struct ssd *ssd, uint32_t eswd_id,
                                uint64_t slba, const uint8_t *buf, uint32_t nlb,
+                               int oob_handle,
+                               WritePageOobCallback fill_oob,
+                               void *oob_ctx,
                                PseudoPpa *ppa_out, int64_t stime_ns);
     /*
      * Staged-aware page read: serves from the eSWD staging buffer if the requested
@@ -378,6 +423,9 @@ struct FtlPolicyAPI {
      */
     uint64_t (*eswd_get_effective_wp_lba)(struct ssd *ssd, uint32_t eswd_id);
     /* struct BbmPolicyAPI *bbm_api; */
+
+    /* Stats accessor: returns a pointer to the live ssd_stats counter block. */
+    struct ssd_stats *(*get_stats)(struct ssd *ssd);
 };
 
 typedef int (*policy_init_fn)(struct ssd *ssd, struct FtlPolicyAPI *api);

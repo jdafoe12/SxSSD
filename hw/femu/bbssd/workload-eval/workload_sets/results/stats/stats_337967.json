@@ -1,0 +1,19 @@
+{
+  "run_id": 337967,
+  "host_read_cmds": 564097,
+  "host_write_cmds": 439931,
+  "host_trim_cmds": 0,
+  "host_read_sectors": 29054125,
+  "host_write_sectors": 8046705,
+  "host_trim_sectors": 0,
+  "phys_page_reads": 0,
+  "phys_page_programs": 1071878,
+  "block_erases": 10,
+  "gc_invocations": 10,
+  "gc_pages_migrated": 4246,
+  "foreground_gc_count": 0,
+  "background_gc_count": 10,
+  "gc_time_ns": 51409649,
+  "policy_dispatch_time_ns": 1521263078,
+  "bytes_copied": 0
+}

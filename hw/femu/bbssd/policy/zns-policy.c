@@ -338,9 +338,10 @@ static uint64_t zns_do_write(struct zns_policy_context *ctx,
     }
 
     cur_lba = append ? write_slba : cmd_slba;
-    lat = ctx->api->write_host_lbas(ctx->ssd, zone->eswd_id,
-                                    cur_lba, req_buf, nlb,
-                                    NULL, NULL, (int64_t)event->stime);
+    lat = ctx->api->write_seq_lbas(ctx->ssd, zone->eswd_id,
+                                   cur_lba, req_buf, nlb,
+                                   -1, NULL, NULL,
+                                   NULL, (int64_t)event->stime);
 
     free(req_buf);
 

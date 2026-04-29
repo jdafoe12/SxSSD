@@ -78,6 +78,16 @@ static void bb_flip(FemuCtrl *n, NvmeCmd *cmd)
         n->print_log = false;
         femu_log("%s,Log print [Disabled]!\n", n->devname);
         break;
+    case FEMU_STATS_RESET:
+        ssd_stats_reset(ssd);
+        femu_log("%s,Stats reset\n", n->devname);
+        break;
+    case FEMU_STATS_DUMP: {
+        uint32_t run_id = (uint32_t)le64_to_cpu(cmd->cdw11);
+        ssd_stats_dump_json(ssd, run_id);
+        femu_log("%s,Stats dumped run_id=%u\n", n->devname, run_id);
+        break;
+    }
     default:
         printf("FEMU:%s,Not implemented flip cmd (%lu)\n", n->devname, cdw10);
     }

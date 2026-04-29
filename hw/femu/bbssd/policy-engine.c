@@ -257,7 +257,8 @@ int pe_read_policy_payload(struct ssd *ssd,
         ppa_list[i].g.sec = 0;
     }
 
-    if (ftl_backend_raw_read(ssd->fb, payload, ppa_list, page_count, page_size, NULL) != 0) {
+    if (ftl_backend_raw_read(ssd->fb, payload, ppa_list, page_count, page_size,
+                             NULL, 0, 0, NULL) != 0) {
         goto cleanup;
     }
 

@@ -267,9 +267,13 @@ int ftl_backend_write(struct FtlBackend *fb, NvmeRequest *req, struct ppa *ppa_l
 
 /* These are for direct operations on the FTL backend, without involving the host. */
 int ftl_backend_raw_read(struct FtlBackend *fb, uint8_t *buffer, struct ppa *ppa_list,
-                         uint64_t ppn_count, uint64_t page_size, struct FtlBackendEvent *event);
+                         uint64_t ppn_count, uint64_t page_size,
+                         void *oob_buf, size_t oob_offset, size_t oob_len,
+                         struct FtlBackendEvent *event);
 int ftl_backend_raw_write(struct FtlBackend *fb, uint8_t *buffer, struct ppa *ppa_list,
-                          uint64_t ppn_count, uint64_t page_size, struct FtlBackendEvent *event);
+                          uint64_t ppn_count, uint64_t page_size,
+                          const void *oob_buf, size_t oob_offset, size_t oob_len,
+                          struct FtlBackendEvent *event);
 int ftl_backend_raw_erase(struct FtlBackend *fb, struct pba *pbn, uint64_t block_count,
                           struct FtlBackendEvent *event);
 
@@ -285,6 +289,10 @@ int ftl_backend_register_oob_policy(struct FtlBackend *fb,
     const char *policy_name,
     size_t required_size,
     int *policy_handle_out);
+int ftl_backend_get_oob_policy_info(struct FtlBackend *fb,
+    int policy_handle,
+    size_t *offset_out,
+    size_t *size_out);
 
 /* Policies use this to access their OOB section */
 void* ftl_backend_get_oob_for_policy(struct FtlBackend *fb, 

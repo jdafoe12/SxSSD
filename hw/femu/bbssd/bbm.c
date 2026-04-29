@@ -206,6 +206,15 @@ static inline struct ppa bbm_translate_pseudo_ppa(const struct bbm *ctx,
     return out;
 }
 
+int bbm_translate_ppa(const struct bbm *ctx, const PseudoPpa *pppa, struct ppa *out)
+{
+    if (!ctx || !pppa || !out) {
+        return -1;
+    }
+    *out = bbm_translate_pseudo_ppa(ctx, pppa);
+    return 0;
+}
+
 /* Helpers to map BBM events to backend events */
 static inline enum FtlBackendEventCmd bbm_cmd_to_backend(enum BbmEventCmd cmd)
 {
@@ -233,12 +242,16 @@ int bbm_read(struct FtlBackend *fb, const struct bbm *ctx,
     }
 
     struct ppa *phys = g_malloc0(sizeof(struct ppa) * ppa_count);
+    int *bev_status = NULL;
+
+    if (!phys) {
+        return -1;
+    }
     for (uint64_t i = 0; i < ppa_count; ++i) {
         phys[i] = bbm_translate_pseudo_ppa(ctx, &ppas[i]);
     }
 
     struct FtlBackendEvent bev = {0};
-    int *bev_status = NULL;
     if (event) {
         bev.cmd = bbm_cmd_to_backend(event->cmd);
         bev.type = bbm_type_to_backend(event->type);
@@ -272,12 +285,16 @@ int bbm_write(struct FtlBackend *fb, const struct bbm *ctx,
     }
 
     struct ppa *phys = g_malloc0(sizeof(struct ppa) * ppa_count);
+    int *bev_status = NULL;
+
+    if (!phys) {
+        return -1;
+    }
     for (uint64_t i = 0; i < ppa_count; ++i) {
         phys[i] = bbm_translate_pseudo_ppa(ctx, &ppas[i]);
     }
 
     struct FtlBackendEvent bev = {0};
-    int *bev_status = NULL;
     if (event) {
         bev.cmd = bbm_cmd_to_backend(event->cmd);
         bev.type = bbm_type_to_backend(event->type);
@@ -303,18 +320,24 @@ int bbm_write(struct FtlBackend *fb, const struct bbm *ctx,
 
 int bbm_raw_read(struct FtlBackend *fb, const struct bbm *ctx,
              uint8_t *buffer, PseudoPpa *ppas,
-             uint64_t ppa_count, uint64_t page_size, struct BbmEvent *event)
+             uint64_t ppa_count, uint64_t page_size,
+             void *oob_buf, size_t oob_offset, size_t oob_len,
+             struct BbmEvent *event)
 {
     /* Note: buffer can be NULL for timing-only simulation (e.g., GC operations) */
     if (!fb || !ctx || !ppas || !ppa_count || !page_size) {
         return -1;
     }
     struct ppa *phys = g_malloc0(sizeof(struct ppa) * ppa_count);
+    int *bev_status = NULL;
+
+    if (!phys) {
+        return -1;
+    }
     for (uint64_t i = 0; i < ppa_count; ++i) {
         phys[i] = bbm_translate_pseudo_ppa(ctx, &ppas[i]);
     }
     struct FtlBackendEvent bev = {0};
-    int *bev_status = NULL;
     if (event) {
         bev.cmd = bbm_cmd_to_backend(event->cmd);
         bev.type = bbm_type_to_backend(event->type);
@@ -325,7 +348,9 @@ int bbm_raw_read(struct FtlBackend *fb, const struct bbm *ctx,
         }
     }
 
-    int rc = ftl_backend_raw_read(fb, buffer, phys, ppa_count, page_size, event ? &bev : NULL);
+    int rc = ftl_backend_raw_read(fb, buffer, phys, ppa_count, page_size,
+                                  oob_buf, oob_offset, oob_len,
+                                  event ? &bev : NULL);
     if (event) {
         if (ctx->policy_engine) {
             pe_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
@@ -339,19 +364,25 @@ int bbm_raw_read(struct FtlBackend *fb, const struct bbm *ctx,
 }
 
 int bbm_raw_write(struct FtlBackend *fb, const struct bbm *ctx,
-              uint8_t *buffer, PseudoPpa *ppas,
-              uint64_t ppa_count, uint64_t page_size, struct BbmEvent *event)
+             uint8_t *buffer, PseudoPpa *ppas,
+             uint64_t ppa_count, uint64_t page_size,
+             const void *oob_buf, size_t oob_offset, size_t oob_len,
+             struct BbmEvent *event)
 {
     /* Note: buffer can be NULL for timing-only simulation (e.g., GC operations) */
     if (!fb || !ctx || !ppas || !ppa_count || !page_size) {
         return -1;
     }
     struct ppa *phys = g_malloc0(sizeof(struct ppa) * ppa_count);
+    int *bev_status = NULL;
+
+    if (!phys) {
+        return -1;
+    }
     for (uint64_t i = 0; i < ppa_count; ++i) {
         phys[i] = bbm_translate_pseudo_ppa(ctx, &ppas[i]);
     }
     struct FtlBackendEvent bev = {0};
-    int *bev_status = NULL;
     if (event) {
         bev.cmd = bbm_cmd_to_backend(event->cmd);
         bev.type = bbm_type_to_backend(event->type);
@@ -362,7 +393,9 @@ int bbm_raw_write(struct FtlBackend *fb, const struct bbm *ctx,
         }
     }
 
-    int rc = ftl_backend_raw_write(fb, buffer, phys, ppa_count, page_size, event ? &bev : NULL);
+    int rc = ftl_backend_raw_write(fb, buffer, phys, ppa_count, page_size,
+                                   oob_buf, oob_offset, oob_len,
+                                   event ? &bev : NULL);
     if (event) {
         if (ctx->policy_engine) {
             pe_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
@@ -383,11 +416,15 @@ int bbm_raw_erase(struct FtlBackend *fb, const struct bbm *ctx,
         return -1;
     }
     struct pba *phys = g_malloc0(sizeof(struct pba) * blk_count);
+    int *bev_status = NULL;
+
+    if (!phys) {
+        return -1;
+    }
     for (uint64_t i = 0; i < blk_count; ++i) {
         phys[i] = bbm_get_maptbl_entry(ctx, &pbns[i]);
     }
     struct FtlBackendEvent bev = {0};
-    int *bev_status = NULL;
     if (event) {
         bev.cmd = bbm_cmd_to_backend(event->cmd);
         bev.type = bbm_type_to_backend(event->type);

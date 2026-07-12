@@ -1,13 +1,18 @@
 #include "ftl.h"
 #include "bbm.h"
 #include "policy-engine.h"
+#include <inttypes.h>
+#include <stdbool.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <openssl/evp.h>
 #include <openssl/core_names.h>
 #include <openssl/kdf.h>
 #include <openssl/params.h>
 #include <openssl/err.h>
+#include "qemu/timer.h"
 #include "meta-interface-policy.h"
 
 /* ========================================================================== */
@@ -24,6 +29,7 @@
 #define META_AUTH_TAG_SIZE 16
 #define META_ENVELOPE_AUTH_SIZE 32
 #define META_ENVELOPE_HEADER_SIZE (8 + META_ENVELOPE_AUTH_SIZE)
+#define DEVICE_TIMING_CSV_ENV "FEMU_META_DEVICE_TIMING_CSV"
 
 struct meta_policy_context {
     uint8_t session_key[32];
@@ -37,6 +43,11 @@ struct meta_policy_context {
     uint64_t active_session_counter; // This is ctr0 in the paper. This is for replay protection within the session.
     uint64_t session_counter;        // This is for replay protection of session initialization.
     uint64_t next_policy_alloc_index;
+    FILE *timing_csv;
+    uint32_t pending_attestation_policy_id;
+    uint32_t pending_attestation_report_type;
+    uint32_t pending_attestation_policy_size_bytes;
+    uint32_t pending_attestation_policy_size_pages;
     struct {
         uint32_t policy_id;
         uint32_t policy_version;
@@ -50,6 +61,145 @@ struct meta_policy_context {
 };
 
 static struct meta_policy_context *g_meta_ctx = NULL;
+
+static int open_device_timing_csv(struct meta_policy_context *ctx)
+{
+    const char *path;
+    struct stat st;
+    bool need_header = false;
+
+    if (!ctx) {
+        return -1;
+    }
+
+    path = getenv(DEVICE_TIMING_CSV_ENV);
+    if (!path || !*path) {
+        return 0;
+    }
+
+    if (stat(path, &st) != 0 || st.st_size == 0) {
+        need_header = true;
+    }
+
+    ctx->timing_csv = fopen(path, "a");
+    if (!ctx->timing_csv) {
+        return -1;
+    }
+
+    if (need_header) {
+        fprintf(ctx->timing_csv,
+                "ts_ns,command,detail,report_type,mode,policy_size_bytes,policy_size_pages,elapsed_ns\n");
+    }
+    setvbuf(ctx->timing_csv, NULL, _IOLBF, 0);
+    return 0;
+}
+
+static uint64_t device_now_ns(void)
+{
+    return (uint64_t)qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+}
+
+/* Return elapsed time since start_ns, scaled to the emulated controller
+ * frequency (cpu_scale_factor = host_mhz / ctrl_mhz). */
+static inline uint64_t device_scaled_elapsed_ns(uint64_t start_ns, struct ssd *ssd)
+{
+    return (uint64_t)((device_now_ns() - start_ns) * ssd->cpu_scale_factor);
+}
+
+static const char *device_mode_name(int mode)
+{
+    switch (mode) {
+    case SESSION_MODE_CONFIDENTIAL:
+        return "confidential";
+    case SESSION_MODE_NORMAL:
+    default:
+        return "normal";
+    }
+}
+
+static const char *device_opcode_name(uint8_t opcode)
+{
+    switch (opcode) {
+    case NVME_CMD_INIT_SESSION_SUBMIT:
+        return "session";
+    case NVME_CMD_INIT_SESSION_FETCH:
+        return "session";
+    case NVME_CMD_INSTALL_POLICY:
+        return "install";
+    case NVME_CMD_UPDATE_POLICY:
+        return "update";
+    case NVME_CMD_REMOVE_POLICY:
+        return "remove";
+    case NVME_CMD_ACTIVATE_POLICY:
+        return "activate";
+    case NVME_CMD_DEACTIVATE_POLICY:
+        return "deactivate";
+    case NVME_CMD_POLICY_ATTESTATION_SUBMIT:
+    case NVME_CMD_POLICY_ATTESTATION_FETCH:
+        return "attest";
+    default:
+        return "unknown";
+    }
+}
+
+static const char *device_detail_name(uint8_t opcode)
+{
+    switch (opcode) {
+    case NVME_CMD_INIT_SESSION_SUBMIT:
+        return "submit";
+    case NVME_CMD_INIT_SESSION_FETCH:
+        return "fetch";
+    case NVME_CMD_INSTALL_POLICY:
+    case NVME_CMD_UPDATE_POLICY:
+    case NVME_CMD_REMOVE_POLICY:
+    case NVME_CMD_ACTIVATE_POLICY:
+    case NVME_CMD_DEACTIVATE_POLICY:
+        return "submit";
+    case NVME_CMD_POLICY_ATTESTATION_SUBMIT:
+        return "submit";
+    case NVME_CMD_POLICY_ATTESTATION_FETCH:
+        return "fetch";
+    default:
+        return "";
+    }
+}
+
+static const char *device_report_type_name(uint32_t report_type)
+{
+    switch (report_type) {
+    case POLICY_ATTESTATION_REPORT_SECURITY:
+        return "security";
+    case POLICY_ATTESTATION_REPORT_CONSISTENCY:
+        return "consistency";
+    default:
+        return "";
+    }
+}
+
+static void device_timing_log(struct meta_policy_context *ctx,
+                              uint8_t opcode,
+                              const char *report_type,
+                              int mode,
+                              uint32_t policy_size_bytes,
+                              uint32_t policy_size_pages,
+                              uint64_t elapsed_ns)
+{
+    if (!ctx || !ctx->timing_csv) {
+        return;
+    }
+
+    fprintf(ctx->timing_csv,
+            "%" PRIu64 ",%s,%s,%s,%s,%u,%u,%" PRIu64 "\n",
+            device_now_ns(),
+            device_opcode_name(opcode),
+            device_detail_name(opcode),
+            report_type ? report_type : "",
+            device_mode_name(mode),
+            policy_size_bytes,
+            policy_size_pages,
+            elapsed_ns);
+    fflush(ctx->timing_csv);
+}
 
 struct meta_encrypted_request {
     uint64_t counter;
@@ -512,7 +662,7 @@ static bool verify_admin_signature(const uint8_t *message, size_t message_len,
     EVP_PKEY *pkey = NULL;
     EVP_MD_CTX *md_ctx = NULL;
     bool result = false;
-
+    
     /* Create public key from raw bytes */
     pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, ADMIN_PUBLIC_KEY, 32);
     if (!pkey) {
@@ -981,15 +1131,17 @@ static uint64_t install_policy_callback(struct ssd *ssd, struct NvmeCommandEvent
                                         struct FtlPolicyAPI *api, void *context)
 {
     struct meta_policy_context *ctx = (struct meta_policy_context *)context;
+    uint64_t start_ns = device_now_ns();
     uint8_t *plaintext = NULL;
     size_t plaintext_len = 0;
-    uint32_t policy_id;
-    uint32_t policy_version;
-    uint32_t policy_size_bytes;
+    uint32_t policy_id = 0;
+    uint32_t policy_version = 0;
+    uint32_t policy_size_bytes = 0;
+    uint32_t policy_size_pages = 0;
     uint32_t page_size = page_size_bytes(ssd);
     uint32_t ppb = pages_per_block(ssd);
-    uint32_t page_count;
-    uint32_t block_count;
+    uint32_t page_count = 0;
+    uint32_t block_count = 0;
     uint8_t *payload = NULL;
     struct pba *blocks = NULL;
     int slot;
@@ -997,7 +1149,7 @@ static uint64_t install_policy_callback(struct ssd *ssd, struct NvmeCommandEvent
                                   NULL,
                                   &plaintext, &plaintext_len) != 0) {
         event->status = NVME_INVALID_FIELD | NVME_DNR;
-        return 0;
+        goto cleanup;
     }
     if (plaintext_len < 12) {
         event->status = NVME_INVALID_FIELD | NVME_DNR;
@@ -1030,6 +1182,7 @@ static uint64_t install_policy_callback(struct ssd *ssd, struct NvmeCommandEvent
 
     page_count = (policy_size_bytes + page_size - 1) / page_size;
     block_count = (page_count + ppb - 1) / ppb;
+    policy_size_pages = page_count;
 
     payload = g_malloc0(policy_size_bytes);
     memcpy(payload, plaintext + 12, policy_size_bytes);
@@ -1072,6 +1225,10 @@ static uint64_t install_policy_callback(struct ssd *ssd, struct NvmeCommandEvent
     g_free(payload);
     event->status = NVME_SUCCESS;
 cleanup:
+    device_timing_log(ctx, event->opcode, "",
+                      ctx ? ctx->mode : SESSION_MODE_NORMAL,
+                      policy_size_bytes, policy_size_pages,
+                      device_scaled_elapsed_ns(start_ns, ssd));
     if (plaintext) {
         OPENSSL_cleanse(plaintext, plaintext_len);
         g_free(plaintext);
@@ -1148,9 +1305,13 @@ static uint64_t update_policy_callback(struct ssd *ssd,
                                        void *context)
 {
     struct meta_policy_context *ctx = (struct meta_policy_context *)context;
+    uint64_t start_ns = device_now_ns();
     uint8_t *plaintext = NULL;
     size_t plaintext_len = 0;
-    uint32_t policy_id;
+    uint32_t policy_id = 0;
+    uint32_t policy_version = 0;
+    uint32_t policy_size_bytes = 0;
+    uint32_t policy_size_pages = 0;
     int slot;
 
     (void)api;
@@ -1159,12 +1320,10 @@ static uint64_t update_policy_callback(struct ssd *ssd,
                                              &plaintext, &plaintext_len,
                                              &policy_id, &slot) != 0) {
         event->status = NVME_INVALID_FIELD | NVME_DNR;
-        return 0;
+        goto cleanup;
     }
 
     {
-        uint32_t policy_version;
-        uint32_t policy_size_bytes;
         uint32_t page_size = page_size_bytes(ssd);
         uint32_t ppb = pages_per_block(ssd);
         uint32_t page_count;
@@ -1193,6 +1352,7 @@ static uint64_t update_policy_callback(struct ssd *ssd,
 
         page_count = (policy_size_bytes + page_size - 1) / page_size;
         block_count = (page_count + ppb - 1) / ppb;
+        policy_size_pages = page_count;
 
         payload = g_malloc0(policy_size_bytes);
         memcpy(payload, plaintext + 12, policy_size_bytes);
@@ -1244,6 +1404,10 @@ update_cleanup:
     }
 
 cleanup:
+    device_timing_log(ctx, event->opcode, "",
+                      ctx ? ctx->mode : SESSION_MODE_NORMAL,
+                      policy_size_bytes, policy_size_pages,
+                      device_scaled_elapsed_ns(start_ns, ssd));
     if (plaintext) {
         OPENSSL_cleanse(plaintext, plaintext_len);
         g_free(plaintext);
@@ -1266,9 +1430,12 @@ static uint64_t remove_policy_callback(struct ssd *ssd,
                                        void *context)
 {
     struct meta_policy_context *ctx = (struct meta_policy_context *)context;
+    uint64_t start_ns = device_now_ns();
     uint8_t *plaintext = NULL;
     size_t plaintext_len = 0;
-    uint32_t policy_id;
+    uint32_t policy_id = 0;
+    uint32_t policy_size_bytes = 0;
+    uint32_t policy_size_pages = 0;
     int slot;
 
     (void)api;
@@ -1277,12 +1444,14 @@ static uint64_t remove_policy_callback(struct ssd *ssd,
                                              &plaintext, &plaintext_len,
                                              &policy_id, &slot) != 0) {
         event->status = NVME_INVALID_FIELD | NVME_DNR;
-        return 0;
+        goto cleanup;
     }
     if (plaintext_len != 4) {
         event->status = NVME_INVALID_FIELD | NVME_DNR;
         goto cleanup;
     }
+    policy_size_bytes = ctx->installed_policies[slot].policy_size_bytes;
+    policy_size_pages = ctx->installed_policies[slot].policy_size_pages;
     if (reclaim_policy_storage(ssd,
                                ctx->installed_policies[slot].blocks,
                                ctx->installed_policies[slot].block_count) != 0) {
@@ -1295,6 +1464,10 @@ static uint64_t remove_policy_callback(struct ssd *ssd,
     event->status = NVME_SUCCESS;
 
 cleanup:
+    device_timing_log(ctx, event->opcode, "",
+                      ctx ? ctx->mode : SESSION_MODE_NORMAL,
+                      policy_size_bytes, policy_size_pages,
+                      device_scaled_elapsed_ns(start_ns, ssd));
     if (plaintext) {
         OPENSSL_cleanse(plaintext, plaintext_len);
         g_free(plaintext);
@@ -1317,9 +1490,12 @@ static uint64_t activate_policy_callback(struct ssd *ssd, struct NvmeCommandEven
                                          struct FtlPolicyAPI *api, void *context)
 {
     struct meta_policy_context *ctx = (struct meta_policy_context *)context;
+    uint64_t start_ns = device_now_ns();
     uint8_t *plaintext = NULL;
     size_t plaintext_len = 0;
-    uint32_t policy_id;
+    uint32_t policy_id = 0;
+    uint32_t policy_size_bytes = 0;
+    uint32_t policy_size_pages = 0;
     int slot;
 
     (void)api;
@@ -1328,7 +1504,7 @@ static uint64_t activate_policy_callback(struct ssd *ssd, struct NvmeCommandEven
                                   NULL,
                                   &plaintext, &plaintext_len) != 0) {
         event->status = NVME_INVALID_FIELD | NVME_DNR;
-        return 0;
+        goto cleanup;
     }
     if (plaintext_len != 4) {
         event->status = NVME_INVALID_FIELD | NVME_DNR;
@@ -1346,6 +1522,8 @@ static uint64_t activate_policy_callback(struct ssd *ssd, struct NvmeCommandEven
         event->status = NVME_INVALID_FIELD | NVME_DNR;
         goto cleanup;
     }
+    policy_size_bytes = ctx->installed_policies[slot].policy_size_bytes;
+    policy_size_pages = ctx->installed_policies[slot].policy_size_pages;
 
     if (event->opcode == NVME_CMD_ACTIVATE_POLICY) {
         struct policy_storage_desc desc;
@@ -1378,6 +1556,10 @@ static uint64_t activate_policy_callback(struct ssd *ssd, struct NvmeCommandEven
 
     event->status = NVME_SUCCESS;
 cleanup:
+    device_timing_log(ctx, event->opcode, "",
+                      ctx ? ctx->mode : SESSION_MODE_NORMAL,
+                      policy_size_bytes, policy_size_pages,
+                      device_scaled_elapsed_ns(start_ns, ssd));
     if (plaintext) {
         OPENSSL_cleanse(plaintext, plaintext_len);
         g_free(plaintext);
@@ -1472,11 +1654,14 @@ static uint64_t policy_attestation_callback(struct ssd *ssd,
                                             void *context)
 {
     struct meta_policy_context *ctx = (struct meta_policy_context *)context;
+    uint64_t start_ns = device_now_ns();
     uint8_t *plaintext = NULL;
     size_t plaintext_len = 0;
     uint64_t request_counter = 0;
-    uint32_t policy_id;
-    uint32_t report_type;
+    uint32_t policy_id = 0;
+    uint32_t report_type = 0;
+    uint32_t policy_size_bytes = 0;
+    uint32_t policy_size_pages = 0;
     int slot;
     struct policy_attestation_report report = {0};
     uint8_t response_plaintext[POLICY_ATTESTATION_RESPONSE_PLAINTEXT_SIZE];
@@ -1488,7 +1673,7 @@ static uint64_t policy_attestation_callback(struct ssd *ssd,
     if (event->opcode == NVME_CMD_POLICY_ATTESTATION_FETCH) {
         if (!ctx->pending_attestation_response_valid) {
             event->status = NVME_INVALID_FIELD | NVME_DNR;
-            return 0;
+            goto cleanup;
         }
 
         event->status = api->write_cmd_buffer(
@@ -1496,18 +1681,22 @@ static uint64_t policy_attestation_callback(struct ssd *ssd,
             ctx->pending_attestation_response,
             sizeof(ctx->pending_attestation_response));
         if (event->status != NVME_SUCCESS) {
-            return 0;
+            goto cleanup;
         }
 
         ctx->pending_attestation_response_valid = false;
         event->status = NVME_SUCCESS;
-        return 0;
+        policy_id = ctx->pending_attestation_policy_id;
+        report_type = ctx->pending_attestation_report_type;
+        policy_size_bytes = ctx->pending_attestation_policy_size_bytes;
+        policy_size_pages = ctx->pending_attestation_policy_size_pages;
+        goto cleanup;
     }
 
     if (authenticate_meta_request(ctx, event, api, &request_counter,
                                   &plaintext, &plaintext_len) != 0) {
         event->status = NVME_INVALID_FIELD | NVME_DNR;
-        return 0;
+        goto cleanup;
     }
     if (plaintext_len != POLICY_ATTESTATION_REQUEST_PLAINTEXT_SIZE) {
         event->status = NVME_INVALID_FIELD | NVME_DNR;
@@ -1534,6 +1723,8 @@ static uint64_t policy_attestation_callback(struct ssd *ssd,
 
     if (report_type == POLICY_ATTESTATION_REPORT_CONSISTENCY && slot >= 0) {
         fill_policy_storage_desc(ctx, slot, &desc);
+        policy_size_bytes = desc.policy_size_bytes;
+        policy_size_pages = (desc.policy_size_bytes + page_size_bytes(ssd) - 1) / page_size_bytes(ssd);
         if (pe_read_policy_payload(ssd, &desc, &policy_payload) != 0) {
             event->status = NVME_DATA_TRAS_ERROR | NVME_DNR;
             goto cleanup;
@@ -1564,9 +1755,17 @@ static uint64_t policy_attestation_callback(struct ssd *ssd,
 
     memcpy(ctx->pending_attestation_response, response, response_len);
     ctx->pending_attestation_response_valid = true;
+    ctx->pending_attestation_policy_id = policy_id;
+    ctx->pending_attestation_report_type = report_type;
+    ctx->pending_attestation_policy_size_bytes = policy_size_bytes;
+    ctx->pending_attestation_policy_size_pages = policy_size_pages;
     event->status = NVME_SUCCESS;
 
 cleanup:
+    device_timing_log(ctx, event->opcode, device_report_type_name(report_type),
+                      ctx ? ctx->mode : SESSION_MODE_NORMAL,
+                      policy_size_bytes, policy_size_pages,
+                      device_scaled_elapsed_ns(start_ns, ssd));
     OPENSSL_cleanse(response_plaintext, sizeof(response_plaintext));
     if (policy_payload) {
         OPENSSL_cleanse(policy_payload, desc.policy_size_bytes);
@@ -1597,6 +1796,7 @@ static uint64_t init_session_callback(struct ssd *ssd, struct NvmeCommandEvent *
 {
     (void)ssd;
     struct meta_policy_context *ctx = (struct meta_policy_context *)context;
+    uint64_t start_ns = device_now_ns();
     uint8_t request[INIT_SESSION_REQUEST_SIZE];
     uint8_t response[INIT_SESSION_RESPONSE_SIZE];
     uint8_t admin_init_message[1 + 32 + 1 + 8];
@@ -1605,12 +1805,14 @@ static uint64_t init_session_callback(struct ssd *ssd, struct NvmeCommandEvent *
     const uint8_t *admin_ephem_pub;
     uint8_t session_mode;
     uint64_t counter;
+    int mode_for_log = SESSION_MODE_NORMAL;
+    uint64_t elapsed_ns;
     
     if (event->opcode == NVME_CMD_INIT_SESSION_SUBMIT) {
         /* Read request: admin_ephem_pub (32) + mode (1) + counter (8) + admin_sig (64). */
         event->status = api->read_cmd_buffer(event, request, INIT_SESSION_REQUEST_SIZE);
         if (event->status != NVME_SUCCESS) {
-            return 0;
+            goto cleanup;
         }
 
         admin_ephem_pub = request;
@@ -1620,19 +1822,19 @@ static uint64_t init_session_callback(struct ssd *ssd, struct NvmeCommandEvent *
         if (session_mode != SESSION_MODE_NORMAL &&
             session_mode != SESSION_MODE_CONFIDENTIAL) {
             event->status = NVME_INVALID_FIELD | NVME_DNR;
-            return 0;
+            goto cleanup;
         }
 
         if (counter <= ctx->session_counter) {
             event->status = NVME_INVALID_FIELD | NVME_DNR;
-            return 0;
+            goto cleanup;
         }
 
         /* Verify the admin signed the transcript fragment that carries the replay counter. */
         build_admin_init_message(admin_ephem_pub, session_mode, counter, admin_init_message);
         if (!verify_admin_signature(admin_init_message, sizeof(admin_init_message), request + 41)) {
             event->status = NVME_INVALID_OPCODE | NVME_DNR;
-            return 0;
+            goto cleanup;
         }
 
         /* Generate SSD ephemeral key (TODO: real X25519) */
@@ -1658,24 +1860,33 @@ static uint64_t init_session_callback(struct ssd *ssd, struct NvmeCommandEvent *
         ctx->active_session_counter = 0;
         ctx->pending_attestation_response_valid = false;
         ctx->session_established = true;
+        mode_for_log = session_mode;
     } else if (event->opcode == NVME_CMD_INIT_SESSION_FETCH) {
         if (!ctx->pending_response_valid) {
             event->status = NVME_INVALID_FIELD | NVME_DNR;
-            return 0;
+            goto cleanup;
         }
 
         event->status = api->write_cmd_buffer(event, ctx->pending_response,
                                               INIT_SESSION_RESPONSE_SIZE);
         if (event->status != NVME_SUCCESS) {
-            return 0;
+            goto cleanup;
         }
         ctx->pending_response_valid = false;
+        mode_for_log = ctx->mode;
     } else {
         event->status = NVME_INVALID_OPCODE | NVME_DNR;
-        return 0;
+        goto cleanup;
     }
 
     event->status = NVME_SUCCESS;
+cleanup:
+    elapsed_ns = device_scaled_elapsed_ns(start_ns, ssd);
+    if (event->opcode == NVME_CMD_INIT_SESSION_SUBMIT) {
+        device_timing_log(ctx, event->opcode, "", mode_for_log, 0, 0, elapsed_ns);
+    } else {
+        device_timing_log(ctx, event->opcode, "", mode_for_log, 0, 0, elapsed_ns);
+    }
     return 0;
 }
 
@@ -1691,12 +1902,23 @@ int m_interface_policy_init(struct ssd *ssd)
     ctx->pending_response_valid = false;
     ctx->pending_attestation_response_valid = false;
     ctx->session_counter = 0;
-
-    g_meta_ctx = ctx;
+    ctx->pending_attestation_policy_id = 0;
+    ctx->pending_attestation_report_type = 0;
+    ctx->pending_attestation_policy_size_bytes = 0;
+    ctx->pending_attestation_policy_size_pages = 0;
 
     if (!api) {
+        g_free(ctx);
         return -1;
     }
+
+    if (open_device_timing_csv(ctx) != 0) {
+        fprintf(stderr, "[Meta] Failed to open device timing CSV\n");
+        g_free(ctx);
+        return -1;
+    }
+
+    g_meta_ctx = ctx;
 
     if (api->register_admin_hook(ssd, NVME_CMD_INIT_SESSION_SUBMIT,
                                init_session_condition,

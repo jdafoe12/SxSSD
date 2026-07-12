@@ -2,16 +2,10 @@
 # Huaicheng Li <huaicheng@cs.uchicago.edu>
 # Run FEMU as a black-box SSD (FTL managed by the device)
 
-# Override with:
-#   FEMU_IMAGE_DIR=/path/to/images
-#   FEMU_OS_IMAGE=/path/to/u20s.qcow2
-#   FEMU_HOST_RESULTS_DIR=/path/to/results
-#   FEMU_STATS_DIR=/path/to/results/stats
-#   FEMU_META_DEVICE_TIMING_CSV=/path/to/device_timing.csv
 # image directory
-IMGDIR="${FEMU_IMAGE_DIR:-$HOME/images}"
+IMGDIR=$HOME/images
 # Virtual machine disk image
-OSIMGF="${FEMU_OS_IMAGE:-$IMGDIR/u20s.qcow2}"
+OSIMGF=$IMGDIR/u20s.qcow2
 
 # Configurable SSD Controller layout parameters (must be power of 2)
 secsz=512 # sector size in bytes
@@ -83,7 +77,7 @@ if [[ ! -e "$OSIMGF" ]]; then
 	exit
 fi
 
-sudo env FEMU_STATS_DIR="${FEMU_STATS_DIR}" FEMU_META_DEVICE_TIMING_CSV="${FEMU_META_DEVICE_TIMING_CSV:-}" ./qemu-system-x86_64 \
+sudo env FEMU_STATS_DIR="${FEMU_STATS_DIR}" ./qemu-system-x86_64 \
     -name "FEMU-BBSSD-VM" \
     -enable-kvm \
     -cpu host \

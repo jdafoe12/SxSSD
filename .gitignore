@@ -1,0 +1,24 @@
+# Build outputs
+build/
+build-femu/
+FEMU-SxSSD/build/
+FEMU-SxSSD/build-femu/
+FEMU/build/
+FEMU/build-femu/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Generated evaluation data
+results/
+*.iolog
+FEMU-SxSSD/hw/femu/bbssd/workload-eval/workload_sets/results/
+FEMU/hw/femu/bbssd/workload-eval/workload_sets/results/
+device_timing.csv
+policyctl_timing.csv
+
+# Local VM images and editor files
+*.qcow2
+.DS_Store
+*~

@@ -61,9 +61,10 @@ echo ${FEMU_OPTIONS}
 #   sudo mkdir -p /mnt/femu-host-results
 #   sudo mount -t 9p -o trans=virtio,version=9p2000.L femu_host_results /mnt/femu-host-results
 if [[ -z "${FEMU_HOST_RESULTS_DIR:-}" ]]; then
-    FEMU_HOST_RESULTS_DIR="$(realpath "$(dirname "$0")/../hw/femu/bbssd/workload-eval/workload_sets/results")"
+    FEMU_HOST_RESULTS_DIR="${HOME}/femu-results"
 fi
 mkdir -p "$FEMU_HOST_RESULTS_DIR"
+FEMU_HOST_RESULTS_DIR="$(realpath "$FEMU_HOST_RESULTS_DIR")"
 echo "FEMU host results dir: $FEMU_HOST_RESULTS_DIR"
 
 # Stats output directory: FEMU writes stats_<run_id>.json here directly (host-side path).

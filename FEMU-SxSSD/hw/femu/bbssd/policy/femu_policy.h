@@ -274,6 +274,14 @@ struct FtlMigrationCallbacks {
 
 struct FtlPolicyAPI {
     uint32_t version;
+    /* Sign only the fixed, domain-separated policy key-bootstrap transcript:
+       "SxSSD-Policy-Key-Bootstrap-v1" || owner_nonce[32] ||
+       owner_ephemeral_public_key[32] || policy_ephemeral_public_key[32]. */
+    int (*sign_key_bootstrap)(
+        const uint8_t owner_nonce[32],
+        const uint8_t owner_ephemeral_public_key[32],
+        const uint8_t policy_ephemeral_public_key[32],
+        uint8_t signature[64]);
     struct eswd *(*get_eswd_by_id)(struct ssd *ssd, uint32_t eswd_id);
     struct eswd *(*get_eswd_by_ppa)(struct ssd *ssd, PseudoPpa *ppa);
     void (*get_eswd_vpc_ipc)(struct ssd *ssd, uint32_t eswd_id, int *vpc, int *ipc);

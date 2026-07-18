@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -Wall -Wextra -O2 -fPIC -I. -Iinc
 POLICY_LDFLAGS = -shared
 
-POLICIES = block-interface-policy-eval.so block-interface-policy-baseline.so block-interface-policy-flashguard.so block-interface-flashguard-policy.so zns-policy.so
+POLICIES = block-interface-policy-eval.so block-interface-policy-baseline.so block-interface-policy-flashguard.so block-interface-flashguard-policy.so zns-policy.so signing-test-policy.so key-sharing-policy.so
 
 .PHONY: all clean
 .PHONY: tool
@@ -27,6 +27,12 @@ block-interface-flashguard-policy.so: block-interface-flashguard-policy.c $(BLOC
 
 zns-policy.so: zns-policy.c zns-policy.h femu_policy.h
 	$(CC) $(CFLAGS) $(POLICY_LDFLAGS) -o $@ zns-policy.c
+
+signing-test-policy.so: signing-test-policy.c femu_policy.h
+	$(CC) $(CFLAGS) $(POLICY_LDFLAGS) -o $@ signing-test-policy.c
+
+key-sharing-policy.so: key-sharing-policy.c key-sharing.h femu_policy.h
+	$(CC) $(CFLAGS) $(POLICY_LDFLAGS) -o $@ key-sharing-policy.c
 
 clean:
 	rm -f $(POLICIES)

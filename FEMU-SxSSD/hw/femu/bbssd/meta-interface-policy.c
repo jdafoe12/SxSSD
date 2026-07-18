@@ -1,6 +1,8 @@
 #include "ftl.h"
 #include "bbm.h"
+#include "device-signing.h"
 #include "policy-engine.h"
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <openssl/evp.h>
@@ -8,13 +10,8 @@
 #include <openssl/kdf.h>
 #include <openssl/params.h>
 #include <openssl/err.h>
+#include <openssl/rand.h>
 #include "meta-interface-policy.h"
-
-/* ========================================================================== */
-/* SSD/FTL Private Key (for proving identity during INIT_SESSION) */
-/* ========================================================================== */
-
-
 
 /* ========================================================================== */
 /* Type Definitions */
@@ -25,11 +22,28 @@
 #define META_ENVELOPE_AUTH_SIZE 32
 #define META_ENVELOPE_HEADER_SIZE (8 + META_ENVELOPE_AUTH_SIZE)
 
+struct policy_history_record {
+    uint8_t operation;
+    uint32_t policy_id;
+    uint32_t generation;
+};
+
+struct policy_generation_record {
+    uint32_t policy_id;
+    uint32_t last_generation;
+};
+
+struct prepared_history_record {
+    struct policy_history_record record;
+    uint8_t next_head[POLICY_ATTESTATION_HASH_SIZE];
+};
+
 struct meta_policy_context {
     uint8_t session_key[32];
     uint8_t pending_response[INIT_SESSION_RESPONSE_SIZE];
-    uint8_t pending_attestation_response[META_ENVELOPE_HEADER_SIZE +
-                                         POLICY_ATTESTATION_RESPONSE_PLAINTEXT_SIZE];
+    uint8_t *pending_attestation_response;
+    size_t pending_attestation_response_len;
+    size_t pending_attestation_fetch_offset;
     bool session_established;
     bool pending_response_valid;
     bool pending_attestation_response_valid;
@@ -37,9 +51,18 @@ struct meta_policy_context {
     uint64_t active_session_counter; // This is ctr0 in the paper. This is for replay protection within the session.
     uint64_t session_counter;        // This is for replay protection of session initialization.
     uint64_t next_policy_alloc_index;
+    uint8_t boot_epoch[POLICY_ATTESTATION_BOOT_EPOCH_SIZE];
+    uint8_t history_head[POLICY_ATTESTATION_HASH_SIZE];
+    struct policy_history_record *history;
+    size_t history_count;
+    size_t history_capacity;
+    struct policy_generation_record *generations;
+    size_t generation_count;
+    size_t generation_capacity;
     struct {
         uint32_t policy_id;
         uint32_t policy_version;
+        uint32_t generation;
         uint32_t policy_size_bytes;
         uint32_t policy_size_pages;
         uint32_t block_count;
@@ -56,15 +79,6 @@ struct meta_encrypted_request {
     uint8_t auth[META_ENVELOPE_AUTH_SIZE];
     const uint8_t *ciphertext;
     size_t ciphertext_len;
-};
-
-struct policy_attestation_report {
-    uint32_t policy_id;
-    uint32_t report_type;
-    uint8_t installed;
-    uint8_t active;
-    uint8_t reserved[2];
-    uint8_t hash[POLICY_ATTESTATION_RESPONSE_HASH_SIZE];
 };
 
 static void encode_u64_le(uint64_t value, uint8_t out[8])
@@ -101,6 +115,196 @@ static void encode_u32_le(uint32_t value, uint8_t out[4])
     for (size_t i = 0; i < 4; i++) {
         out[i] = (uint8_t)(value >> (8 * i));
     }
+}
+
+static int reserve_array(void **array, size_t element_size,
+                         size_t *capacity, size_t needed)
+{
+    size_t new_capacity;
+    void *new_array;
+
+    if (needed <= *capacity) {
+        return 0;
+    }
+
+    new_capacity = *capacity ? *capacity : 16;
+    while (new_capacity < needed) {
+        if (new_capacity > SIZE_MAX / 2) {
+            new_capacity = needed;
+            break;
+        }
+        new_capacity *= 2;
+    }
+    if (element_size != 0 && new_capacity > SIZE_MAX / element_size) {
+        return -1;
+    }
+
+    new_array = g_try_realloc_n(*array, new_capacity, element_size);
+    if (!new_array) {
+        return -1;
+    }
+    *array = new_array;
+    *capacity = new_capacity;
+    return 0;
+}
+
+static int sha256_parts(const uint8_t *part1, size_t part1_len,
+                        const uint8_t *part2, size_t part2_len,
+                        const uint8_t *part3, size_t part3_len,
+                        uint8_t out[POLICY_ATTESTATION_HASH_SIZE])
+{
+    EVP_MD_CTX *md_ctx = NULL;
+    unsigned int digest_len = 0;
+    int rc = -1;
+
+    md_ctx = EVP_MD_CTX_new();
+    if (!md_ctx || EVP_DigestInit_ex(md_ctx, EVP_sha256(), NULL) != 1) {
+        goto cleanup;
+    }
+    if ((part1_len && EVP_DigestUpdate(md_ctx, part1, part1_len) != 1) ||
+        (part2_len && EVP_DigestUpdate(md_ctx, part2, part2_len) != 1) ||
+        (part3_len && EVP_DigestUpdate(md_ctx, part3, part3_len) != 1) ||
+        EVP_DigestFinal_ex(md_ctx, out, &digest_len) != 1 ||
+        digest_len != POLICY_ATTESTATION_HASH_SIZE) {
+        goto cleanup;
+    }
+    rc = 0;
+
+cleanup:
+    EVP_MD_CTX_free(md_ctx);
+    if (rc != 0) {
+        memset(out, 0, POLICY_ATTESTATION_HASH_SIZE);
+    }
+    return rc;
+}
+
+static int initialize_history_head(struct meta_policy_context *ctx)
+{
+    static const uint8_t domain[] = "SxSSD-History-Root-v1";
+
+    return sha256_parts(domain, sizeof(domain) - 1,
+                        ctx->boot_epoch, sizeof(ctx->boot_epoch),
+                        NULL, 0, ctx->history_head);
+}
+
+static int compute_next_history_head(
+    const struct meta_policy_context *ctx,
+    const struct policy_history_record *record,
+    uint8_t next_head[POLICY_ATTESTATION_HASH_SIZE])
+{
+    static const uint8_t domain[] = "SxSSD-History-Event-v1";
+    uint8_t encoded[8 + POLICY_ATTESTATION_HISTORY_RECORD_SIZE];
+    uint64_t sequence;
+
+    if (ctx->history_count == SIZE_MAX ||
+        (uint64_t)ctx->history_count == UINT64_MAX) {
+        return -1;
+    }
+
+    sequence = (uint64_t)ctx->history_count + 1;
+    encode_u64_le(sequence, encoded);
+    encoded[8] = record->operation;
+    encode_u32_le(record->policy_id, encoded + 9);
+    encode_u32_le(record->generation, encoded + 13);
+
+    return sha256_parts(domain, sizeof(domain) - 1,
+                        ctx->history_head, sizeof(ctx->history_head),
+                        encoded, sizeof(encoded), next_head);
+}
+
+static int prepare_history_record(struct meta_policy_context *ctx,
+                                  uint8_t operation, uint32_t policy_id,
+                                  uint32_t generation,
+                                  struct prepared_history_record *prepared)
+{
+    if (!ctx || !prepared || policy_id == 0 || generation == 0 ||
+        operation < POLICY_HISTORY_OP_INSTALL ||
+        operation > POLICY_HISTORY_OP_REMOVE ||
+        reserve_array((void **)&ctx->history, sizeof(*ctx->history),
+                      &ctx->history_capacity, ctx->history_count + 1) != 0) {
+        return -1;
+    }
+
+    prepared->record.operation = operation;
+    prepared->record.policy_id = policy_id;
+    prepared->record.generation = generation;
+    return compute_next_history_head(ctx, &prepared->record,
+                                     prepared->next_head);
+}
+
+static void commit_history_record(struct meta_policy_context *ctx,
+                                  const struct prepared_history_record *prepared)
+{
+    ctx->history[ctx->history_count++] = prepared->record;
+    memcpy(ctx->history_head, prepared->next_head,
+           sizeof(ctx->history_head));
+}
+
+static int find_generation_record(const struct meta_policy_context *ctx,
+                                  uint32_t policy_id)
+{
+    size_t i;
+
+    for (i = 0; i < ctx->generation_count; i++) {
+        if (ctx->generations[i].policy_id == policy_id) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static int prepare_next_generation(struct meta_policy_context *ctx,
+                                   uint32_t policy_id, size_t *index_out,
+                                   uint32_t *generation_out, bool *new_out)
+{
+    int index;
+    uint32_t previous = 0;
+
+    index = find_generation_record(ctx, policy_id);
+    if (index >= 0) {
+        previous = ctx->generations[index].last_generation;
+        *index_out = (size_t)index;
+        *new_out = false;
+    } else {
+        if (reserve_array((void **)&ctx->generations,
+                          sizeof(*ctx->generations),
+                          &ctx->generation_capacity,
+                          ctx->generation_count + 1) != 0) {
+            return -1;
+        }
+        *index_out = ctx->generation_count;
+        *new_out = true;
+    }
+
+    if (previous == UINT32_MAX) {
+        return -1;
+    }
+    *generation_out = previous + 1;
+    return 0;
+}
+
+static void commit_generation(struct meta_policy_context *ctx, size_t index,
+                              bool is_new, uint32_t policy_id,
+                              uint32_t generation)
+{
+    ctx->generations[index].policy_id = policy_id;
+    ctx->generations[index].last_generation = generation;
+    if (is_new) {
+        ctx->generation_count++;
+    }
+}
+
+static void clear_pending_attestation(struct meta_policy_context *ctx)
+{
+    if (ctx->pending_attestation_response) {
+        OPENSSL_cleanse(ctx->pending_attestation_response,
+                        ctx->pending_attestation_response_len);
+        g_free(ctx->pending_attestation_response);
+    }
+    ctx->pending_attestation_response = NULL;
+    ctx->pending_attestation_response_len = 0;
+    ctx->pending_attestation_fetch_offset = 0;
+    ctx->pending_attestation_response_valid = false;
 }
 
 static void build_meta_nonce(uint64_t counter, uint8_t nonce[12])
@@ -261,59 +465,8 @@ cleanup:
     return rc;
 }
 
-static int aes256_gcm_encrypt(const uint8_t key[32], uint64_t counter,
-                              uint8_t opcode, const uint8_t *plaintext,
-                              size_t plaintext_len, uint8_t *ciphertext,
-                              uint8_t tag[16])
-{
-    EVP_CIPHER_CTX *ctx = NULL;
-    uint8_t nonce[12];
-    int len = 0;
-    int out_len = 0;
-    int rc = -1;
-
-    build_meta_nonce(counter, nonce);
-    ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        return -1;
-    }
-
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) {
-        goto cleanup;
-    }
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, (int)sizeof(nonce), NULL) != 1) {
-        goto cleanup;
-    }
-    if (EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) {
-        goto cleanup;
-    }
-    if (EVP_EncryptUpdate(ctx, NULL, &len, &opcode, 1) != 1) {
-        goto cleanup;
-    }
-    if (plaintext_len > 0 &&
-        EVP_EncryptUpdate(ctx, ciphertext, &len, plaintext, (int)plaintext_len) != 1) {
-        goto cleanup;
-    }
-    out_len += len;
-    if (EVP_EncryptFinal_ex(ctx, ciphertext + out_len, &len) != 1) {
-        goto cleanup;
-    }
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, META_AUTH_TAG_SIZE, tag) != 1) {
-        goto cleanup;
-    }
-
-    rc = 0;
-
-cleanup:
-    OPENSSL_cleanse(nonce, sizeof(nonce));
-    if (ctx) {
-        EVP_CIPHER_CTX_free(ctx);
-    }
-    return rc;
-}
-
 static int compute_policy_sha256(const uint8_t *payload, size_t payload_len,
-                                 uint8_t out[POLICY_ATTESTATION_RESPONSE_HASH_SIZE])
+                                 uint8_t out[POLICY_ATTESTATION_HASH_SIZE])
 {
     EVP_MD_CTX *md_ctx = NULL;
     unsigned int digest_len = 0;
@@ -334,7 +487,7 @@ static int compute_policy_sha256(const uint8_t *payload, size_t payload_len,
         goto cleanup;
     }
     if (EVP_DigestFinal_ex(md_ctx, out, &digest_len) != 1 ||
-        digest_len != POLICY_ATTESTATION_RESPONSE_HASH_SIZE) {
+        digest_len != POLICY_ATTESTATION_HASH_SIZE) {
         goto cleanup;
     }
 
@@ -345,7 +498,7 @@ cleanup:
         EVP_MD_CTX_free(md_ctx);
     }
     if (rc != 0) {
-        memset(out, 0, POLICY_ATTESTATION_RESPONSE_HASH_SIZE);
+        memset(out, 0, POLICY_ATTESTATION_HASH_SIZE);
     }
     return rc;
 }
@@ -593,51 +746,6 @@ cleanup:
     }
     if (pctx) {
         EVP_PKEY_CTX_free(pctx);
-    }
-}
-
-/* Ed25519 signature generation using SSD_PRIVATE_KEY */
-static void sign_with_ssd_private_key(const uint8_t *message, size_t message_len,
-                                     uint8_t *sig_out)
-{
-    EVP_PKEY *pkey = NULL;
-    EVP_MD_CTX *md_ctx = NULL;
-    size_t sig_len = 64;
-    
-    /* Create private key from raw bytes */
-    pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, SSD_PRIVATE_KEY, 32);
-    if (!pkey) {
-        goto error;
-    }
-    
-    /* Create message digest context */
-    md_ctx = EVP_MD_CTX_new();
-    if (!md_ctx) {
-        goto error;
-    }
-    
-    /* Initialize signing (NULL digest for Ed25519) */
-    if (EVP_DigestSignInit(md_ctx, NULL, NULL, NULL, pkey) != 1) {
-        goto error;
-    }
-    
-    /* Sign message (one-shot for Ed25519) */
-    if (EVP_DigestSign(md_ctx, sig_out, &sig_len, message, message_len) != 1 || sig_len != 64) {
-        goto error;
-    }
-    
-    goto cleanup;
-    
-error:
-    /* On error, zero the signature output */
-    memset(sig_out, 0, 64);
-    
-cleanup:
-    if (md_ctx) {
-        EVP_MD_CTX_free(md_ctx);
-    }
-    if (pkey) {
-        EVP_PKEY_free(pkey);
     }
 }
 
@@ -992,6 +1100,10 @@ static uint64_t install_policy_callback(struct ssd *ssd, struct NvmeCommandEvent
     uint32_t block_count;
     uint8_t *payload = NULL;
     struct pba *blocks = NULL;
+    struct prepared_history_record prepared_history;
+    size_t generation_index;
+    uint32_t generation;
+    bool new_generation_record;
     int slot;
     if (authenticate_meta_request(ctx, event, api,
                                   NULL,
@@ -1028,6 +1140,14 @@ static uint64_t install_policy_callback(struct ssd *ssd, struct NvmeCommandEvent
         goto cleanup;
     }
 
+    if (prepare_next_generation(ctx, policy_id, &generation_index,
+                                &generation, &new_generation_record) != 0 ||
+        prepare_history_record(ctx, POLICY_HISTORY_OP_INSTALL, policy_id,
+                               generation, &prepared_history) != 0) {
+        event->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+        goto cleanup;
+    }
+
     page_count = (policy_size_bytes + page_size - 1) / page_size;
     block_count = (page_count + ppb - 1) / ppb;
 
@@ -1059,6 +1179,7 @@ static uint64_t install_policy_callback(struct ssd *ssd, struct NvmeCommandEvent
 
     ctx->installed_policies[slot].policy_id = policy_id;
     ctx->installed_policies[slot].policy_version = policy_version;
+    ctx->installed_policies[slot].generation = generation;
     ctx->installed_policies[slot].policy_size_bytes = policy_size_bytes;
     ctx->installed_policies[slot].policy_size_pages = page_count;
     ctx->installed_policies[slot].block_count = block_count;
@@ -1066,8 +1187,12 @@ static uint64_t install_policy_callback(struct ssd *ssd, struct NvmeCommandEvent
     ctx->installed_policies[slot].active = false;
     ctx->installed_policies[slot].in_use = true;
 
-    printf("[Meta] Installed policy id=%u version=%u size=%u bytes blocks=%u\n",
-           policy_id, policy_version, policy_size_bytes, block_count);
+    commit_generation(ctx, generation_index, new_generation_record,
+                      policy_id, generation);
+    commit_history_record(ctx, &prepared_history);
+
+    printf("[Meta] Installed policy id=%u version=%u generation=%u size=%u bytes blocks=%u\n",
+           policy_id, policy_version, generation, policy_size_bytes, block_count);
 
     g_free(payload);
     event->status = NVME_SUCCESS;
@@ -1173,6 +1298,10 @@ static uint64_t update_policy_callback(struct ssd *ssd,
         struct pba *new_blocks = NULL;
         struct pba *old_blocks;
         uint32_t old_block_count;
+        struct prepared_history_record prepared_history;
+        size_t generation_index;
+        uint32_t generation;
+        bool new_generation_record;
 
         if (plaintext_len < 12) {
             event->status = NVME_INVALID_FIELD | NVME_DNR;
@@ -1188,6 +1317,16 @@ static uint64_t update_policy_callback(struct ssd *ssd,
         }
         if (plaintext_len != (size_t)12 + policy_size_bytes) {
             event->status = NVME_INVALID_FIELD | NVME_DNR;
+            goto cleanup;
+        }
+
+        if (prepare_next_generation(ctx, policy_id, &generation_index,
+                                    &generation, &new_generation_record) != 0 ||
+            new_generation_record ||
+            generation != ctx->installed_policies[slot].generation + 1 ||
+            prepare_history_record(ctx, POLICY_HISTORY_OP_UPDATE, policy_id,
+                                   generation, &prepared_history) != 0) {
+            event->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
             goto cleanup;
         }
 
@@ -1223,16 +1362,21 @@ static uint64_t update_policy_callback(struct ssd *ssd,
         }
 
         ctx->installed_policies[slot].policy_version = policy_version;
+        ctx->installed_policies[slot].generation = generation;
         ctx->installed_policies[slot].policy_size_bytes = policy_size_bytes;
         ctx->installed_policies[slot].policy_size_pages = page_count;
         ctx->installed_policies[slot].block_count = block_count;
         ctx->installed_policies[slot].blocks = new_blocks;
 
+        commit_generation(ctx, generation_index, false, policy_id, generation);
+        commit_history_record(ctx, &prepared_history);
+
         g_free(old_blocks);
         g_free(payload);
 
-        printf("[Meta] Updated policy id=%u version=%u size=%u bytes blocks=%u\n",
-               policy_id, policy_version, policy_size_bytes, block_count);
+        printf("[Meta] Updated policy id=%u version=%u generation=%u size=%u bytes blocks=%u\n",
+               policy_id, policy_version, generation, policy_size_bytes,
+               block_count);
 
         event->status = NVME_SUCCESS;
         goto cleanup;
@@ -1269,6 +1413,8 @@ static uint64_t remove_policy_callback(struct ssd *ssd,
     uint8_t *plaintext = NULL;
     size_t plaintext_len = 0;
     uint32_t policy_id;
+    struct prepared_history_record prepared_history;
+    uint32_t generation;
     int slot;
 
     (void)api;
@@ -1283,6 +1429,12 @@ static uint64_t remove_policy_callback(struct ssd *ssd,
         event->status = NVME_INVALID_FIELD | NVME_DNR;
         goto cleanup;
     }
+    generation = ctx->installed_policies[slot].generation;
+    if (prepare_history_record(ctx, POLICY_HISTORY_OP_REMOVE, policy_id,
+                               generation, &prepared_history) != 0) {
+        event->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+        goto cleanup;
+    }
     if (reclaim_policy_storage(ssd,
                                ctx->installed_policies[slot].blocks,
                                ctx->installed_policies[slot].block_count) != 0) {
@@ -1290,8 +1442,9 @@ static uint64_t remove_policy_callback(struct ssd *ssd,
         goto cleanup;
     }
 
+    commit_history_record(ctx, &prepared_history);
     free_policy_slot_resources(ctx, slot);
-    printf("[Meta] Removed policy id=%u\n", policy_id);
+    printf("[Meta] Removed policy id=%u generation=%u\n", policy_id, generation);
     event->status = NVME_SUCCESS;
 
 cleanup:
@@ -1320,6 +1473,7 @@ static uint64_t activate_policy_callback(struct ssd *ssd, struct NvmeCommandEven
     uint8_t *plaintext = NULL;
     size_t plaintext_len = 0;
     uint32_t policy_id;
+    struct prepared_history_record prepared_history;
     int slot;
 
     (void)api;
@@ -1355,16 +1509,31 @@ static uint64_t activate_policy_callback(struct ssd *ssd, struct NvmeCommandEven
             goto cleanup;
         }
 
+        if (prepare_history_record(ctx, POLICY_HISTORY_OP_ACTIVATE, policy_id,
+                                   ctx->installed_policies[slot].generation,
+                                   &prepared_history) != 0) {
+            event->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+            goto cleanup;
+        }
+
         fill_policy_storage_desc(ctx, slot, &desc);
         if (pe_activate_stored_policy(ssd->policy_engine, ssd, &desc) != 0) {
             event->status = NVME_INVALID_FIELD | NVME_DNR;
             goto cleanup;
         }
         ctx->installed_policies[slot].active = true;
+        commit_history_record(ctx, &prepared_history);
         printf("[Meta] Activated policy id=%u\n", policy_id);
     } else {
         if (!ctx->installed_policies[slot].active) {
             event->status = NVME_SUCCESS;
+            goto cleanup;
+        }
+
+        if (prepare_history_record(ctx, POLICY_HISTORY_OP_DEACTIVATE, policy_id,
+                                   ctx->installed_policies[slot].generation,
+                                   &prepared_history) != 0) {
+            event->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
             goto cleanup;
         }
 
@@ -1373,6 +1542,7 @@ static uint64_t activate_policy_callback(struct ssd *ssd, struct NvmeCommandEven
             goto cleanup;
         }
         ctx->installed_policies[slot].active = false;
+        commit_history_record(ctx, &prepared_history);
         printf("[Meta] Deactivated policy id=%u\n", policy_id);
     }
 
@@ -1385,74 +1555,150 @@ cleanup:
     return 0;
 }
 
-static int build_attestation_response_envelope(struct meta_policy_context *ctx,
-                                               uint8_t opcode,
-                                               uint64_t counter,
-                                               const uint8_t *plaintext,
-                                               size_t plaintext_len,
-                                               uint8_t **response_out,
-                                               uint32_t *response_len_out)
+static int compare_policy_slots(const void *left, const void *right,
+                                void *opaque)
 {
-    uint8_t *response = NULL;
-    uint8_t *ciphertext;
+    const struct meta_policy_context *ctx = opaque;
+    int left_slot = *(const int *)left;
+    int right_slot = *(const int *)right;
+    uint32_t left_id = ctx->installed_policies[left_slot].policy_id;
+    uint32_t right_id = ctx->installed_policies[right_slot].policy_id;
+
+    return left_id < right_id ? -1 : left_id > right_id;
+}
+
+static int build_attestation_response(struct ssd *ssd,
+                                      struct meta_policy_context *ctx,
+                                      uint8_t report_type,
+                                      uint8_t history_mode,
+                                      uint64_t base_sequence,
+                                      const uint8_t nonce[POLICY_ATTESTATION_NONCE_SIZE])
+{
+    int slots[POLICY_ATTESTATION_MAX_POLICIES];
+    size_t policy_count = 0;
+    size_t history_start;
+    size_t returned_history_count;
+    size_t policy_entry_size;
+    size_t policy_bytes;
+    size_t history_bytes;
     size_t response_len;
-    int rc = -1;
+    size_t offset;
+    uint8_t *response = NULL;
+    size_t i;
 
-    if (!ctx || !plaintext || !response_out || !response_len_out ||
-        plaintext_len > UINT32_MAX) {
+    if (!ssd || !ctx || !nonce ||
+        ctx->history_count > UINT64_MAX) {
         return -1;
     }
 
-    response_len = META_ENVELOPE_HEADER_SIZE + plaintext_len;
-    if (response_len > UINT32_MAX) {
-        return -1;
+    for (i = 0; i < POLICY_ATTESTATION_MAX_POLICIES; i++) {
+        if (ctx->installed_policies[i].in_use) {
+            slots[policy_count++] = (int)i;
+        }
     }
-    response = g_malloc0(response_len);
-    encode_u64_le(counter, response);
-    ciphertext = response + META_ENVELOPE_HEADER_SIZE;
+    g_qsort_with_data(slots, policy_count, sizeof(slots[0]),
+                      compare_policy_slots, ctx);
 
-    if (ctx->mode == SESSION_MODE_NORMAL) {
-        uint8_t mac_key[32];
-
-        if (derive_labeled_key(ctx->session_key, "meta-normal-response-mac", mac_key) != 0) {
-            OPENSSL_cleanse(mac_key, sizeof(mac_key));
-            goto cleanup;
+    if (history_mode == POLICY_ATTESTATION_HISTORY_CHECKPOINT) {
+        history_start = ctx->history_count;
+    } else if (history_mode == POLICY_ATTESTATION_HISTORY_FULL) {
+        history_start = 0;
+    } else if (history_mode == POLICY_ATTESTATION_HISTORY_DELTA) {
+        if (base_sequence > ctx->history_count) {
+            return -1;
         }
-        memcpy(ciphertext, plaintext, plaintext_len);
-        if (compute_meta_hmac(mac_key, opcode, counter, ciphertext, plaintext_len,
-                              response + 8) != 0) {
-            OPENSSL_cleanse(mac_key, sizeof(mac_key));
-            goto cleanup;
-        }
-        OPENSSL_cleanse(mac_key, sizeof(mac_key));
-    } else if (ctx->mode == SESSION_MODE_CONFIDENTIAL) {
-        uint8_t aead_key[32];
-
-        if (derive_labeled_key(ctx->session_key, "meta-conf-response-aead", aead_key) != 0) {
-            OPENSSL_cleanse(aead_key, sizeof(aead_key));
-            goto cleanup;
-        }
-        if (aes256_gcm_encrypt(aead_key, counter, opcode, plaintext, plaintext_len,
-                               ciphertext, response + 8) != 0) {
-            OPENSSL_cleanse(aead_key, sizeof(aead_key));
-            goto cleanup;
-        }
-        OPENSSL_cleanse(aead_key, sizeof(aead_key));
+        history_start = (size_t)base_sequence;
     } else {
-        goto cleanup;
+        return -1;
+    }
+    returned_history_count = ctx->history_count - history_start;
+
+    policy_entry_size = report_type == POLICY_ATTESTATION_REPORT_SECURITY ?
+        POLICY_ATTESTATION_SECURITY_ENTRY_SIZE :
+        POLICY_ATTESTATION_CONSISTENCY_ENTRY_SIZE;
+    if (policy_count > (SIZE_MAX - POLICY_ATTESTATION_RESPONSE_HEADER_SIZE) /
+                       policy_entry_size) {
+        return -1;
+    }
+    policy_bytes = policy_count * policy_entry_size;
+    if (returned_history_count >
+        (SIZE_MAX - POLICY_ATTESTATION_RESPONSE_HEADER_SIZE - policy_bytes -
+         POLICY_ATTESTATION_SIGNATURE_SIZE) /
+        POLICY_ATTESTATION_HISTORY_RECORD_SIZE) {
+        return -1;
+    }
+    history_bytes = returned_history_count *
+                    POLICY_ATTESTATION_HISTORY_RECORD_SIZE;
+    response_len = POLICY_ATTESTATION_RESPONSE_HEADER_SIZE + policy_bytes +
+                   history_bytes + POLICY_ATTESTATION_SIGNATURE_SIZE;
+
+    response = g_try_malloc0(response_len);
+    if (!response) {
+        return -1;
     }
 
-    *response_out = response;
-    *response_len_out = (uint32_t)response_len;
-    response = NULL;
-    rc = 0;
+    response[0] = POLICY_ATTESTATION_FORMAT_VERSION;
+    response[1] = report_type;
+    response[2] = history_mode;
+    response[3] = (uint8_t)policy_count;
+    encode_u64_le((uint64_t)ctx->history_count, response + 4);
+    memcpy(response + 12, ctx->boot_epoch, sizeof(ctx->boot_epoch));
+    memcpy(response + 28, nonce, POLICY_ATTESTATION_NONCE_SIZE);
+    memcpy(response + 44, ctx->history_head, sizeof(ctx->history_head));
 
-cleanup:
-    if (response) {
-        OPENSSL_cleanse(response, response_len);
-        g_free(response);
+    offset = POLICY_ATTESTATION_RESPONSE_HEADER_SIZE;
+    for (i = 0; i < policy_count; i++) {
+        int slot = slots[i];
+
+        encode_u32_le(ctx->installed_policies[slot].policy_id,
+                      response + offset);
+        encode_u32_le(ctx->installed_policies[slot].generation,
+                      response + offset + 4);
+        response[offset + 8] = ctx->installed_policies[slot].active ? 1 : 0;
+
+        if (report_type == POLICY_ATTESTATION_REPORT_CONSISTENCY) {
+            struct policy_storage_desc desc;
+            uint8_t *payload = NULL;
+
+            fill_policy_storage_desc(ctx, slot, &desc);
+            if (pe_read_policy_payload(ssd, &desc, &payload) != 0 ||
+                compute_policy_sha256(payload, desc.policy_size_bytes,
+                                      response + offset + 9) != 0) {
+                if (payload) {
+                    OPENSSL_cleanse(payload, desc.policy_size_bytes);
+                    g_free(payload);
+                }
+                goto fail;
+            }
+            OPENSSL_cleanse(payload, desc.policy_size_bytes);
+            g_free(payload);
+        }
+        offset += policy_entry_size;
     }
-    return rc;
+
+    for (i = history_start; i < ctx->history_count; i++) {
+        response[offset] = ctx->history[i].operation;
+        encode_u32_le(ctx->history[i].policy_id, response + offset + 1);
+        encode_u32_le(ctx->history[i].generation, response + offset + 5);
+        offset += POLICY_ATTESTATION_HISTORY_RECORD_SIZE;
+    }
+
+    if (offset + POLICY_ATTESTATION_SIGNATURE_SIZE != response_len ||
+        sign_with_attestation_key(response, offset, response + offset) != 0) {
+        goto fail;
+    }
+
+    clear_pending_attestation(ctx);
+    ctx->pending_attestation_response = response;
+    ctx->pending_attestation_response_len = response_len;
+    ctx->pending_attestation_fetch_offset = 0;
+    ctx->pending_attestation_response_valid = true;
+    return 0;
+
+fail:
+    OPENSSL_cleanse(response, response_len);
+    g_free(response);
+    return -1;
 }
 
 static bool policy_attestation_condition(struct ssd *ssd, struct NvmeCommandEvent *event,
@@ -1472,114 +1718,86 @@ static uint64_t policy_attestation_callback(struct ssd *ssd,
                                             void *context)
 {
     struct meta_policy_context *ctx = (struct meta_policy_context *)context;
-    uint8_t *plaintext = NULL;
-    size_t plaintext_len = 0;
-    uint64_t request_counter = 0;
-    uint32_t policy_id;
-    uint32_t report_type;
-    int slot;
-    struct policy_attestation_report report = {0};
-    uint8_t response_plaintext[POLICY_ATTESTATION_RESPONSE_PLAINTEXT_SIZE];
-    uint8_t *response = NULL;
-    uint8_t *policy_payload = NULL;
-    struct policy_storage_desc desc;
-    uint32_t response_len = 0;
+    uint32_t transfer_len;
 
     if (event->opcode == NVME_CMD_POLICY_ATTESTATION_FETCH) {
+        uint64_t offset;
+
         if (!ctx->pending_attestation_response_valid) {
             event->status = NVME_INVALID_FIELD | NVME_DNR;
             return 0;
         }
 
+        transfer_len = le32_to_cpu(event->cmd->cdw12);
+        offset = (uint64_t)le32_to_cpu(event->cmd->cdw13) |
+                 ((uint64_t)le32_to_cpu(event->cmd->cdw14) << 32);
+        if (transfer_len == 0 || offset != ctx->pending_attestation_fetch_offset ||
+            offset > ctx->pending_attestation_response_len ||
+            transfer_len > ctx->pending_attestation_response_len - offset) {
+            event->status = NVME_INVALID_FIELD | NVME_DNR;
+            return 0;
+        }
+
         event->status = api->write_cmd_buffer(
-            event,
-            ctx->pending_attestation_response,
-            sizeof(ctx->pending_attestation_response));
+            event, ctx->pending_attestation_response + offset, transfer_len);
         if (event->status != NVME_SUCCESS) {
             return 0;
         }
 
-        ctx->pending_attestation_response_valid = false;
+        ctx->pending_attestation_fetch_offset += transfer_len;
+        if (ctx->pending_attestation_fetch_offset ==
+            ctx->pending_attestation_response_len) {
+            clear_pending_attestation(ctx);
+        }
         event->status = NVME_SUCCESS;
         return 0;
     }
 
-    if (authenticate_meta_request(ctx, event, api, &request_counter,
-                                  &plaintext, &plaintext_len) != 0) {
-        event->status = NVME_INVALID_FIELD | NVME_DNR;
-        return 0;
-    }
-    if (plaintext_len != POLICY_ATTESTATION_REQUEST_PLAINTEXT_SIZE) {
-        event->status = NVME_INVALID_FIELD | NVME_DNR;
-        goto cleanup;
-    }
-    policy_id = decode_u32_le(plaintext);
-    report_type = decode_u32_le(plaintext + 4);
-    if (policy_id == 0) {
-        event->status = NVME_INVALID_FIELD | NVME_DNR;
-        goto cleanup;
-    }
-    if (report_type != POLICY_ATTESTATION_REPORT_SECURITY &&
-        report_type != POLICY_ATTESTATION_REPORT_CONSISTENCY) {
-        event->status = NVME_INVALID_FIELD | NVME_DNR;
-        goto cleanup;
-    }
+    {
+        uint8_t request[POLICY_ATTESTATION_DELTA_REQUEST_SIZE];
+        uint8_t report_type;
+        uint8_t history_mode;
+        uint64_t base_sequence = 0;
 
-    slot = find_policy_slot(ctx, policy_id);
-
-    report.policy_id = policy_id;
-    report.report_type = report_type;
-    report.installed = (slot >= 0) ? 1 : 0;
-    report.active = pe_is_policy_active(ssd->policy_engine, policy_id) ? 1 : 0;
-
-    if (report_type == POLICY_ATTESTATION_REPORT_CONSISTENCY && slot >= 0) {
-        fill_policy_storage_desc(ctx, slot, &desc);
-        if (pe_read_policy_payload(ssd, &desc, &policy_payload) != 0) {
-            event->status = NVME_DATA_TRAS_ERROR | NVME_DNR;
-            goto cleanup;
-        }
-        if (compute_policy_sha256(policy_payload,
-                                  desc.policy_size_bytes,
-                                  report.hash) != 0) {
+        transfer_len = le32_to_cpu(event->cmd->cdw12);
+        if (transfer_len != POLICY_ATTESTATION_REQUEST_SIZE &&
+            transfer_len != POLICY_ATTESTATION_DELTA_REQUEST_SIZE) {
             event->status = NVME_INVALID_FIELD | NVME_DNR;
-            goto cleanup;
+            return 0;
+        }
+        if (api->read_cmd_buffer(event, request, transfer_len) != NVME_SUCCESS) {
+            event->status = NVME_DATA_TRAS_ERROR | NVME_DNR;
+            return 0;
+        }
+
+        report_type = request[1];
+        history_mode = request[2];
+        if (request[0] != POLICY_ATTESTATION_FORMAT_VERSION ||
+            (report_type != POLICY_ATTESTATION_REPORT_SECURITY &&
+             report_type != POLICY_ATTESTATION_REPORT_CONSISTENCY) ||
+            (history_mode != POLICY_ATTESTATION_HISTORY_CHECKPOINT &&
+             history_mode != POLICY_ATTESTATION_HISTORY_FULL &&
+             history_mode != POLICY_ATTESTATION_HISTORY_DELTA) ||
+            (history_mode == POLICY_ATTESTATION_HISTORY_DELTA &&
+             transfer_len != POLICY_ATTESTATION_DELTA_REQUEST_SIZE) ||
+            (history_mode != POLICY_ATTESTATION_HISTORY_DELTA &&
+             transfer_len != POLICY_ATTESTATION_REQUEST_SIZE)) {
+            event->status = NVME_INVALID_FIELD | NVME_DNR;
+            return 0;
+        }
+        if (history_mode == POLICY_ATTESTATION_HISTORY_DELTA) {
+            base_sequence = decode_u64_le(request +
+                                          POLICY_ATTESTATION_REQUEST_SIZE);
+        }
+
+        if (build_attestation_response(ssd, ctx, report_type,
+                                       history_mode, base_sequence,
+                                       request + 3) != 0) {
+            event->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+            return 0;
         }
     }
-
-    memset(response_plaintext, 0, sizeof(response_plaintext));
-    encode_u32_le(report.policy_id, response_plaintext);
-    encode_u32_le(report.report_type, response_plaintext + 4);
-    response_plaintext[8] = report.installed;
-    response_plaintext[9] = report.active;
-    memcpy(response_plaintext + 12, report.hash, sizeof(report.hash));
-
-    if (build_attestation_response_envelope(ctx, NVME_CMD_POLICY_ATTESTATION_SUBMIT,
-                                            request_counter,
-                                            response_plaintext,
-                                            sizeof(response_plaintext),
-                                            &response, &response_len) != 0) {
-        event->status = NVME_INVALID_FIELD | NVME_DNR;
-        goto cleanup;
-    }
-
-    memcpy(ctx->pending_attestation_response, response, response_len);
-    ctx->pending_attestation_response_valid = true;
     event->status = NVME_SUCCESS;
-
-cleanup:
-    OPENSSL_cleanse(response_plaintext, sizeof(response_plaintext));
-    if (policy_payload) {
-        OPENSSL_cleanse(policy_payload, desc.policy_size_bytes);
-        g_free(policy_payload);
-    }
-    if (response) {
-        OPENSSL_cleanse(response, response_len);
-        g_free(response);
-    }
-    if (plaintext) {
-        OPENSSL_cleanse(plaintext, plaintext_len);
-        g_free(plaintext);
-    }
     return 0;
 }
 
@@ -1641,7 +1859,11 @@ static uint64_t init_session_callback(struct ssd *ssd, struct NvmeCommandEvent *
         /* Sign the full transcript fragment, including the replay counter. */
         build_ssd_response_message(admin_ephem_pub, ssd_ephem_pub, session_mode,
                                    counter, proof_message);
-        sign_with_ssd_private_key(proof_message, sizeof(proof_message), response + 40);
+        if (sign_with_attestation_key(proof_message, sizeof(proof_message),
+                                      response + 40) != 0) {
+            event->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+            return 0;
+        }
 
         /* Response: ssd_ephem_pub (32) + counter (8) + proof_sig (64). */
         memcpy(response, ssd_ephem_pub, 32);
@@ -1656,7 +1878,7 @@ static uint64_t init_session_callback(struct ssd *ssd, struct NvmeCommandEvent *
         ctx->session_counter = counter;
         ctx->mode = session_mode;
         ctx->active_session_counter = 0;
-        ctx->pending_attestation_response_valid = false;
+        clear_pending_attestation(ctx);
         ctx->session_established = true;
     } else if (event->opcode == NVME_CMD_INIT_SESSION_FETCH) {
         if (!ctx->pending_response_valid) {
@@ -1687,6 +1909,14 @@ int m_interface_policy_init(struct ssd *ssd)
 {
     struct meta_policy_context *ctx = g_malloc0(sizeof(struct meta_policy_context));
     struct FtlPolicyAPI *api = ssd ? ssd->policy_api : NULL;
+
+    if (!api || !ssd->policy_engine ||
+        RAND_bytes(ctx->boot_epoch, sizeof(ctx->boot_epoch)) != 1 ||
+        initialize_history_head(ctx) != 0) {
+        g_free(ctx);
+        return -1;
+    }
+
     ctx->session_established = false;
     ctx->pending_response_valid = false;
     ctx->pending_attestation_response_valid = false;
@@ -1694,67 +1924,72 @@ int m_interface_policy_init(struct ssd *ssd)
 
     g_meta_ctx = ctx;
 
-    if (!api) {
-        return -1;
-    }
-
-    if (api->register_admin_hook(ssd, NVME_CMD_INIT_SESSION_SUBMIT,
+    if (pe_register_privileged_admin_hook(ssd->policy_engine,
+                               NVME_CMD_INIT_SESSION_SUBMIT,
                                init_session_condition,
                                init_session_callback, ctx) < 0) {
         fprintf(stderr, "[Meta] Failed to register INIT_SESSION submit hook\n");
         return -1;
     }
 
-    if (api->register_admin_hook(ssd, NVME_CMD_INIT_SESSION_FETCH,
+    if (pe_register_privileged_admin_hook(ssd->policy_engine,
+                               NVME_CMD_INIT_SESSION_FETCH,
                                init_session_condition,
                                init_session_callback, ctx) < 0) {
         fprintf(stderr, "[Meta] Failed to register INIT_SESSION fetch hook\n");
         return -1;
     }
 
-    if (api->register_admin_hook(ssd, NVME_CMD_INSTALL_POLICY,
+    if (pe_register_privileged_admin_hook(ssd->policy_engine,
+                               NVME_CMD_INSTALL_POLICY,
                                install_policy_condition,
                                install_policy_callback, ctx) < 0) {
         fprintf(stderr, "[Meta] Failed to register INSTALL_POLICY hook\n");
         return -1;
     }
 
-    if (api->register_admin_hook(ssd, NVME_CMD_ACTIVATE_POLICY,
+    if (pe_register_privileged_admin_hook(ssd->policy_engine,
+                               NVME_CMD_ACTIVATE_POLICY,
                                activate_policy_condition,
                                activate_policy_callback, ctx) < 0) {
         fprintf(stderr, "[Meta] Failed to register ACTIVATE_POLICY hook\n");
         return -1;
     }
 
-    if (api->register_admin_hook(ssd, NVME_CMD_DEACTIVATE_POLICY,
+    if (pe_register_privileged_admin_hook(ssd->policy_engine,
+                               NVME_CMD_DEACTIVATE_POLICY,
                                activate_policy_condition,
                                activate_policy_callback, ctx) < 0) {
         fprintf(stderr, "[Meta] Failed to register DEACTIVATE_POLICY hook\n");
         return -1;
     }
 
-    if (api->register_admin_hook(ssd, NVME_CMD_UPDATE_POLICY,
+    if (pe_register_privileged_admin_hook(ssd->policy_engine,
+                               NVME_CMD_UPDATE_POLICY,
                                update_policy_condition,
                                update_policy_callback, ctx) < 0) {
         fprintf(stderr, "[Meta] Failed to register UPDATE_POLICY hook\n");
         return -1;
     }
 
-    if (api->register_admin_hook(ssd, NVME_CMD_REMOVE_POLICY,
+    if (pe_register_privileged_admin_hook(ssd->policy_engine,
+                               NVME_CMD_REMOVE_POLICY,
                                remove_policy_condition,
                                remove_policy_callback, ctx) < 0) {
         fprintf(stderr, "[Meta] Failed to register REMOVE_POLICY hook\n");
         return -1;
     }
 
-    if (api->register_admin_hook(ssd, NVME_CMD_POLICY_ATTESTATION_SUBMIT,
+    if (pe_register_privileged_admin_hook(ssd->policy_engine,
+                               NVME_CMD_POLICY_ATTESTATION_SUBMIT,
                                policy_attestation_condition,
                                policy_attestation_callback, ctx) < 0) {
         fprintf(stderr, "[Meta] Failed to register POLICY_ATTESTATION_SUBMIT hook\n");
         return -1;
     }
 
-    if (api->register_admin_hook(ssd, NVME_CMD_POLICY_ATTESTATION_FETCH,
+    if (pe_register_privileged_admin_hook(ssd->policy_engine,
+                               NVME_CMD_POLICY_ATTESTATION_FETCH,
                                policy_attestation_condition,
                                policy_attestation_callback, ctx) < 0) {
         fprintf(stderr, "[Meta] Failed to register POLICY_ATTESTATION_FETCH hook\n");

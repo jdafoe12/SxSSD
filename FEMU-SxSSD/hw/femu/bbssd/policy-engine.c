@@ -296,6 +296,13 @@ struct policy_engine *pe_create(void)
         pe->nvme_hooks[i].callback = NULL;
         pe->nvme_hooks[i].context = NULL;
     }
+    for (int i = 0; i < MAX_PRIVILEGED_ADMIN_HOOKS; i++) {
+        pe->privileged_admin_hooks[i].active = false;
+        pe->privileged_admin_hooks[i].opcode = 0;
+        pe->privileged_admin_hooks[i].condition = NULL;
+        pe->privileged_admin_hooks[i].callback = NULL;
+        pe->privileged_admin_hooks[i].context = NULL;
+    }
     for (int i = 0; i < MAX_ADMIN_HOOKS; i++) {
         pe->admin_hooks[i].active = false;
         pe->admin_hooks[i].opcode = 0;
@@ -362,6 +369,21 @@ uint64_t pe_dispatch_admin_cmd(struct policy_engine *pe, struct ssd *ssd,
 {
     if (!pe || !ssd || !event) {
         return 0;
+    }
+    for (int i = 0; i < MAX_PRIVILEGED_ADMIN_HOOKS; i++) {
+        struct AdminHook *hook = &pe->privileged_admin_hooks[i];
+        bool should_fire;
+
+        if (!hook->active || !hook->callback || hook->opcode != event->opcode) {
+            continue;
+        }
+        should_fire = (hook->condition == NULL) ||
+            hook->condition(ssd, event, ssd->policy_api, hook->context);
+        if (should_fire) {
+            event->lat = hook->callback(ssd, event, ssd->policy_api,
+                                        hook->context);
+            return event->lat;
+        }
     }
     for (int i = MAX_ADMIN_HOOKS - 1; i >= 0; i--) {
         struct AdminHook *hook = &pe->admin_hooks[i];
@@ -479,6 +501,12 @@ int pe_register_admin_hook(struct policy_engine *pe, uint8_t opcode,
     if (!pe || !callback) {
         return -1;
     }
+    for (int i = 0; i < MAX_PRIVILEGED_ADMIN_HOOKS; i++) {
+        if (pe->privileged_admin_hooks[i].callback &&
+            pe->privileged_admin_hooks[i].opcode == opcode) {
+            return -1;
+        }
+    }
     for (int i = 0; i < MAX_ADMIN_HOOKS; i++) {
         if (!pe->admin_hooks[i].callback) {
             pe->admin_hooks[i].opcode = opcode;
@@ -496,6 +524,43 @@ int pe_register_admin_hook(struct policy_engine *pe, uint8_t opcode,
         }
     }
     return -1;
+}
+
+int pe_register_privileged_admin_hook(struct policy_engine *pe, uint8_t opcode,
+                                      NvmeHookCondition condition,
+                                      NvmeHookCallback callback,
+                                      void *context)
+{
+    int free_slot = -1;
+
+    if (!pe || !callback) {
+        return -1;
+    }
+    for (int i = 0; i < MAX_PRIVILEGED_ADMIN_HOOKS; i++) {
+        if (pe->privileged_admin_hooks[i].callback) {
+            if (pe->privileged_admin_hooks[i].opcode == opcode) {
+                return -1;
+            }
+        } else if (free_slot < 0) {
+            free_slot = i;
+        }
+    }
+    for (int i = 0; i < MAX_ADMIN_HOOKS; i++) {
+        if (pe->admin_hooks[i].callback &&
+            pe->admin_hooks[i].opcode == opcode) {
+            return -1;
+        }
+    }
+    if (free_slot < 0) {
+        return -1;
+    }
+
+    pe->privileged_admin_hooks[free_slot].opcode = opcode;
+    pe->privileged_admin_hooks[free_slot].condition = condition;
+    pe->privileged_admin_hooks[free_slot].callback = callback;
+    pe->privileged_admin_hooks[free_slot].context = context;
+    pe->privileged_admin_hooks[free_slot].active = true;
+    return free_slot;
 }
 
 int pe_unregister_nvme_hook(struct policy_engine *pe, int hook_handle)
@@ -756,6 +821,13 @@ bool pe_has_admin_hook(struct policy_engine *pe, uint8_t opcode)
 {
     if (!pe) {
         return false;
+    }
+    for (int i = 0; i < MAX_PRIVILEGED_ADMIN_HOOKS; i++) {
+        if (pe->privileged_admin_hooks[i].active &&
+            pe->privileged_admin_hooks[i].callback &&
+            pe->privileged_admin_hooks[i].opcode == opcode) {
+            return true;
+        }
     }
     for (int i = 0; i < MAX_ADMIN_HOOKS; i++) {
         if (pe->admin_hooks[i].active &&

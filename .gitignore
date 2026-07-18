@@ -22,3 +22,6 @@ policyctl_timing.csv
 *.qcow2
 .DS_Store
 *~
+
+# Local agent context
+/SxSSD

@@ -412,6 +412,12 @@ struct FtlMigrationCallbacks {
  */
 struct FtlPolicyAPI {
     uint32_t version;  /* API version for compatibility checking */
+    /* Sign only the fixed, domain-separated policy key-bootstrap transcript. */
+    int (*sign_key_bootstrap)(
+        const uint8_t owner_nonce[32],
+        const uint8_t owner_ephemeral_public_key[32],
+        const uint8_t policy_ephemeral_public_key[32],
+        uint8_t signature[64]);
     
     /* eSWD query operations (mechanism exposes eSWD state, policy decides how to use) */
     struct eswd *(*get_eswd_by_id)(struct ssd *ssd, uint32_t eswd_id);

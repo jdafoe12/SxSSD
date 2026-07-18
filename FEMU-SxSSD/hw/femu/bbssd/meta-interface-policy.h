@@ -2,6 +2,7 @@
 #define META_INTERFACE_POLICY_H
 
 #include "ftl.h"
+#include "policy-attestation-format.h"
 
 // Note that we use -algorithm Ed25519 
 /* Custom NVMe vendor I/O opcodes for INIT_SESSION. */
@@ -21,24 +22,10 @@
 #define INIT_SESSION_REQUEST_SIZE   105
 #define INIT_SESSION_RESPONSE_SIZE  104
 
-#define POLICY_ATTESTATION_REPORT_SECURITY     1
-#define POLICY_ATTESTATION_REPORT_CONSISTENCY  2
-
-#define POLICY_ATTESTATION_REQUEST_PLAINTEXT_SIZE   8
-#define POLICY_ATTESTATION_RESPONSE_HASH_SIZE      32
-#define POLICY_ATTESTATION_RESPONSE_PLAINTEXT_SIZE 44
-
 /* Meta interface policy init; implemented in meta-interface-policy.c */
 int m_interface_policy_init(struct ssd *ssd);
 
 /* Note that we use -algorithm Ed25519 */ 
-
-/* SSD/FTL private key - firmware uses this for identity proof/signatures */
-static const uint8_t SSD_PRIVATE_KEY[32] = {
-    0xe1, 0xaf, 0xe2, 0x9d, 0x3d, 0x41, 0xa9, 0xa1, 0x7e, 0x97, 0x0a, 0x4b,
-    0x33, 0xcc, 0x77, 0x8a, 0x68, 0xa4, 0xf7, 0x70, 0x01, 0x19, 0x06, 0x99,
-    0xff, 0xdb, 0x04, 0xdb, 0xd4, 0xc2, 0xe4, 0xd4
-};
 
 // The  manufacturer public key is embedded into the SSD by the manufacurer.
 static const uint8_t MANUFACTURER_PUBLIC_KEY[] = {

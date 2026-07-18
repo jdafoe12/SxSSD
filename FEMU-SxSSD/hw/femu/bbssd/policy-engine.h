@@ -6,6 +6,7 @@
 #include "bbm.h"
 
 #define MAX_RUNTIME_POLICIES (16)
+#define MAX_PRIVILEGED_ADMIN_HOOKS (16)
 
 struct policy_storage_desc {
     uint32_t policy_id;
@@ -40,6 +41,7 @@ struct runtime_policy_record {
  */
 struct policy_engine {
     struct NvmeHook nvme_hooks[MAX_NVME_HOOKS];
+    struct AdminHook privileged_admin_hooks[MAX_PRIVILEGED_ADMIN_HOOKS];
     struct AdminHook admin_hooks[MAX_ADMIN_HOOKS];
     struct BackendEventHook backend_hooks[MAX_BACKEND_EVENT_HOOKS];
     struct PswdTransitionHook pswd_transition_hooks[MAX_PSWD_TRANSITION_HOOKS];
@@ -70,6 +72,10 @@ int pe_register_admin_hook(struct policy_engine *pe, uint8_t opcode,
                            NvmeHookCondition condition,
                            NvmeHookCallback callback,
                            void *context);
+int pe_register_privileged_admin_hook(struct policy_engine *pe, uint8_t opcode,
+                                      NvmeHookCondition condition,
+                                      NvmeHookCallback callback,
+                                      void *context);
 int pe_unregister_admin_hook(struct policy_engine *pe, int hook_handle);
 int pe_inactivate_admin_hook(struct policy_engine *pe, int hook_handle);
 int pe_reactivate_admin_hook(struct policy_engine *pe, int hook_handle);

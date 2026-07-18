@@ -1,4 +1,5 @@
 #include "ftl.h"
+#include "device-signing.h"
 #include "bbm.h"
 #include "policy-engine.h"
 #include "eswd-config.h"
@@ -6,6 +7,7 @@
 #include "meta-interface-policy.h"
 #include "qemu/timer.h"
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 //#include "../backend/ftl-backend.h"
 
@@ -1865,6 +1867,7 @@ void ssd_init(FemuCtrl *n)
     /* Initialize FTL Policy API (mechanism primitives only) */
     ssd->policy_api = g_malloc0(sizeof(struct FtlPolicyAPI));
     ssd->policy_api->version = 1;
+    ssd->policy_api->sign_key_bootstrap = sign_policy_key_bootstrap;
     
     /* eSWD query operations (mechanism exposes eSWD state) */
     ssd->policy_api->get_eswd_by_id = get_eswd_by_id;
@@ -1962,6 +1965,7 @@ void ssd_init(FemuCtrl *n)
 
     if (m_interface_policy_init(ssd) != 0) {
         fprintf(stderr, "[FTL] Failed to initialize meta interface policy\n");
+        abort();
     }
 
     ftl_assert(n->bb_params.host_mhz > 0);

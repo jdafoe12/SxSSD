@@ -133,3 +133,5 @@ trace-ust-all.c
 build-femu/
 build/
 *.md
+/hw/femu/bbssd/scripts/test_device_signing
+/hw/femu/bbssd/scripts/key-sharing-client

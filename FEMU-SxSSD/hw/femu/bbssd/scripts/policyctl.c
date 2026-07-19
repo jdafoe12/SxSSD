@@ -1565,6 +1565,28 @@ static int do_simple_opcode(const char *device, uint8_t opcode, uint32_t policy_
     return rc;
 }
 
+static int do_probe(const char *device, uint8_t opcode, uint32_t cdw10)
+{
+    struct nvme_admin_cmd command = {0};
+    int fd;
+
+    fd = open(device, O_RDWR);
+    if (fd < 0) {
+        perror("open device");
+        return -1;
+    }
+    command.opcode = opcode;
+    command.cdw10 = cdw10;
+    if (ioctl(fd, NVME_IOCTL_ADMIN_CMD, &command) != 0) {
+        perror("probe ioctl");
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    printf("0x%08x\n", command.result);
+    return 0;
+}
+
 static int parse_mode(const char *arg, uint8_t *mode_out)
 {
     if (!arg || !mode_out) {
@@ -1615,13 +1637,15 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "Usage:\n"
                 "  %s [--mode normal|confidential] session <device>\n"
-                "  %s [--mode normal|confidential] install <device> <policy.so> <policy_id> <version>\n"
-                "  %s [--mode normal|confidential] update <device> <policy.so> <policy_id> <version>\n"
+                "  %s [--mode normal|confidential] install <device> <policy.bpf.o> <policy_id> <version>\n"
+                "  %s [--mode normal|confidential] update <device> <policy.bpf.o> <policy_id> <version>\n"
                 "  %s [--mode normal|confidential] activate <device> <policy_id>\n"
                 "  %s [--mode normal|confidential] deactivate <device> <policy_id>\n"
                 "  %s [--mode normal|confidential] remove <device> <policy_id>\n"
-                "  %s attest <device> <security|consistency> [--history full | --since <checkpoint>] [--save-checkpoint <file>]\n",
-                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+                "  %s attest <device> <security|consistency> [--history full | --since <checkpoint>] [--save-checkpoint <file>]\n"
+                "  %s probe <device> <admin_opcode> <cdw10>\n",
+                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
+                argv[0]);
         return 1;
     }
 
@@ -1631,6 +1655,15 @@ int main(int argc, char **argv)
         }
         clear_session_state();
         return do_session(argv[argi + 1], session_mode) == 0 ? 0 : 1;
+    }
+
+    if (strcmp(argv[argi], "probe") == 0) {
+        if (argc - argi != 4) {
+            return 1;
+        }
+        return do_probe(argv[argi + 1],
+                        (uint8_t)strtoul(argv[argi + 2], NULL, 0),
+                        (uint32_t)strtoul(argv[argi + 3], NULL, 0)) == 0 ? 0 : 1;
     }
 
     if (strcmp(argv[argi], "install") == 0) {

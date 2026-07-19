@@ -789,32 +789,177 @@ int ftl_backend_raw_erase(struct FtlBackend *fb, struct pba *pba_list,
 
 
 /* OOB management */
+static int find_oob_range(const struct FtlBackend *fb, const bool *occupied,
+                          size_t required_size)
+{
+    size_t offset;
+    size_t byte;
+
+    if (!fb || !occupied || required_size == 0 ||
+        required_size > fb->oob_size_per_page) {
+        return -1;
+    }
+    for (offset = 0;
+         offset <= fb->oob_size_per_page - required_size; offset++) {
+        for (byte = 0; byte < required_size; byte++) {
+            if (occupied[offset + byte]) {
+                break;
+            }
+        }
+        if (byte == required_size) {
+            return (int)offset;
+        }
+    }
+    return -1;
+}
+
+static bool *build_oob_occupancy(const struct FtlBackend *fb)
+{
+    bool *occupied;
+    int i;
+
+    if (!fb || fb->oob_size_per_page == 0) {
+        return NULL;
+    }
+    occupied = g_new0(bool, fb->oob_size_per_page);
+    for (i = 0; i < fb->oob_policy_count; i++) {
+        const struct OobPolicyRegistration *registration =
+            &fb->oob_policies[i];
+        size_t byte;
+
+        if (!registration->active ||
+            registration->offset + registration->required_size >
+                fb->oob_size_per_page) {
+            continue;
+        }
+        for (byte = 0; byte < registration->required_size; byte++) {
+            occupied[registration->offset + byte] = true;
+        }
+    }
+    return occupied;
+}
+
+int ftl_backend_can_register_oob_policies(const struct FtlBackend *fb,
+                                          const uint32_t *required_sizes,
+                                          uint32_t required_count)
+{
+    bool *occupied;
+    uint32_t free_handles = MAX_OOB_POLICIES;
+    uint32_t i;
+    int offset;
+
+    if (!fb || (required_count != 0 && !required_sizes)) {
+        return -1;
+    }
+    for (i = 0; i < (uint32_t)fb->oob_policy_count; i++) {
+        if (fb->oob_policies[i].active) {
+            free_handles--;
+        }
+    }
+    if (required_count > free_handles) {
+        return -1;
+    }
+    occupied = build_oob_occupancy(fb);
+    if (!occupied && required_count != 0) {
+        return -1;
+    }
+    for (i = 0; i < required_count; i++) {
+        uint32_t byte;
+
+        offset = find_oob_range(fb, occupied, required_sizes[i]);
+        if (offset < 0) {
+            g_free(occupied);
+            return -1;
+        }
+        for (byte = 0; byte < required_sizes[i]; byte++) {
+            occupied[offset + byte] = true;
+        }
+    }
+    g_free(occupied);
+    return 0;
+}
+
 int ftl_backend_register_oob_policy(struct FtlBackend *fb, 
                                      const char *policy_name,
                                      size_t required_size,
                                      int *policy_handle_out)
 {
-    
-    if (fb->oob_policy_count >= MAX_OOB_POLICIES) {
-        return -1;  /* too many policies */
+    struct OobPolicyRegistration *reg;
+    bool *occupied;
+    int handle = -1;
+    int offset;
+    int i;
+
+    if (!fb || !policy_name || !policy_handle_out || required_size == 0 ||
+        required_size > UINT32_MAX) {
+        return -1;
+    }
+    for (i = 0; i < fb->oob_policy_count; i++) {
+        if (!fb->oob_policies[i].active) {
+            handle = i;
+            break;
+        }
+    }
+    if (handle < 0) {
+        if (fb->oob_policy_count >= MAX_OOB_POLICIES) {
+            return -1;
+        }
+        handle = fb->oob_policy_count;
+    }
+    occupied = build_oob_occupancy(fb);
+    if (!occupied) {
+        return -1;
+    }
+    offset = find_oob_range(fb, occupied, required_size);
+    g_free(occupied);
+    if (offset < 0) {
+        return -2;
     }
 
-    if (fb->oob_used_per_page + required_size > fb->oob_size_per_page) {
-        return -2;  /* OOB space exhausted */
-    }
-    
-    int handle = fb->oob_policy_count;
-    struct OobPolicyRegistration *reg = &fb->oob_policies[handle];
-    
-    reg->policy_name = strdup(policy_name);
+    reg = &fb->oob_policies[handle];
+    g_free(reg->policy_name);
+    reg->policy_name = g_strdup(policy_name);
     reg->required_size = required_size;
-    reg->offset = fb->oob_used_per_page;  /* assign next available offset */
+    reg->offset = (size_t)offset;
     reg->active = true;
-    
     fb->oob_used_per_page += required_size;
-    fb->oob_policy_count++;
-    
+    if (handle == fb->oob_policy_count) {
+        fb->oob_policy_count++;
+    }
     *policy_handle_out = handle;
+    return 0;
+}
+
+int ftl_backend_unregister_oob_policy(struct FtlBackend *fb,
+                                      int policy_handle)
+{
+    struct OobPolicyRegistration *registration;
+    uint64_t page;
+
+    if (!fb || policy_handle < 0 ||
+        policy_handle >= fb->oob_policy_count) {
+        return -1;
+    }
+    registration = &fb->oob_policies[policy_handle];
+    if (!registration->active) {
+        return 0;
+    }
+    if (fb->oob_buf &&
+        registration->offset + registration->required_size <=
+            fb->oob_size_per_page) {
+        for (page = 0; page < (uint64_t)fb->sp.tt_pgs; page++) {
+            memset(fb->oob_buf + page * fb->oob_size_per_page +
+                       registration->offset,
+                   0, registration->required_size);
+        }
+    }
+    if (registration->required_size <= fb->oob_used_per_page) {
+        fb->oob_used_per_page -= registration->required_size;
+    } else {
+        fb->oob_used_per_page = 0;
+    }
+    g_free(registration->policy_name);
+    *registration = (struct OobPolicyRegistration) {0};
     return 0;
 }
 

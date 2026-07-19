@@ -173,6 +173,7 @@ static uint16_t bb_admin_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
                 .is_admin = true,
                 .req = NULL,
                 .cmd = cmd,
+                .cqe = cqe,
                 .ctrl = n,
                 .status = NVME_SUCCESS,
             };

@@ -2,6 +2,8 @@
 #include "bbm.h"
 #include "device-signing.h"
 #include "policy-engine.h"
+#include "policy/policy-bpf-abi.h"
+#include "qemu/error-report.h"
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
@@ -901,6 +903,7 @@ static void fill_policy_storage_desc(const struct meta_policy_context *ctx, int 
 {
     desc->policy_id = ctx->installed_policies[slot].policy_id;
     desc->policy_version = ctx->installed_policies[slot].policy_version;
+    desc->generation = ctx->installed_policies[slot].generation;
     desc->policy_size_bytes = ctx->installed_policies[slot].policy_size_bytes;
     desc->block_count = ctx->installed_policies[slot].block_count;
     desc->blocks = ctx->installed_policies[slot].blocks;
@@ -1120,7 +1123,8 @@ static uint64_t install_policy_callback(struct ssd *ssd, struct NvmeCommandEvent
     policy_version = decode_u32_le(plaintext + 4);
     policy_size_bytes = decode_u32_le(plaintext + 8);
 
-    if (policy_id == 0 || policy_version == 0 || policy_size_bytes == 0) {
+    if (policy_id == 0 || policy_version == 0 || policy_size_bytes == 0 ||
+        policy_size_bytes > SXS_BPF_MAX_ARTIFACT_BYTES) {
         event->status = NVME_INVALID_FIELD | NVME_DNR;
         goto cleanup;
     }
@@ -1153,6 +1157,12 @@ static uint64_t install_policy_callback(struct ssd *ssd, struct NvmeCommandEvent
 
     payload = g_malloc0(policy_size_bytes);
     memcpy(payload, plaintext + 12, policy_size_bytes);
+
+    if (pe_validate_policy_image(payload, policy_size_bytes) != 0) {
+        g_free(payload);
+        event->status = NVME_INVALID_FIELD | NVME_DNR;
+        goto cleanup;
+    }
 
     blocks = g_malloc0(sizeof(struct pba) * block_count);
     if (select_policy_blocks(ssd, ctx, block_count, blocks) < 0) {
@@ -1298,6 +1308,7 @@ static uint64_t update_policy_callback(struct ssd *ssd,
         struct pba *new_blocks = NULL;
         struct pba *old_blocks;
         uint32_t old_block_count;
+        uint32_t old_generation;
         struct prepared_history_record prepared_history;
         size_t generation_index;
         uint32_t generation;
@@ -1311,7 +1322,8 @@ static uint64_t update_policy_callback(struct ssd *ssd,
         policy_version = decode_u32_le(plaintext + 4);
         policy_size_bytes = decode_u32_le(plaintext + 8);
 
-        if (policy_version == 0 || policy_size_bytes == 0) {
+        if (policy_version == 0 || policy_size_bytes == 0 ||
+            policy_size_bytes > SXS_BPF_MAX_ARTIFACT_BYTES) {
             event->status = NVME_INVALID_FIELD | NVME_DNR;
             goto cleanup;
         }
@@ -1336,6 +1348,11 @@ static uint64_t update_policy_callback(struct ssd *ssd,
         payload = g_malloc0(policy_size_bytes);
         memcpy(payload, plaintext + 12, policy_size_bytes);
 
+        if (pe_validate_policy_image(payload, policy_size_bytes) != 0) {
+            event->status = NVME_INVALID_FIELD | NVME_DNR;
+            goto update_cleanup;
+        }
+
         new_blocks = g_malloc0(sizeof(struct pba) * block_count);
         if (select_policy_blocks(ssd, ctx, block_count, new_blocks) < 0) {
             event->status = NVME_INVALID_FIELD | NVME_DNR;
@@ -1354,7 +1371,14 @@ static uint64_t update_policy_callback(struct ssd *ssd,
 
         old_blocks = ctx->installed_policies[slot].blocks;
         old_block_count = ctx->installed_policies[slot].block_count;
+        old_generation = ctx->installed_policies[slot].generation;
 
+        if (pe_can_remove_policy_state(ssd->policy_engine, policy_id,
+                                       old_generation) != 0) {
+            reclaim_policy_storage(ssd, new_blocks, block_count);
+            event->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+            goto update_cleanup;
+        }
         if (reclaim_policy_storage(ssd, old_blocks, old_block_count) != 0) {
             reclaim_policy_storage(ssd, new_blocks, block_count);
             event->status = NVME_DATA_TRAS_ERROR | NVME_DNR;
@@ -1370,6 +1394,12 @@ static uint64_t update_policy_callback(struct ssd *ssd,
 
         commit_generation(ctx, generation_index, false, policy_id, generation);
         commit_history_record(ctx, &prepared_history);
+
+        if (pe_remove_policy_state(ssd->policy_engine, policy_id,
+                                   old_generation) != 0) {
+            error_report("failed to destroy old runtime state for policy %u generation %u",
+                         policy_id, old_generation);
+        }
 
         g_free(old_blocks);
         g_free(payload);
@@ -1435,10 +1465,20 @@ static uint64_t remove_policy_callback(struct ssd *ssd,
         event->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
         goto cleanup;
     }
+    if (pe_can_remove_policy_state(ssd->policy_engine, policy_id,
+                                   generation) != 0) {
+        event->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+        goto cleanup;
+    }
     if (reclaim_policy_storage(ssd,
                                ctx->installed_policies[slot].blocks,
                                ctx->installed_policies[slot].block_count) != 0) {
         event->status = NVME_DATA_TRAS_ERROR | NVME_DNR;
+        goto cleanup;
+    }
+
+    if (pe_remove_policy_state(ssd->policy_engine, policy_id, generation) != 0) {
+        event->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
         goto cleanup;
     }
 

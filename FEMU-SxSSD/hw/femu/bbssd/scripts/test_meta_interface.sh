@@ -7,9 +7,9 @@ POLICY_DIR="$BBSSD_DIR/policy"
 DEVICE="${1:-/dev/nvme0}"
 BASE_POLICY_ID="${2:-100}"
 BASE_POLICY_VERSION="${3:-1}"
-POLICY_PATH="${4:-$POLICY_DIR/block-interface-policy-baseline.so}"
-SIGNING_POLICY_PATH="$POLICY_DIR/signing-test-policy.so"
-KEY_SHARING_POLICY_PATH="$POLICY_DIR/key-sharing-policy.so"
+POLICY_PATH="${4:-$POLICY_DIR/signing-test-policy.bpf.o}"
+SIGNING_POLICY_PATH="$POLICY_DIR/signing-test-policy.bpf.o"
+KEY_SHARING_POLICY_PATH="$POLICY_DIR/key-sharing-policy.bpf.o"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -173,6 +173,8 @@ run_policyctl "$SCRIPT_DIR/policyctl" activate "$DEVICE" "$MULTI_B" >/dev/null
 output="$(attest_checkpoint security "$TMP_DIR/multiple-active.checkpoint")"
 assert_contains "$output" "policy id=$MULTI_A generation=1 active=1"
 assert_contains "$output" "policy id=$MULTI_B generation=1 active=1"
+output="$(run_policyctl "$SCRIPT_DIR/policyctl" probe "$DEVICE" 0xe4 0)"
+assert_contains "$output" "0x50415353"
 run_policyctl "$SCRIPT_DIR/policyctl" deactivate "$DEVICE" "$MULTI_A" >/dev/null
 run_policyctl "$SCRIPT_DIR/policyctl" deactivate "$DEVICE" "$MULTI_B" >/dev/null
 run_policyctl "$SCRIPT_DIR/policyctl" remove "$DEVICE" "$MULTI_A" >/dev/null

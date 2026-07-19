@@ -219,7 +219,7 @@ struct ssdparams {
 
 
 struct OobPolicyRegistration {
-    const char *policy_name;
+    char *policy_name;
     size_t required_size;
     size_t offset;
     bool active;
@@ -289,6 +289,10 @@ int ftl_backend_register_oob_policy(struct FtlBackend *fb,
     const char *policy_name,
     size_t required_size,
     int *policy_handle_out);
+int ftl_backend_unregister_oob_policy(struct FtlBackend *fb,
+    int policy_handle);
+int ftl_backend_can_register_oob_policies(const struct FtlBackend *fb,
+    const uint32_t *required_sizes, uint32_t required_count);
 int ftl_backend_get_oob_policy_info(struct FtlBackend *fb,
     int policy_handle,
     size_t *offset_out,

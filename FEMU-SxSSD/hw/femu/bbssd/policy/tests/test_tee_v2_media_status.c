@@ -5,6 +5,10 @@
 
 int main(void)
 {
+    int untouched[2] = {0, 0};
+    ftl_init_page_program_statuses(untouched, 2);
+    assert(untouched[0] != 0 && untouched[1] != 0);
+    assert(!ftl_page_program_succeeded(0, untouched[0]));
     assert(ftl_page_program_succeeded(0, 0));
     assert(!ftl_page_program_succeeded(-1, 0));
     assert(!ftl_page_program_succeeded(0, 1));

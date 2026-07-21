@@ -70,12 +70,10 @@ uint32_t tee_v4_admin_returned_items(uint32_t total_items,
     return items_per_page;
 }
 
-void tee_v4_admin_response_init(struct tee_v4_admin_response_header *header,
-                                uint16_t command_type, uint64_t request_id,
-                                int32_t status, uint32_t total_items,
-                                uint32_t item_size,
-                                uint32_t items_per_page,
-                                uint32_t page_index)
+void tee_v4_admin_response_header_init(
+    struct tee_v4_admin_response_header *header, uint16_t command_type,
+    uint64_t request_id, int32_t status, uint32_t total_items,
+    uint32_t item_size, uint32_t items_per_page, uint32_t page_index)
 {
     if (!header) {
         return;

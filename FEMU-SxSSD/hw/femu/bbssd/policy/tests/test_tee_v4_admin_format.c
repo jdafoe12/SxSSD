@@ -34,8 +34,9 @@ static void test_response_header_and_pagination(void)
     struct tee_v4_admin_response_header rsp;
 
     memset(&rsp, 0, sizeof(rsp));
-    tee_v4_admin_response_init(&rsp, TEE_V4_ADMIN_CMD_READ_HMAC_GROUPS,
-                               1234, TEE_V4_ADMIN_STATUS_OK, 17, 4, 5, 2);
+    tee_v4_admin_response_header_init(
+        &rsp, TEE_V4_ADMIN_CMD_READ_HMAC_GROUPS, 1234,
+        TEE_V4_ADMIN_STATUS_OK, 17, 4, 5, 2);
 
     assert(sizeof(rsp) == TEE_V4_ADMIN_RESPONSE_HEADER_SIZE);
     assert(rsp.magic == TEE_V4_ADMIN_MAGIC);

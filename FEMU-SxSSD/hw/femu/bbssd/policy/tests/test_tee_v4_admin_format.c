@@ -66,11 +66,22 @@ static void test_continue_request_payload(void)
     assert(payload.page_index == 3);
 }
 
+static void test_operation_domains_are_distinct(void)
+{
+    assert(TEE_V4_ADMIN_FLAG_SUBMIT != TEE_V4_ADMIN_FLAG_FETCH);
+    assert(TEE_V4_ADMIN_FLAG_SUBMIT != TEE_V4_ADMIN_FLAG_CONTINUE);
+    assert(TEE_V4_ADMIN_FLAG_FETCH != TEE_V4_ADMIN_FLAG_CONTINUE);
+    assert((TEE_V4_ADMIN_FLAG_SUBMIT & TEE_V4_ADMIN_FLAG_FETCH) == 0);
+    assert((TEE_V4_ADMIN_FLAG_SUBMIT & TEE_V4_ADMIN_FLAG_CONTINUE) == 0);
+    assert((TEE_V4_ADMIN_FLAG_FETCH & TEE_V4_ADMIN_FLAG_CONTINUE) == 0);
+}
+
 int main(void)
 {
     test_request_header_validation_and_mac_span();
     test_response_header_and_pagination();
     test_continue_request_payload();
+    test_operation_domains_are_distinct();
     puts("test_tee_v4_admin_format: PASS");
     return 0;
 }

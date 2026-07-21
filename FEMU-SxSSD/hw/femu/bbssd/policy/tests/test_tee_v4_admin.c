@@ -7,6 +7,7 @@
 #include "../tee/tee-v2-passive-metadata.h"
 #include "../tee/tee-v2-write.h"
 #include "../tee/tee-v3-policy.h"
+#include "../tee/tee-v4-writeback.h"
 
 #include <assert.h>
 #include <stdint.h>
@@ -28,11 +29,38 @@ static void make_request(uint8_t *buffer, uint16_t command_type,
     header->command_type = command_type;
     header->request_id = request_id;
     header->payload_len = sizeof(*payload);
+    header->flags = TEE_V4_ADMIN_FLAG_SUBMIT;
     payload->file_id = file_id;
     payload->chunk_id = chunk_id;
     payload->page_size = 64;
     assert(tee_v4_admin_sign_request(buffer, sizeof(*header) +
                                              sizeof(*payload)) == 0);
+}
+
+static size_t make_control_request(
+    uint8_t *buffer, uint32_t flags, uint16_t command_type,
+    uint64_t request_id, uint32_t page_index)
+{
+    struct tee_v4_admin_request_header *header = (void *)buffer;
+    size_t bytes = sizeof(*header);
+
+    memset(buffer, 0, TEE_V4_ADMIN_DEFAULT_BUFFER_BYTES);
+    header->magic = TEE_V4_ADMIN_MAGIC;
+    header->version = TEE_V4_ADMIN_VERSION;
+    header->command_type = command_type;
+    header->request_id = request_id;
+    header->flags = flags;
+    if (flags == TEE_V4_ADMIN_FLAG_CONTINUE) {
+        struct tee_v4_admin_continue_payload *payload =
+            (void *)(buffer + sizeof(*header));
+
+        payload->request_id = request_id;
+        payload->page_index = page_index;
+        header->payload_len = sizeof(*payload);
+        bytes += sizeof(*payload);
+    }
+    assert(tee_v4_admin_sign_request(buffer, bytes) == 0);
+    return bytes;
 }
 
 static void build_context(struct tee_v2_active_metadata *active,
@@ -103,8 +131,14 @@ static void test_signed_summary_and_locations(void)
     assert(tee_v4_admin_submit(&admin, request,
                                sizeof(struct tee_v4_admin_request_header) +
                                    sizeof(struct tee_v4_admin_chunk_query_payload)) == 0);
-    assert(tee_v4_admin_fetch(&admin, response, sizeof(response),
+    {
+        size_t fetch_bytes = make_control_request(
+            request, TEE_V4_ADMIN_FLAG_FETCH,
+            TEE_V4_ADMIN_CMD_READ_SUMMARY, 11, 0);
+        assert(tee_v4_admin_fetch(&admin, request, fetch_bytes,
+                              response, sizeof(response),
                               &written) == 0);
+    }
     assert(header->status == TEE_V4_ADMIN_STATUS_OK);
     assert(header->total_items == 1);
     assert(((struct tee_v3_read_summary *)(response + sizeof(*header)))
@@ -114,10 +148,153 @@ static void test_signed_summary_and_locations(void)
     assert(tee_v4_admin_submit(&admin, request,
                                sizeof(struct tee_v4_admin_request_header) +
                                    sizeof(struct tee_v4_admin_chunk_query_payload)) == 0);
-    assert(tee_v4_admin_fetch(&admin, response, sizeof(response),
+    {
+        size_t fetch_bytes = make_control_request(
+            request, TEE_V4_ADMIN_FLAG_FETCH,
+            TEE_V4_ADMIN_CMD_READ_LOCATIONS, 12, 0);
+        assert(tee_v4_admin_fetch(&admin, request, fetch_bytes,
+                              response, sizeof(response),
                               &written) == 0);
+    }
     assert(header->total_items == 4);
     assert(((uint64_t *)(response + sizeof(*header)))[0] == 101);
+
+    tee_v4_admin_destroy(&admin);
+    tee_v2_write_context_destroy(&write);
+    tee_v2_cache_destroy(&cache);
+    tee_v2_active_metadata_destroy(&active);
+}
+
+
+static void test_authenticated_fetch_continue_and_pending_lifecycle(void)
+{
+    struct tee_v2_active_metadata active;
+    struct tee_v2_cache cache;
+    struct tee_v2_write_context write;
+    struct tee_v3_policy_context v3;
+    struct tee_v4_admin admin;
+    uint8_t request[TEE_V4_ADMIN_DEFAULT_BUFFER_BYTES];
+    uint8_t response[TEE_V4_ADMIN_DEFAULT_BUFFER_BYTES];
+    uint32_t items[5] = {10, 20, 30, 40, 50};
+    size_t bytes;
+    size_t written = 0;
+    struct tee_v4_admin_response_header *header = (void *)response;
+
+    build_context(&active, &cache, &write, &v3);
+    assert(tee_v4_admin_init(&admin, &v3, TEE_V4_ADMIN_DEFAULT_BUFFER_BYTES,
+                             4096) == 0);
+    assert(tee_v4_admin_response_prepare_items(
+               &admin.pending, TEE_V4_ADMIN_CMD_READ_HMAC_GROUPS, 70,
+               TEE_V4_ADMIN_STATUS_OK, items, 5, sizeof(items[0]), 2) == 0);
+
+    bytes = make_control_request(request, TEE_V4_ADMIN_FLAG_FETCH,
+                                 TEE_V4_ADMIN_CMD_READ_HMAC_GROUPS, 70, 0);
+    request[TEE_V4_ADMIN_REQUEST_MAC_OFFSET] ^= 1;
+    assert(tee_v4_admin_fetch(&admin, request, bytes, response,
+                              sizeof(response), &written) != 0);
+    assert(admin.pending.valid);
+
+    bytes = make_control_request(request, TEE_V4_ADMIN_FLAG_FETCH,
+                                 TEE_V4_ADMIN_CMD_READ_HMAC_GROUPS, 70, 0);
+    assert(tee_v4_admin_fetch(&admin, request, bytes - 1, response,
+                              sizeof(response), &written) != 0);
+    assert(admin.pending.valid);
+    assert(tee_v4_admin_fetch(&admin, request, bytes, response,
+                              sizeof(response), &written) == 0);
+    assert(header->page_index == 0);
+
+    bytes = make_control_request(request, TEE_V4_ADMIN_FLAG_CONTINUE,
+                                 TEE_V4_ADMIN_CMD_READ_HMAC_GROUPS, 70, 1);
+    ((struct tee_v4_admin_continue_payload *)(
+         request + sizeof(struct tee_v4_admin_request_header)))->request_id++;
+    assert(tee_v4_admin_continue(&admin, request, bytes, response,
+                                 sizeof(response), &written) != 0);
+    assert(admin.pending.valid);
+
+    bytes = make_control_request(request, TEE_V4_ADMIN_FLAG_CONTINUE,
+                                 TEE_V4_ADMIN_CMD_READ_HMAC_GROUPS, 70, 1);
+    assert(tee_v4_admin_continue(&admin, request, bytes, response,
+                                 sizeof(response), &written) == 0);
+    assert(header->page_index == 1);
+    assert(header->start_item == 2);
+    assert(((uint32_t *)(response + sizeof(*header)))[0] == 30);
+
+    make_request(request, TEE_V4_ADMIN_CMD_READ_SUMMARY, 71, 8, 5);
+    assert(tee_v4_admin_submit(&admin, request,
+        sizeof(struct tee_v4_admin_request_header) +
+        sizeof(struct tee_v4_admin_chunk_query_payload)) == 0);
+    assert(admin.pending.request_id == 71);
+
+    /* A valid MAC from the wrong operation domain cannot authorize FETCH. */
+    assert(tee_v4_admin_fetch(
+               &admin, request,
+               sizeof(struct tee_v4_admin_request_header) +
+                   sizeof(struct tee_v4_admin_chunk_query_payload),
+               response, sizeof(response), &written) != 0);
+    assert(admin.pending.request_id == 71);
+
+    /* Exact-size validation rejects trailing bytes without replacing pending. */
+    assert(tee_v4_admin_submit(
+               &admin, request,
+               sizeof(struct tee_v4_admin_request_header) +
+                   sizeof(struct tee_v4_admin_chunk_query_payload) + 1) != 0);
+    assert(admin.pending.valid);
+    assert(admin.pending.request_id == 71);
+
+    tee_v4_admin_destroy(&admin);
+    tee_v2_write_context_destroy(&write);
+    tee_v2_cache_destroy(&cache);
+    tee_v2_active_metadata_destroy(&active);
+}
+
+struct sync_log { int calls; int result; };
+
+static int sync_flush(void *opaque,
+                      const struct tee_v4_transaction_record *records,
+                      uint32_t count)
+{
+    struct sync_log *log = opaque;
+    (void)records;
+    (void)count;
+    log->calls++;
+    return log->result;
+}
+
+static void test_authenticated_sync_failure_and_retry(void)
+{
+    struct tee_v2_active_metadata active;
+    struct tee_v2_cache cache;
+    struct tee_v2_write_context write;
+    struct tee_v3_policy_context v3;
+    struct tee_v4_admin admin;
+    struct tee_v4_writeback wb;
+    struct tee_v4_transaction_record records[2];
+    struct sync_log log = {0, -1};
+    uint8_t request[TEE_V4_ADMIN_DEFAULT_BUFFER_BYTES];
+    size_t request_bytes;
+
+    build_context(&active, &cache, &write, &v3);
+    assert(tee_v4_writeback_init(&wb, records, 2, 1000,
+                                 sync_flush, &log) == 0);
+    assert(tee_v4_writeback_record_relocation(&wb, 8, 5, 1, 101, 201) == 0);
+    assert(tee_v4_admin_init(&admin, &v3, TEE_V4_ADMIN_DEFAULT_BUFFER_BYTES,
+                             4096) == 0);
+    tee_v4_admin_set_writeback(&admin, &wb);
+
+    request_bytes = make_control_request(
+        request, TEE_V4_ADMIN_FLAG_SUBMIT,
+        TEE_V4_ADMIN_CMD_SYNC_METADATA, 80, 0);
+    assert(tee_v4_admin_submit(&admin, request, request_bytes) != 0);
+    assert(log.calls == 1);
+    assert(wb.pending_count == 1);
+
+    log.result = 0;
+    request_bytes = make_control_request(
+        request, TEE_V4_ADMIN_FLAG_SUBMIT,
+        TEE_V4_ADMIN_CMD_SYNC_METADATA, 81, 0);
+    assert(tee_v4_admin_submit(&admin, request, request_bytes) == 0);
+    assert(log.calls == 2);
+    assert(wb.pending_count == 0);
 
     tee_v4_admin_destroy(&admin);
     tee_v2_write_context_destroy(&write);
@@ -153,6 +330,8 @@ int main(void)
 {
     test_signed_summary_and_locations();
     test_bad_mac_is_rejected();
+    test_authenticated_fetch_continue_and_pending_lifecycle();
+    test_authenticated_sync_failure_and_retry();
     puts("test_tee_v4_admin: PASS");
     return 0;
 }

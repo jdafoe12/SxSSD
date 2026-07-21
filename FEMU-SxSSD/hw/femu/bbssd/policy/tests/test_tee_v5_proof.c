@@ -62,8 +62,9 @@ static void test_error_is_one_based_and_survives_queries(void)
     size_t written = 99;
 
     fixture_init(&fixture, 1, 9);
-    tee_v5_proof_record_error(&fixture.controller, 1, 9,
-                              TEE_V5_PROOF_ERROR_PERSISTENCE_FAILURE, 3);
+    assert(tee_v5_proof_record_error(
+               &fixture.controller, 1, 9,
+               TEE_V5_PROOF_ERROR_PERSISTENCE_FAILURE, 3) == 0);
 
     assert(fixture.controller.has_error);
     assert(fixture.controller.last_error_code ==
@@ -86,8 +87,9 @@ static void test_error_is_scoped_to_exact_chunk_identity(void)
     size_t written = 0;
 
     fixture_init(&fixture, 7, 0x123456U);
-    tee_v5_proof_record_error(&fixture.controller, 7, 0x123456U,
-                              TEE_V5_PROOF_ERROR_HMAC_FAILURE, 1);
+    assert(tee_v5_proof_record_error(
+               &fixture.controller, 7, 0x123456U,
+               TEE_V5_PROOF_ERROR_HMAC_FAILURE, 1) == 0);
     assert(tee_v3_one_bit_proof_query(&fixture.controller, 8, 0x123456U,
                                       0, NULL, 0, &written, &proof) ==
            TEE_V3_QUERY_NOT_FOUND);
@@ -100,8 +102,9 @@ static void test_only_matching_superseding_operation_clears_error(void)
     struct tee_v3_pending_controller controller;
 
     memset(&controller, 0, sizeof(controller));
-    tee_v5_proof_record_error(&controller, 7, 0x123456U,
-                              TEE_V5_PROOF_ERROR_HMAC_FAILURE, 1);
+    assert(tee_v5_proof_record_error(
+               &controller, 7, 0x123456U,
+               TEE_V5_PROOF_ERROR_HMAC_FAILURE, 1) == 0);
 
     /* An absent/unrelated ABORT or other lifecycle event is a no-op. */
     tee_v5_proof_clear_error(&controller, 8, 0x123456U);
@@ -122,11 +125,99 @@ static void test_non_segment_error_uses_no_segment_sentinel(void)
     struct tee_v3_pending_controller controller;
 
     memset(&controller, 0, sizeof(controller));
-    tee_v5_proof_record_error(&controller, 4, 5,
-                              TEE_V5_PROOF_ERROR_INTERNAL,
-                              TEE_V5_NO_FAILED_SEGMENT);
+    assert(tee_v5_proof_record_error(
+               &controller, 4, 5, TEE_V5_PROOF_ERROR_INTERNAL,
+               TEE_V5_NO_FAILED_SEGMENT) == 0);
     assert(controller.has_error);
     assert(controller.failed_segment_index == TEE_V5_NO_FAILED_SEGMENT);
+}
+
+static void assert_proof_error(struct proof_fixture *fixture,
+                               uint8_t file_id, uint32_t chunk_id,
+                               int32_t error,
+                               uint32_t failed_segment)
+{
+    struct tee_v3_one_bit_proof proof;
+    size_t written = 0;
+
+    assert(tee_v3_one_bit_proof_query(&fixture->controller, file_id, chunk_id,
+                                      0, NULL, 0, &written, &proof) ==
+           TEE_V3_QUERY_OK);
+    assert(proof.state == TEE_V3_PROOF_ERROR);
+    assert(proof.last_error_code == error);
+    assert(proof.failed_segment_index == failed_segment);
+}
+
+static void test_distinct_chunk_errors_survive_and_clear_independently(void)
+{
+    struct proof_fixture fixture;
+    struct tee_v3_one_bit_proof proof;
+    size_t written = 0;
+
+    fixture_init(&fixture, 1, 1);
+    assert(tee_v5_proof_record_error(
+               &fixture.controller, 10, 100,
+               TEE_V5_PROOF_ERROR_HMAC_FAILURE, 2) == 0);
+    assert(tee_v5_proof_record_error(
+               &fixture.controller, 11, 101,
+               TEE_V5_PROOF_ERROR_PERSISTENCE_FAILURE,
+               TEE_V5_NO_FAILED_SEGMENT) == 0);
+
+    assert_proof_error(&fixture, 10, 100,
+                       TEE_V5_PROOF_ERROR_HMAC_FAILURE, 2);
+    assert_proof_error(&fixture, 11, 101,
+                       TEE_V5_PROOF_ERROR_PERSISTENCE_FAILURE,
+                       TEE_V5_NO_FAILED_SEGMENT);
+
+    tee_v5_proof_clear_error(&fixture.controller, 10, 100);
+    assert(tee_v3_one_bit_proof_query(&fixture.controller, 10, 100, 0,
+                                      NULL, 0, &written, &proof) ==
+           TEE_V3_QUERY_NOT_FOUND);
+    assert_proof_error(&fixture, 11, 101,
+                       TEE_V5_PROOF_ERROR_PERSISTENCE_FAILURE,
+                       TEE_V5_NO_FAILED_SEGMENT);
+    fixture_destroy(&fixture);
+}
+
+static void test_error_table_full_preserves_existing_evidence(void)
+{
+    struct proof_fixture fixture;
+    uint32_t i;
+
+    fixture_init(&fixture, 1, 1);
+    assert(TEE_V5_PROOF_ERROR_CAPACITY == 8);
+    for (i = 0; i < TEE_V5_PROOF_ERROR_CAPACITY; i++) {
+        assert(tee_v5_proof_record_error(
+                   &fixture.controller, 20, 1000 + i,
+                   TEE_V5_PROOF_ERROR_DELETE_INTEGRITY, i + 1) == 0);
+    }
+
+    /* Deterministic full behavior: never evict evidence; reject the new item. */
+    assert(tee_v5_proof_record_error(
+               &fixture.controller, 21, 2000,
+               TEE_V5_PROOF_ERROR_INTERNAL,
+               TEE_V5_NO_FAILED_SEGMENT) == -1);
+    for (i = 0; i < TEE_V5_PROOF_ERROR_CAPACITY; i++) {
+        assert_proof_error(&fixture, 20, 1000 + i,
+                           TEE_V5_PROOF_ERROR_DELETE_INTEGRITY, i + 1);
+    }
+    fixture_destroy(&fixture);
+}
+
+static void test_legacy_record_resets_stale_scoped_state(void)
+{
+    struct proof_fixture fixture;
+
+    fixture_init(&fixture, 1, 1);
+    assert(tee_v5_proof_record_error(
+               &fixture.controller, 30, 3000,
+               TEE_V5_PROOF_ERROR_DELETE_CONFLICT,
+               TEE_V5_NO_FAILED_SEGMENT) == 0);
+
+    /* V1-V4's legacy API remains unscoped and replaces stale V5 evidence. */
+    tee_v3_pending_record_error(&fixture.controller, 77, 4);
+    assert_proof_error(&fixture, 31, 3001, 77, 4);
+    fixture_destroy(&fixture);
 }
 
 int main(void)
@@ -136,6 +227,9 @@ int main(void)
     test_error_is_scoped_to_exact_chunk_identity();
     test_only_matching_superseding_operation_clears_error();
     test_non_segment_error_uses_no_segment_sentinel();
+    test_distinct_chunk_errors_survive_and_clear_independently();
+    test_error_table_full_preserves_existing_evidence();
+    test_legacy_record_resets_stale_scoped_state();
     puts("test_tee_v5_proof: PASS");
     return 0;
 }

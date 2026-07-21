@@ -334,6 +334,17 @@ static void test_continuous_v1_to_v5_nvme_flow(void)
            TEE_V5_STATUS_OK);
     record = tee_v2_cache_find_passive(&g_v2_cache, 13, 35);
     assert(record && record->segment_count == 2);
+
+    /* Keep a second passive chunk to prove V5 policy errors stay scoped. */
+    submit_and_promote(&api, 120, 14, 36, 121);
+    bytes = make_identity(TEE_V5_ADMIN_CMD_ABORT_ACTIVE, 121, 14, 36);
+    assert(dispatch(TEE_V4_ADMIN_SUBMIT_OPCODE, (uint32_t)bytes, &api) ==
+           NVME_SUCCESS);
+    assert(fetch_status(&api, TEE_V5_ADMIN_CMD_ABORT_ACTIVE, 121) ==
+           TEE_V5_STATUS_OK);
+
+    record = tee_v2_cache_find_passive(&g_v2_cache, 13, 35);
+    assert(record && record->segment_count == 2);
     assert(g_v2_cache.protected_bitmap.byte_count <= sizeof(bitmap_before));
     memcpy(bitmap_before, g_v2_cache.protected_bitmap.bits,
            g_v2_cache.protected_bitmap.byte_count);
@@ -360,6 +371,14 @@ static void test_continuous_v1_to_v5_nvme_flow(void)
     assert(proof->state == TEE_V3_PROOF_ERROR);
     assert(proof->last_error_code == TEE_V5_PROOF_ERROR_PERSISTENCE_FAILURE);
     assert(proof->failed_segment_index == TEE_V5_NO_FAILED_SEGMENT);
+
+    bytes = make_query(TEE_V4_ADMIN_CMD_ONE_BIT_PROOF, 122, 14, 36);
+    assert(dispatch(TEE_V4_ADMIN_SUBMIT_OPCODE, (uint32_t)bytes, &api) ==
+           NVME_SUCCESS);
+    assert(fetch_status(&api, TEE_V4_ADMIN_CMD_ONE_BIT_PROOF, 122) ==
+           TEE_V5_STATUS_OK);
+    assert(proof->state == TEE_V3_PROOF_DONE);
+    assert(proof->done_bit == 1);
 
     /* No-pending response and unsupported command remain explicit. */
     assert(fetch_status(&api, 99, 999) ==

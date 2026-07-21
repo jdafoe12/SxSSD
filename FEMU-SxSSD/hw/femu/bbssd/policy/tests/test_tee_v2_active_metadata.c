@@ -19,6 +19,8 @@ static void test_rejects_ambiguous_groups_and_mismatched_record(void)
                                        1, groups, 2) == -1);
     groups[0] = (struct tee_v2_hmac_group_spec){1, 2, hmac};
     groups[1] = (struct tee_v2_hmac_group_spec){3, 2, hmac};
+    assert(tee_v2_active_metadata_init(&active, &config, 1, 0x1000000,
+                                       2012, 4, 1, groups, 2) == -1);
     assert(tee_v2_active_metadata_init(&active, &config, 1, 2, 2012, 4,
                                        1, groups, 2) == 0);
     segment[0] = TEE_V2_SEGMENT_MAGIC;

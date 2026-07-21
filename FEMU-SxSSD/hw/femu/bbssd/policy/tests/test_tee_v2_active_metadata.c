@@ -61,6 +61,13 @@ int main(void)
     assert(active.segment_locations[1] == 44);
     assert(memcmp(active.segment_bytes + 512, segment, 512) == 0);
     assert(active.groups[0].arrived_count == 1);
+    {
+        struct tee_v2_active_metadata clone;
+        assert(tee_v2_active_metadata_clone(&clone, &active) == 0);
+        active.segment_locations[1] = 99;
+        assert(clone.segment_locations[1] == 44 && clone.arrived[1]);
+        tee_v2_active_metadata_destroy(&clone);
+    }
     assert(tee_v2_active_record_segment(&active, 2, 45, segment) == 1);
 
     segment[1] = 8;

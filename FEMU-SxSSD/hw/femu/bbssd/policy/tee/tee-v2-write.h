@@ -37,6 +37,10 @@ bool tee_v2_write_page_range_allowed(const struct tee_v2_write_context *write,
 bool tee_v2_write_can_activate_identity(struct tee_v2_write_context *write,
                                         uint8_t file_id,
                                         uint32_t chunk_id);
+bool tee_v2_media_write_complete(uint64_t expected_pages,
+                                 uint64_t committed_pages,
+                                 uint64_t expected_bytes,
+                                 uint64_t consumed_bytes);
 void tee_v2_write_abandon_active(struct tee_v2_write_context *write);
 enum tee_v2_write_result tee_v2_classify_segment_write(
     struct tee_v2_write_context *write, uint64_t logical_location,

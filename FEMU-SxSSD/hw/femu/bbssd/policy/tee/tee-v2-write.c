@@ -65,6 +65,15 @@ bool tee_v2_write_can_activate_identity(struct tee_v2_write_context *write,
            tee_v2_cache_find_passive(write->cache, file_id, chunk_id) == NULL;
 }
 
+bool tee_v2_media_write_complete(uint64_t expected_pages,
+                                 uint64_t committed_pages,
+                                 uint64_t expected_bytes,
+                                 uint64_t consumed_bytes)
+{
+    return expected_pages > 0 && expected_pages == committed_pages &&
+           expected_bytes > 0 && expected_bytes == consumed_bytes;
+}
+
 void tee_v2_write_abandon_active(struct tee_v2_write_context *write)
 {
     uint32_t i;

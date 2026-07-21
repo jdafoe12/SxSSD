@@ -17,8 +17,10 @@ enum tee_v5_proof_error {
 #define TEE_V5_NO_FAILED_SEGMENT UINT32_MAX
 
 void tee_v5_proof_record_error(struct tee_v3_pending_controller *controller,
+                               uint8_t file_id, uint32_t chunk_id,
                                enum tee_v5_proof_error error,
                                uint32_t failed_segment_index);
-void tee_v5_proof_clear_error(struct tee_v3_pending_controller *controller);
+void tee_v5_proof_clear_error(struct tee_v3_pending_controller *controller,
+                              uint8_t file_id, uint32_t chunk_id);
 
 #endif

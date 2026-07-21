@@ -18,6 +18,7 @@ int tee_v5_admin_init(struct tee_v5_admin *admin,
 {
     if (!admin) return -1;
     memset(admin, 0, sizeof(*admin));
+    if (policy) policy->pending.error_precedes_passive = true;
     return tee_v4_admin_init(&admin->v4, policy, admin_buffer_bytes,
                              response_item_bytes);
 }
@@ -80,13 +81,17 @@ int tee_v5_admin_submit(struct tee_v5_admin *admin, const void *request,
                 admin, header, callback_result < 0 ?
                     TEE_V5_STATUS_INTERNAL_ERROR : TEE_V5_STATUS_OK);
         } else {
+            int delete_result;
             callback_result = admin->delete_chunk ?
                 admin->delete_chunk(admin->delete_chunk_opaque,
                                     identity->file_id, identity->chunk_id) : -1;
+            delete_result = callback_result;
             callback_result = prepare_status(
                 admin, header, callback_result == 0 ? TEE_V5_STATUS_OK :
-                callback_result > 0 ? TEE_V5_STATUS_NOT_FOUND :
+                callback_result == 1 ? TEE_V5_STATUS_NOT_FOUND :
+                callback_result == 2 ? TEE_V5_STATUS_BAD_REQUEST :
                 TEE_V5_STATUS_INTERNAL_ERROR);
+            if (callback_result == 0 && delete_result < 0) return -2;
         }
     }
     if (callback_result == 0) {

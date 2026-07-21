@@ -135,10 +135,32 @@ static int tee_v4_intake_active_metadata(
         specs[i].group_segment_count = groups[i].group_segment_count;
         specs[i].expected_hmac = groups[i].expected_hmac;
     }
-    result = tee_v2_policy_set_active_metadata(
-        metadata->file_id, metadata->chunk_id, metadata->chunk_size_bytes,
-        metadata->segment_count, metadata->number_coefficient, specs,
-        metadata->group_count);
+    if (g_ctx) {
+        result = tee_v2_policy_set_active_metadata(
+            metadata->file_id, metadata->chunk_id,
+            metadata->chunk_size_bytes, metadata->segment_count,
+            metadata->number_coefficient, specs, metadata->group_count);
+    } else {
+        struct tee_v2_active_metadata replacement = {0};
+        result = -1;
+        if (tee_v2_write_can_activate_identity(
+                &g_v2_write, metadata->file_id, metadata->chunk_id) &&
+            tee_v2_active_metadata_init(
+                &replacement, &g_v2_config, metadata->file_id,
+                metadata->chunk_id, metadata->chunk_size_bytes,
+                metadata->segment_count, metadata->number_coefficient,
+                specs, metadata->group_count) == 0) {
+            if (g_v2_active_valid) {
+                tee_v2_write_abandon_active(&g_v2_write);
+                tee_v2_active_metadata_destroy(&g_v2_active);
+            }
+            g_v2_active = replacement;
+            g_v2_active_valid = true;
+            g_v2_write.active = &g_v2_active;
+            g_v2_write.active_promoted = false;
+            result = 0;
+        }
+    }
     free(specs);
     return result;
 }
@@ -251,13 +273,9 @@ static uint64_t tee_v4_admin_callback(struct ssd *ssd,
     return 0;
 }
 
-int init_policy(struct ssd *ssd, struct FtlPolicyAPI *api)
+int tee_v4_policy_state_init(struct ssd *ssd, struct FtlPolicyAPI *api)
 {
-    int submit_handle;
-    int fetch_handle;
-
-    if (tee_v4_base_init_policy(ssd, api) != 0 || !api ||
-        !api->register_admin_hook || !api->unregister_admin_hook) {
+    if (tee_v4_base_init_policy(ssd, api) != 0 || !api) {
         return -1;
     }
     g_v4_backend.capacity = (size_t)(g_v1_layout.hidden_lba_count *
@@ -289,6 +307,22 @@ int init_policy(struct ssd *ssd, struct FtlPolicyAPI *api)
     tee_v2_write_set_relocation_cancel(&g_v2_write,
                                        tee_v4_cancel_relocations,
                                        &g_v4_writeback);
+
+    return 0;
+}
+
+#ifndef TEE_V4_POLICY_INIT_NAME
+#define TEE_V4_POLICY_INIT_NAME init_policy
+#endif
+int TEE_V4_POLICY_INIT_NAME(struct ssd *ssd, struct FtlPolicyAPI *api)
+{
+    int submit_handle;
+    int fetch_handle;
+
+    if (!api || !api->register_admin_hook || !api->unregister_admin_hook ||
+        tee_v4_policy_state_init(ssd, api) != 0) {
+        return -1;
+    }
 
     if (tee_v4_admin_init(&g_v4_admin, &g_v4_policy,
                           TEE_V4_ADMIN_DEFAULT_BUFFER_BYTES,

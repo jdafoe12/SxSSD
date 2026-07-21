@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -Wall -Wextra -O2 -fPIC -I. -Iinc
 POLICY_LDFLAGS = -shared
 
-POLICIES = block-interface-policy-eval.so block-interface-policy-baseline.so block-interface-policy-flashguard.so block-interface-flashguard-policy.so zns-policy.so signing-test-policy.so key-sharing-policy.so tee-ftl-v1-policy.so tee-ftl-v2-policy.so tee-ftl-v3-policy.so tee-ftl-v4-policy.so
+POLICIES = block-interface-policy-eval.so block-interface-policy-baseline.so block-interface-policy-flashguard.so block-interface-flashguard-policy.so zns-policy.so signing-test-policy.so key-sharing-policy.so tee-ftl-v1-policy.so tee-ftl-v2-policy.so tee-ftl-v3-policy.so tee-ftl-v4-policy.so tee-ftl-v5-policy.so
 
 .PHONY: all clean
 .PHONY: tool
@@ -23,6 +23,7 @@ TEE_V4_SRCS = tee/tee-v4-admin-format.c tee/tee-v4-admin-response.c tee/tee-v4-w
 TEE_V4_DEPS = tee-ftl-v4-policy.h tee/tee-v4-admin-format.h tee/tee-v4-admin-response.h tee/tee-v4-writeback.h tee/tee-v4-admin.h $(TEE_V4_SRCS)
 TEE_V5_STATUS_SRCS = tee/tee-v5-status.c
 TEE_V5_PROOF_SRCS = tee/tee-v5-proof.c
+TEE_V5_SRCS = tee/tee-v5-status.c tee/tee-v5-admin-format.c tee/tee-v5-admin.c tee/tee-v5-proof.c tee/tee-v5-delete.c
 
 block-interface-policy-eval.so: block-interface-policy-eval.c $(BLOCK_POLICY_DEPS)
 	$(CC) $(CFLAGS) $(POLICY_LDFLAGS) -o $@ block-interface-policy-eval.c lib/pqueue.c
@@ -56,6 +57,9 @@ tee-ftl-v3-policy.so: tee-ftl-v3-policy.c tee-ftl-v1-policy.c $(BLOCK_POLICY_DEP
 
 tee-ftl-v4-policy.so: tee-ftl-v4-policy.c tee-ftl-v3-policy.c tee-ftl-v1-policy.c $(BLOCK_POLICY_DEPS) $(TEE_V1_DEPS) $(TEE_V2_DEPS) $(TEE_V3_DEPS) $(TEE_V4_DEPS)
 	$(CC) $(CFLAGS) $(POLICY_LDFLAGS) -o $@ tee-ftl-v4-policy.c lib/pqueue.c $(TEE_V1_SRCS) $(TEE_V2_SRCS) $(TEE_V3_SRCS) $(TEE_V4_SRCS)
+
+tee-ftl-v5-policy.so: tee-ftl-v5-policy.c tee-ftl-v4-policy.c tee-ftl-v1-policy.c $(BLOCK_POLICY_DEPS) $(TEE_V1_DEPS) $(TEE_V2_DEPS) $(TEE_V3_DEPS) $(TEE_V4_DEPS) $(TEE_V5_SRCS)
+	$(CC) $(CFLAGS) $(POLICY_LDFLAGS) -o $@ tee-ftl-v5-policy.c lib/pqueue.c $(TEE_V1_SRCS) $(TEE_V2_SRCS) $(TEE_V3_SRCS) $(TEE_V4_SRCS) $(TEE_V5_SRCS)
 
 test_tee_v1_segment: tests/test_tee_v1_segment.c tee/tee-v1-segment.c tee/tee-v1-segment.h
 	$(CC) $(CFLAGS) -o $@ tests/test_tee_v1_segment.c tee/tee-v1-segment.c

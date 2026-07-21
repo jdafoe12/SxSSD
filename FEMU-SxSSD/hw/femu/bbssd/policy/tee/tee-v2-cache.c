@@ -68,7 +68,9 @@ int tee_v2_cache_store_passive(struct tee_v2_cache *cache,
                                const struct tee_v2_passive_metadata *passive)
 {
     struct tee_v2_passive_metadata *existing;
-    if (!cache || !passive || !passive->segment_count || !passive->segment_locations)
+    if (!cache || !passive || !passive->segment_count ||
+        !passive->segment_locations ||
+        (passive->group_count && !passive->groups))
         return -1;
     existing = tee_v2_cache_find_passive(cache, passive->file_id, passive->chunk_id);
     if (existing) {

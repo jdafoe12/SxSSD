@@ -26,7 +26,8 @@ int tee_v2_active_metadata_init(struct tee_v2_active_metadata *active,
     uint32_t i;
     uint32_t expected_start = 1;
 
-    if (!active || !config || segment_count == 0 || group_count == 0 ||
+    if (!active || !config || chunk_id > 0xFFFFFFU ||
+        segment_count == 0 || group_count == 0 ||
         !groups || group_count > config->hmac_group_capacity ||
         config->segment_size > SIZE_MAX / segment_count) {
         return -1;

@@ -398,6 +398,7 @@ static uint64_t write_callback(struct ssd *ssd, struct NvmeCommandEvent *event,
     uint64_t start_byte;
     uint64_t first_segment;
     uint64_t segment_count;
+    uint64_t lat;
     uint64_t i;
 
     (void)api;
@@ -411,13 +412,10 @@ static uint64_t write_callback(struct ssd *ssd, struct NvmeCommandEvent *event,
     segment_count = ((start_byte % g_v2_config.segment_size) +
                      (uint64_t)event->nsecs * ctx->secsz +
                      g_v2_config.segment_size - 1) / g_v2_config.segment_size;
-    for (i = 0; i < segment_count; i++) {
-        uint64_t location = first_segment + i;
-        if (tee_v2_cache_is_protected(&g_v2_cache, location) ||
-            tee_v1_bitmap_test(&g_v2_write.pending_bitmap, location)) {
-            event->status = NVME_INVALID_FIELD | NVME_DNR;
-            return 0;
-        }
+    if (!tee_v2_write_range_allowed(&g_v2_write, first_segment,
+                                    segment_count)) {
+        event->status = NVME_INVALID_FIELD | NVME_DNR;
+        return 0;
     }
     req_buf = ctx->api->copy_request_data(event->req, 0,
                                           (uint64_t)event->nsecs * ctx->secsz,
@@ -429,28 +427,42 @@ static uint64_t write_callback(struct ssd *ssd, struct NvmeCommandEvent *event,
     }
     if (start_byte % g_v2_config.segment_size == 0 &&
         req_size % g_v2_config.segment_size == 0) {
-        for (i = 0; i < req_size / g_v2_config.segment_size; i++) {
-            enum tee_v2_write_result result;
-            struct tee_v2_passive_metadata *passive = NULL;
-            uint32_t segment_index = 0;
-            result = tee_v2_process_segment_write(
+        uint64_t count = req_size / g_v2_config.segment_size;
+        enum tee_v2_write_result *results = calloc(count, sizeof(*results));
+        struct tee_v2_passive_metadata **passives = calloc(count, sizeof(*passives));
+        uint32_t *indices = calloc(count, sizeof(*indices));
+        uint64_t *old_locations = calloc(count, sizeof(*old_locations));
+        if (!results || !passives || !indices || !old_locations) {
+            free(results); free(passives); free(indices); free(old_locations);
+            free(req_buf);
+            event->status = NVME_INTERNAL_DEV_ERROR;
+            return 0;
+        }
+        /* Validate the complete request without changing policy state. */
+        for (i = 0; i < count; i++) {
+            results[i] = tee_v2_classify_segment_write(
                 &g_v2_write, first_segment + i,
                 req_buf + i * g_v2_config.segment_size,
-                g_v2_config.segment_size, &passive, &segment_index);
-            if (result == TEE_V2_WRITE_REJECTED || result == TEE_V2_WRITE_ERROR) {
+                g_v2_config.segment_size, &passives[i], &indices[i]);
+            if (results[i] == TEE_V2_WRITE_REJECTED ||
+                results[i] == TEE_V2_WRITE_ERROR) {
+                free(results); free(passives); free(indices); free(old_locations);
                 free(req_buf);
                 event->status = NVME_INVALID_FIELD | NVME_DNR;
                 return 0;
             }
-            if (result == TEE_V2_WRITE_RELOCATION) {
-                /* Comparison is performed by the policy-facing helper below. */
-                uint64_t old_location = passive->segment_locations[segment_index - 1];
-                uint64_t old_byte = old_location * g_v2_config.segment_size;
-                uint64_t old_lpn = old_byte / ctx->page_size;
-                size_t old_offset = (size_t)(old_byte % ctx->page_size);
-                PseudoPpa old_ppa = get_maptbl_ent(ctx, old_lpn);
+            if (results[i] == TEE_V2_WRITE_RELOCATION) {
+                uint64_t old_byte;
+                uint64_t old_lpn;
+                size_t old_offset;
+                PseudoPpa old_ppa;
                 uint8_t *page = malloc((size_t)ctx->page_size);
                 bool same = false;
+                old_locations[i] = passives[i]->segment_locations[indices[i] - 1];
+                old_byte = old_locations[i] * g_v2_config.segment_size;
+                old_lpn = old_byte / ctx->page_size;
+                old_offset = (size_t)(old_byte % ctx->page_size);
+                old_ppa = get_maptbl_ent(ctx, old_lpn);
                 if (page && old_offset + g_v2_config.segment_size <= ctx->page_size &&
                     ctx->api->mapped_ppa(&old_ppa) &&
                     ctx->api->valid_ppa(ctx->ssd, &old_ppa)) {
@@ -462,16 +474,34 @@ static uint64_t write_callback(struct ssd *ssd, struct NvmeCommandEvent *event,
                 }
                 free(page);
                 if (!same) {
+                    free(results); free(passives); free(indices); free(old_locations);
                     free(req_buf);
                     event->status = NVME_INVALID_FIELD | NVME_DNR;
                     return 0;
                 }
-                /* V2 models mark-new-before-unmark; durable transaction is V4. */
-                tee_v2_cache_mark_protected(&g_v2_cache, first_segment + i);
-                passive->segment_locations[segment_index - 1] = first_segment + i;
-                tee_v2_cache_unmark_protected(&g_v2_cache, old_location);
             }
         }
+        lat = block_write(ssd, event);
+        /* Publish RAM working/persisted-style state only after the data write. */
+        for (i = 0; i < count; i++) {
+            if (results[i] == TEE_V2_WRITE_PENDING) {
+                enum tee_v2_write_result applied = tee_v2_process_segment_write(
+                    &g_v2_write, first_segment + i,
+                    req_buf + i * g_v2_config.segment_size,
+                    g_v2_config.segment_size, NULL, NULL);
+                if (applied == TEE_V2_WRITE_ERROR ||
+                    applied == TEE_V2_WRITE_REJECTED)
+                    event->status = NVME_INTERNAL_DEV_ERROR;
+            } else if (results[i] == TEE_V2_WRITE_RELOCATION) {
+                /* V2 records mark-new-before-unmark; durable transaction is V4. */
+                tee_v2_cache_mark_protected(&g_v2_cache, first_segment + i);
+                passives[i]->segment_locations[indices[i] - 1] = first_segment + i;
+                tee_v2_cache_unmark_protected(&g_v2_cache, old_locations[i]);
+            }
+        }
+        free(results); free(passives); free(indices); free(old_locations);
+        free(req_buf);
+        return lat;
     }
     free(req_buf);
     return block_write(ssd, event);
@@ -513,6 +543,22 @@ static uint64_t dsm_callback(struct ssd *ssd, struct NvmeCommandEvent *event,
             event->status = NVME_LBA_RANGE | NVME_DNR;
             return 0;
         }
+#ifdef TEE_V2_POLICY
+        {
+            struct block_policy_context *ctx = get_policy_ctx(ssd);
+            uint64_t start_byte = ranges[i].slba * (uint64_t)ctx->secsz;
+            uint64_t first_segment = start_byte / g_v2_config.segment_size;
+            uint64_t segment_count = ((start_byte % g_v2_config.segment_size) +
+                                      (uint64_t)ranges[i].nlb * ctx->secsz +
+                                      g_v2_config.segment_size - 1) /
+                                     g_v2_config.segment_size;
+            if (!tee_v2_write_range_allowed(&g_v2_write, first_segment,
+                                            segment_count)) {
+                event->status = NVME_INVALID_FIELD | NVME_DNR;
+                return 0;
+            }
+        }
+#endif
     }
 
     (void)api;
@@ -660,7 +706,10 @@ int tee_v2_policy_set_active_metadata(
     const struct tee_v2_hmac_group_spec *groups, uint32_t group_count)
 {
     if (!g_ctx) return -1;
-    if (g_v2_active_valid) tee_v2_active_metadata_destroy(&g_v2_active);
+    if (g_v2_active_valid) {
+        tee_v2_write_abandon_active(&g_v2_write);
+        tee_v2_active_metadata_destroy(&g_v2_active);
+    }
     if (tee_v2_active_metadata_init(&g_v2_active, &g_v2_config, file_id,
                                     chunk_id, chunk_size_bytes, segment_count,
                                     number_coefficient, groups, group_count) != 0) {
@@ -676,7 +725,10 @@ int tee_v2_policy_set_active_metadata(
 
 void tee_v2_policy_clear_active_metadata(void)
 {
-    if (g_v2_active_valid) tee_v2_active_metadata_destroy(&g_v2_active);
+    if (g_v2_active_valid) {
+        tee_v2_write_abandon_active(&g_v2_write);
+        tee_v2_active_metadata_destroy(&g_v2_active);
+    }
     g_v2_active_valid = false;
     g_v2_write.active = NULL;
     g_v2_write.active_promoted = false;

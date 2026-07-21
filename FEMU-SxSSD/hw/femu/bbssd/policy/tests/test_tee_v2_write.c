@@ -128,4 +128,34 @@ static void test_request_preflight_rejects_duplicate_active_index(void)
     tee_v2_active_metadata_destroy(&active);
 }
 
-int main(void){test_normal_and_guard_paths();test_active_group_and_promotion();test_hmac_failure_becomes_normal();test_preflight_is_non_mutating_and_abandon_clears_pending();test_range_guard();test_request_preflight_rejects_duplicate_active_index();puts("test_tee_v2_write: PASS");return 0;}
+static void test_request_preflight_rejects_duplicate_relocation(void)
+{
+    struct tee_v2_cache cache; struct tee_v2_write_context write;
+    struct tee_v2_passive_metadata passive={0}; uint64_t location=20;
+    uint8_t s[2][512]; enum tee_v2_write_result results[2];
+    struct tee_v2_passive_metadata *passives[2]; uint32_t indices[2];
+    passive.file_id=8;passive.chunk_id=0x010203;passive.segment_count=1;
+    passive.segment_locations=&location;
+    segment(s[0],1,0x66);memcpy(s[1],s[0],512);
+    assert(tee_v2_cache_init(&cache,1000,2)==0);
+    assert(tee_v2_cache_store_passive(&cache,&passive)==0);
+    assert(tee_v2_write_context_init(&write,NULL,&cache,1000)==0);
+    assert(!tee_v2_write_can_activate_identity(&write,8,0x010203));
+    assert(tee_v2_write_can_activate_identity(&write,8,0x010204));
+    assert(tee_v2_preflight_segment_request(&write,600,&s[0][0],512,2,
+                                             results,passives,indices)==-1);
+    tee_v2_write_context_destroy(&write);tee_v2_cache_destroy(&cache);
+}
+
+static void test_page_expanded_guard(void)
+{
+    struct tee_v2_cache cache; struct tee_v2_write_context write;
+    assert(tee_v2_cache_init(&cache,32,2)==0);
+    assert(tee_v2_write_context_init(&write,NULL,&cache,32)==0);
+    assert(tee_v2_cache_mark_protected(&cache,15)==0);
+    assert(!tee_v2_write_page_range_allowed(&write,8,1,8));
+    assert(tee_v2_write_page_range_allowed(&write,16,1,8));
+    tee_v2_write_context_destroy(&write);tee_v2_cache_destroy(&cache);
+}
+
+int main(void){test_normal_and_guard_paths();test_active_group_and_promotion();test_hmac_failure_becomes_normal();test_preflight_is_non_mutating_and_abandon_clears_pending();test_range_guard();test_request_preflight_rejects_duplicate_active_index();test_request_preflight_rejects_duplicate_relocation();test_page_expanded_guard();puts("test_tee_v2_write: PASS");return 0;}

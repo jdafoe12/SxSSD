@@ -439,18 +439,16 @@ static uint64_t write_callback(struct ssd *ssd, struct NvmeCommandEvent *event,
             return 0;
         }
         /* Validate the complete request without changing policy state. */
+        if (tee_v2_preflight_segment_request(
+                &g_v2_write, first_segment, req_buf,
+                g_v2_config.segment_size, count,
+                results, passives, indices) != 0) {
+            free(results); free(passives); free(indices); free(old_locations);
+            free(req_buf);
+            event->status = NVME_INVALID_FIELD | NVME_DNR;
+            return 0;
+        }
         for (i = 0; i < count; i++) {
-            results[i] = tee_v2_classify_segment_write(
-                &g_v2_write, first_segment + i,
-                req_buf + i * g_v2_config.segment_size,
-                g_v2_config.segment_size, &passives[i], &indices[i]);
-            if (results[i] == TEE_V2_WRITE_REJECTED ||
-                results[i] == TEE_V2_WRITE_ERROR) {
-                free(results); free(passives); free(indices); free(old_locations);
-                free(req_buf);
-                event->status = NVME_INVALID_FIELD | NVME_DNR;
-                return 0;
-            }
             if (results[i] == TEE_V2_WRITE_RELOCATION) {
                 uint64_t old_byte;
                 uint64_t old_lpn;

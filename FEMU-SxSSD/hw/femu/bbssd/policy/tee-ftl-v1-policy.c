@@ -249,10 +249,16 @@ static bool resolve_read_ppa(void *opaque, struct ssd *ssd, uint64_t lpn, Pseudo
     *out = ppa;
     return true;
 }
+struct block_write_commit_context {
+    struct block_policy_context *policy;
+    uint64_t committed_pages;
+};
+
 static void block_update_mapping_after_write(void *opaque, struct ssd *ssd,
                                              uint64_t lpn,
                                              const PseudoPpa *new_ppa) {
-    struct block_policy_context *ctx = opaque;
+    struct block_write_commit_context *commit = opaque;
+    struct block_policy_context *ctx = commit->policy;
     PseudoPpa old_ppa = get_maptbl_ent(ctx, lpn);
     PseudoPpa new_ppa_local = *new_ppa;
     (void)ssd;
@@ -261,32 +267,35 @@ static void block_update_mapping_after_write(void *opaque, struct ssd *ssd,
         set_rmap_ent(ctx, INVALID_LPN, &old_ppa);
     }
     set_maptbl_ent(ctx, lpn, &new_ppa_local);
+    commit->committed_pages++;
 }
-static uint64_t block_write(struct ssd *ssd, struct NvmeCommandEvent *event) {
+static uint64_t block_write_buffer(struct ssd *ssd,
+                                   struct NvmeCommandEvent *event,
+                                   const uint8_t *req_buf,
+                                   uint64_t req_size,
+                                   bool *complete) {
     struct block_policy_context *ctx = get_policy_ctx(ssd);
     const struct eswd_layout *layout = ctx->api->get_eswd_layout(ctx->ssd);
-    uint8_t *req_buf;
-    uint64_t req_size = 0;
+    struct block_write_commit_context commit = { .policy = ctx };
     uint64_t max_lat = 0;
     uint64_t cur_lba;
     uint64_t end_lba;
     uint64_t data_off_bytes = 0;
+    uint64_t expected_pages;
     uint32_t pgs_per_eswd;
     assert(ctx);
+    if (complete) *complete = false;
+    if (!req_buf || req_size != (uint64_t)event->nsecs * ctx->secsz)
+        return 0;
     while (should_gc_high(ctx)) {
         if (do_gc(ctx, true) < 0) {
             break;
         }
     }
-    req_buf = ctx->api->copy_request_data(event->req, 0,
-                                          (uint64_t)event->nsecs * ctx->secsz,
-                                          &req_size);
-    if (!req_buf || req_size < (uint64_t)event->nsecs * ctx->secsz) {
-        free(req_buf);
-        return 0;
-    }
     cur_lba = event->lba;
     end_lba = event->lba + event->nsecs;
+    expected_pages = (end_lba - 1) / ctx->secs_per_pg -
+                     cur_lba / ctx->secs_per_pg + 1;
     pgs_per_eswd = layout ? layout->pgs_per_eswd : 0;
     while (cur_lba < end_lba && pgs_per_eswd > 0) {
         uint32_t wp = ctx->api->get_eswd_wp_index(ctx->ssd, ctx->cur_eswd_id);
@@ -321,7 +330,7 @@ static uint64_t block_write(struct ssd *ssd, struct NvmeCommandEvent *event) {
                                         resolve_read_ppa, ctx,
                                         -1,
                                         NULL, NULL,
-                                        block_update_mapping_after_write, ctx,
+                                        block_update_mapping_after_write, &commit,
                                         (int64_t)event->stime);
         if (lat > max_lat) {
             max_lat = lat;
@@ -330,8 +339,30 @@ static uint64_t block_write(struct ssd *ssd, struct NvmeCommandEvent *event) {
         cur_lba = chunk_end_lba;
         rotate_if_full(ctx);
     }
-    free(req_buf);
+    if (complete)
+#ifdef TEE_V2_POLICY
+        *complete = tee_v2_media_write_complete(
+            expected_pages, commit.committed_pages, req_size, data_off_bytes);
+#else
+        *complete = expected_pages > 0 &&
+                    expected_pages == commit.committed_pages &&
+                    req_size > 0 && req_size == data_off_bytes;
+#endif
     return max_lat;
+}
+
+static uint64_t block_write(struct ssd *ssd, struct NvmeCommandEvent *event) {
+    struct block_policy_context *ctx = get_policy_ctx(ssd);
+    uint8_t *req_buf;
+    uint64_t req_size = 0;
+    uint64_t lat;
+    bool complete;
+    req_buf = ctx->api->copy_request_data(event->req, 0,
+                                          (uint64_t)event->nsecs * ctx->secsz,
+                                          &req_size);
+    lat = block_write_buffer(ssd, event, req_buf, req_size, &complete);
+    free(req_buf);
+    return complete ? lat : 0;
 }
 static uint64_t block_trim(struct ssd *ssd, struct NvmeCommandEvent *event) {
     struct block_policy_context *ctx = get_policy_ctx(ssd);
@@ -432,6 +463,10 @@ static uint64_t write_callback(struct ssd *ssd, struct NvmeCommandEvent *event,
         struct tee_v2_passive_metadata **passives = calloc(count, sizeof(*passives));
         uint32_t *indices = calloc(count, sizeof(*indices));
         uint64_t *old_locations = calloc(count, sizeof(*old_locations));
+        struct tee_v2_active_metadata active_snapshot = {0};
+        uint8_t *pending_snapshot = NULL;
+        bool active_snapshot_valid = false;
+        bool policy_apply_failed = false;
         if (!results || !passives || !indices || !old_locations) {
             free(results); free(passives); free(indices); free(old_locations);
             free(req_buf);
@@ -479,18 +514,88 @@ static uint64_t write_callback(struct ssd *ssd, struct NvmeCommandEvent *event,
                 }
             }
         }
-        lat = block_write(ssd, event);
-        /* Publish RAM working/persisted-style state only after the data write. */
         for (i = 0; i < count; i++) {
             if (results[i] == TEE_V2_WRITE_PENDING) {
-                enum tee_v2_write_result applied = tee_v2_process_segment_write(
-                    &g_v2_write, first_segment + i,
-                    req_buf + i * g_v2_config.segment_size,
-                    g_v2_config.segment_size, NULL, NULL);
-                if (applied == TEE_V2_WRITE_ERROR ||
-                    applied == TEE_V2_WRITE_REJECTED)
+                if (g_v2_cache.passive_count >= g_v2_cache.passive_capacity ||
+                    tee_v2_active_metadata_clone(&active_snapshot,
+                                                 &g_v2_active) != 0) {
+                    free(results); free(passives); free(indices); free(old_locations);
+                    free(req_buf);
                     event->status = NVME_INTERNAL_DEV_ERROR;
-            } else if (results[i] == TEE_V2_WRITE_RELOCATION) {
+                    return 0;
+                }
+                pending_snapshot = malloc((size_t)g_v2_write.pending_bitmap.byte_count);
+                if (!pending_snapshot) {
+                    tee_v2_active_metadata_destroy(&active_snapshot);
+                    free(results); free(passives); free(indices); free(old_locations);
+                    free(req_buf);
+                    event->status = NVME_INTERNAL_DEV_ERROR;
+                    return 0;
+                }
+                memcpy(pending_snapshot, g_v2_write.pending_bitmap.bits,
+                       (size_t)g_v2_write.pending_bitmap.byte_count);
+                active_snapshot_valid = true;
+                break;
+            }
+        }
+        {
+            bool media_complete = false;
+            lat = block_write_buffer(ssd, event, req_buf, req_size,
+                                     &media_complete);
+            if (!media_complete) {
+                if (active_snapshot_valid)
+                    tee_v2_active_metadata_destroy(&active_snapshot);
+                free(pending_snapshot);
+                free(results); free(passives); free(indices); free(old_locations);
+                free(req_buf);
+                event->status = NVME_INTERNAL_DEV_ERROR;
+                return lat;
+            }
+        }
+        /* Publish RAM working/persisted-style state only after the data write. */
+        if (active_snapshot_valid) {
+            uint32_t active_index;
+            bool apply_failed = false;
+            for (active_index = 1;
+                 active_index <= active_snapshot.segment_count && !apply_failed;
+                 active_index++) {
+                for (i = 0; i < count; i++) {
+                    struct tee_v2_segment_header header;
+                    enum tee_v2_write_result applied;
+                    if (results[i] != TEE_V2_WRITE_PENDING ||
+                        !tee_v2_parse_segment_header(
+                            req_buf + i * g_v2_config.segment_size,
+                            g_v2_config.segment_size, &header) ||
+                        header.segment_index != active_index)
+                        continue;
+                    applied = tee_v2_process_segment_write(
+                        &g_v2_write, first_segment + i,
+                        req_buf + i * g_v2_config.segment_size,
+                        g_v2_config.segment_size, NULL, NULL);
+                    if (applied == TEE_V2_WRITE_ERROR ||
+                        applied == TEE_V2_WRITE_REJECTED) {
+                        apply_failed = true;
+                        break;
+                    }
+                }
+            }
+            if (apply_failed) {
+                tee_v2_active_metadata_destroy(&g_v2_active);
+                g_v2_active = active_snapshot;
+                active_snapshot_valid = false;
+                g_v2_write.active = &g_v2_active;
+                g_v2_write.active_promoted = false;
+                memcpy(g_v2_write.pending_bitmap.bits, pending_snapshot,
+                       (size_t)g_v2_write.pending_bitmap.byte_count);
+                event->status = NVME_INTERNAL_DEV_ERROR;
+                policy_apply_failed = true;
+            }
+        }
+        if (active_snapshot_valid)
+            tee_v2_active_metadata_destroy(&active_snapshot);
+        free(pending_snapshot);
+        for (i = 0; i < count; i++) {
+            if (!policy_apply_failed && results[i] == TEE_V2_WRITE_RELOCATION) {
                 /* V2 records mark-new-before-unmark; durable transaction is V4. */
                 tee_v2_cache_mark_protected(&g_v2_cache, first_segment + i);
                 passives[i]->segment_locations[indices[i] - 1] = first_segment + i;
@@ -550,8 +655,9 @@ static uint64_t dsm_callback(struct ssd *ssd, struct NvmeCommandEvent *event,
                                       (uint64_t)ranges[i].nlb * ctx->secsz +
                                       g_v2_config.segment_size - 1) /
                                      g_v2_config.segment_size;
-            if (!tee_v2_write_range_allowed(&g_v2_write, first_segment,
-                                            segment_count)) {
+            if (!tee_v2_write_page_range_allowed(
+                    &g_v2_write, first_segment, segment_count,
+                    g_v2_config.segments_per_page)) {
                 event->status = NVME_INVALID_FIELD | NVME_DNR;
                 return 0;
             }
@@ -704,6 +810,8 @@ int tee_v2_policy_set_active_metadata(
     const struct tee_v2_hmac_group_spec *groups, uint32_t group_count)
 {
     if (!g_ctx) return -1;
+    if (!tee_v2_write_can_activate_identity(&g_v2_write, file_id, chunk_id))
+        return -1;
     if (g_v2_active_valid) {
         tee_v2_write_abandon_active(&g_v2_write);
         tee_v2_active_metadata_destroy(&g_v2_active);

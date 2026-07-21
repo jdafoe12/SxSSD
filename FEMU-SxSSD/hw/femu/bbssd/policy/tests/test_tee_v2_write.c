@@ -165,4 +165,22 @@ static void test_media_completion_requires_all_bytes_and_pages(void)
     assert(!tee_v2_media_write_complete(2,2,4096,2048));
 }
 
-int main(void){test_normal_and_guard_paths();test_active_group_and_promotion();test_hmac_failure_becomes_normal();test_preflight_is_non_mutating_and_abandon_clears_pending();test_range_guard();test_request_preflight_rejects_duplicate_active_index();test_request_preflight_rejects_duplicate_relocation();test_page_expanded_guard();test_media_completion_requires_all_bytes_and_pages();puts("test_tee_v2_write: PASS");return 0;}
+static void test_failed_media_does_not_publish_active_state(void)
+{
+    struct tee_v2_format_config config; struct tee_v2_active_metadata active;
+    struct tee_v2_hmac_group_spec spec; struct tee_v2_cache cache;
+    struct tee_v2_write_context write; uint8_t s[512], expected[32];
+    segment(s,1,0x77);tee_v2_hmac_sha256(tee_v2_prototype_key,32,s,512,expected);
+    assert(tee_v2_format_config_init(&config,512,4096));
+    spec=(struct tee_v2_hmac_group_spec){1,1,expected};
+    assert(tee_v2_active_metadata_init(&active,&config,8,0x010203,503,1,1,&spec,1)==0);
+    assert(tee_v2_cache_init(&cache,1000,2)==0);
+    assert(tee_v2_write_context_init(&write,&active,&cache,1000)==0);
+    assert(tee_v2_apply_segment_after_media(&write,false,700,s,512)==TEE_V2_WRITE_ERROR);
+    assert(!active.arrived[0] && !tee_v1_bitmap_test(&write.pending_bitmap,700));
+    assert(!tee_v2_cache_is_protected(&cache,700));
+    tee_v2_write_context_destroy(&write);tee_v2_cache_destroy(&cache);
+    tee_v2_active_metadata_destroy(&active);
+}
+
+int main(void){test_normal_and_guard_paths();test_active_group_and_promotion();test_hmac_failure_becomes_normal();test_preflight_is_non_mutating_and_abandon_clears_pending();test_range_guard();test_request_preflight_rejects_duplicate_active_index();test_request_preflight_rejects_duplicate_relocation();test_page_expanded_guard();test_media_completion_requires_all_bytes_and_pages();test_failed_media_does_not_publish_active_state();puts("test_tee_v2_write: PASS");return 0;}

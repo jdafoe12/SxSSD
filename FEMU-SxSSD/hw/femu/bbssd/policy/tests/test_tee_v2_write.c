@@ -158,4 +158,11 @@ static void test_page_expanded_guard(void)
     tee_v2_write_context_destroy(&write);tee_v2_cache_destroy(&cache);
 }
 
-int main(void){test_normal_and_guard_paths();test_active_group_and_promotion();test_hmac_failure_becomes_normal();test_preflight_is_non_mutating_and_abandon_clears_pending();test_range_guard();test_request_preflight_rejects_duplicate_active_index();test_request_preflight_rejects_duplicate_relocation();test_page_expanded_guard();puts("test_tee_v2_write: PASS");return 0;}
+static void test_media_completion_requires_all_bytes_and_pages(void)
+{
+    assert(tee_v2_media_write_complete(2,2,4096,4096));
+    assert(!tee_v2_media_write_complete(2,1,4096,4096));
+    assert(!tee_v2_media_write_complete(2,2,4096,2048));
+}
+
+int main(void){test_normal_and_guard_paths();test_active_group_and_promotion();test_hmac_failure_becomes_normal();test_preflight_is_non_mutating_and_abandon_clears_pending();test_range_guard();test_request_preflight_rejects_duplicate_active_index();test_request_preflight_rejects_duplicate_relocation();test_page_expanded_guard();test_media_completion_requires_all_bytes_and_pages();puts("test_tee_v2_write: PASS");return 0;}

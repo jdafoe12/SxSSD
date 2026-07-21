@@ -36,6 +36,8 @@ void tee_v4_admin_set_metadata_intake(
                   const struct tee_v4_admin_hmac_group_wire *),
     void *opaque);
 int tee_v4_admin_sign_request(void *request_buffer, size_t request_bytes);
+int tee_v4_admin_verify_request(const void *request_buffer,
+                                size_t request_bytes);
 int tee_v4_admin_submit(struct tee_v4_admin *admin, const void *request_buffer,
                         size_t request_bytes);
 int tee_v4_admin_fetch(struct tee_v4_admin *admin, const void *request_buffer,

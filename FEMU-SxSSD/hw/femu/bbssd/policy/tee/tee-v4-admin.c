@@ -79,6 +79,19 @@ static int verify_request_mac(const void *request_buffer, size_t request_bytes)
     return memcmp(actual, header->request_mac, sizeof(actual)) == 0 ? 0 : -1;
 }
 
+int tee_v4_admin_verify_request(const void *request_buffer,
+                                size_t request_bytes)
+{
+    const struct tee_v4_admin_request_header *header = request_buffer;
+
+    if (!request_buffer ||
+        !tee_v4_admin_request_valid(header, request_bytes) ||
+        request_bytes != sizeof(*header) + header->payload_len) {
+        return -1;
+    }
+    return verify_request_mac(request_buffer, request_bytes);
+}
+
 int tee_v4_admin_init(struct tee_v4_admin *admin,
                       struct tee_v3_policy_context *policy,
                       uint32_t admin_buffer_bytes,

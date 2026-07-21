@@ -74,6 +74,15 @@ bool tee_v2_media_write_complete(uint64_t expected_pages,
            expected_bytes > 0 && expected_bytes == consumed_bytes;
 }
 
+enum tee_v2_write_result tee_v2_apply_segment_after_media(
+    struct tee_v2_write_context *write, bool media_complete,
+    uint64_t logical_location, const uint8_t *segment, size_t segment_size)
+{
+    if (!media_complete) return TEE_V2_WRITE_ERROR;
+    return tee_v2_process_segment_write(write, logical_location, segment,
+                                        segment_size, NULL, NULL);
+}
+
 void tee_v2_write_abandon_active(struct tee_v2_write_context *write)
 {
     uint32_t i;

@@ -41,6 +41,9 @@ bool tee_v2_media_write_complete(uint64_t expected_pages,
                                  uint64_t committed_pages,
                                  uint64_t expected_bytes,
                                  uint64_t consumed_bytes);
+enum tee_v2_write_result tee_v2_apply_segment_after_media(
+    struct tee_v2_write_context *write, bool media_complete,
+    uint64_t logical_location, const uint8_t *segment, size_t segment_size);
 void tee_v2_write_abandon_active(struct tee_v2_write_context *write);
 enum tee_v2_write_result tee_v2_classify_segment_write(
     struct tee_v2_write_context *write, uint64_t logical_location,

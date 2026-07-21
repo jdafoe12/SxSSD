@@ -24,6 +24,7 @@ int tee_v2_active_metadata_init(struct tee_v2_active_metadata *active,
 {
     size_t bytes_size;
     uint32_t i;
+    uint32_t expected_start = 1;
 
     if (!active || !config || segment_count == 0 || group_count == 0 ||
         !groups || group_count > config->hmac_group_capacity ||
@@ -43,7 +44,8 @@ int tee_v2_active_metadata_init(struct tee_v2_active_metadata *active,
         return -1;
     }
     for (i = 0; i < group_count; i++) {
-        if (!group_valid(&groups[i], segment_count)) {
+        if (!group_valid(&groups[i], segment_count) ||
+            groups[i].start_segment_index != expected_start) {
             tee_v2_active_metadata_destroy(active);
             return -1;
         }
@@ -53,6 +55,11 @@ int tee_v2_active_metadata_init(struct tee_v2_active_metadata *active,
         active->groups[i].group_segment_count = groups[i].group_segment_count;
         memcpy(active->groups[i].expected_hmac, groups[i].expected_hmac,
                TEE_V2_HMAC_SIZE);
+        expected_start += groups[i].group_segment_count;
+    }
+    if (expected_start != segment_count + 1) {
+        tee_v2_active_metadata_destroy(active);
+        return -1;
     }
     for (i = 0; i < segment_count; i++) {
         active->segment_locations[i] = TEE_V2_LOCATION_UNSET;
@@ -115,10 +122,14 @@ int tee_v2_active_record_segment(struct tee_v2_active_metadata *active,
                                  const uint8_t *segment)
 {
     struct tee_v2_hmac_group_state *group;
+    struct tee_v2_segment_header header;
     uint32_t slot;
     if (!active || !segment || segment_index == 0 ||
         segment_index > active->segment_count ||
-        logical_location == TEE_V2_LOCATION_UNSET) return -1;
+        logical_location == TEE_V2_LOCATION_UNSET ||
+        !tee_v2_active_matches_segment(active, segment,
+                                       active->config.segment_size, &header) ||
+        header.segment_index != segment_index) return -1;
     slot = segment_index - 1;
     if (active->arrived[slot]) return 1;
     group = tee_v2_active_find_group(active, segment_index);

@@ -6,7 +6,7 @@ POLICIES = block-interface-policy-eval.so block-interface-policy-baseline.so blo
 
 .PHONY: all clean
 .PHONY: tool
-.PHONY: test test-tee-v1 test-tee-v2 test-tee-v3 test-tee-v3-storage test-tee-v3-read test-tee-v3-proof-timeout test-tee-v4 test-tee-v4-admin-format test-tee-v4-admin-response test-tee-v4-writeback test-tee-v4-admin
+.PHONY: test test-tee-v1 test-tee-v2 test-tee-v3 test-tee-v3-storage test-tee-v3-read test-tee-v3-proof-timeout test-tee-v4 test-tee-v4-admin-format test-tee-v4-admin-response test-tee-v4-writeback test-tee-v4-admin test-tee-v4-policy-flow test-tee-v4-metadata-intake
 
 all: $(POLICIES)
 
@@ -156,12 +156,24 @@ test-tee-v4-writeback: test_tee_v4_writeback
 	./test_tee_v4_writeback
 
 test_tee_v4_admin: tests/test_tee_v4_admin.c $(TEE_V1_DEPS) $(TEE_V2_DEPS) $(TEE_V3_DEPS) $(TEE_V4_DEPS)
-	$(CC) $(CFLAGS) -o $@ tests/test_tee_v4_admin.c $(TEE_V1_SRCS) $(TEE_V2_SRCS) $(TEE_V3_SRCS) tee/tee-v4-admin-format.c tee/tee-v4-admin-response.c tee/tee-v4-admin.c
+	$(CC) $(CFLAGS) -o $@ tests/test_tee_v4_admin.c $(TEE_V1_SRCS) $(TEE_V2_SRCS) $(TEE_V3_SRCS) tee/tee-v4-admin-format.c tee/tee-v4-admin-response.c tee/tee-v4-writeback.c tee/tee-v4-admin.c
 
 test-tee-v4-admin: test_tee_v4_admin
 	./test_tee_v4_admin
 
-test-tee-v4: test-tee-v4-admin-format test-tee-v4-admin-response test-tee-v4-writeback test-tee-v4-admin
+test_tee_v4_policy_flow: tests/test_tee_v4_policy_flow.c tee-ftl-v4-policy.c tee-ftl-v1-policy.c $(BLOCK_POLICY_DEPS) $(TEE_V1_DEPS) $(TEE_V2_DEPS) $(TEE_V3_DEPS) $(TEE_V4_DEPS)
+	$(CC) $(CFLAGS) -o $@ tests/test_tee_v4_policy_flow.c lib/pqueue.c $(TEE_V1_SRCS) $(TEE_V2_SRCS) $(TEE_V3_SRCS) $(TEE_V4_SRCS)
+
+test-tee-v4-policy-flow: test_tee_v4_policy_flow
+	./test_tee_v4_policy_flow
+
+test_tee_v4_metadata_intake: tests/test_tee_v4_metadata_intake.c $(TEE_V1_DEPS) $(TEE_V2_DEPS) $(TEE_V3_DEPS) $(TEE_V4_DEPS)
+	$(CC) $(CFLAGS) -o $@ tests/test_tee_v4_metadata_intake.c $(TEE_V1_SRCS) $(TEE_V2_SRCS) $(TEE_V3_SRCS) $(TEE_V4_SRCS)
+
+test-tee-v4-metadata-intake: test_tee_v4_metadata_intake
+	./test_tee_v4_metadata_intake
+
+test-tee-v4: test-tee-v4-admin-format test-tee-v4-admin-response test-tee-v4-writeback test-tee-v4-admin test-tee-v4-policy-flow test-tee-v4-metadata-intake
 
 clean:
-	rm -f $(POLICIES) test_tee_v1_segment test_tee_v1_bitmap test_tee_v1_guard test_tee_v1_flow test_tee_v2_format test_tee_v2_active_metadata test_tee_v2_hmac_group test_tee_v2_passive_metadata test_tee_v2_cache test_tee_v2_write test_tee_v2_relocation test_tee_v2_flow test_tee_v2_media_status test_tee_v3_storage test_tee_v3_read test_tee_v3_proof_timeout test_tee_v3_flow test_tee_v4_admin_format test_tee_v4_admin_response test_tee_v4_writeback test_tee_v4_admin
+	rm -f $(POLICIES) test_tee_v1_segment test_tee_v1_bitmap test_tee_v1_guard test_tee_v1_flow test_tee_v2_format test_tee_v2_active_metadata test_tee_v2_hmac_group test_tee_v2_passive_metadata test_tee_v2_cache test_tee_v2_write test_tee_v2_relocation test_tee_v2_flow test_tee_v2_media_status test_tee_v3_storage test_tee_v3_read test_tee_v3_proof_timeout test_tee_v3_flow test_tee_v4_admin_format test_tee_v4_admin_response test_tee_v4_writeback test_tee_v4_admin test_tee_v4_policy_flow test_tee_v4_metadata_intake

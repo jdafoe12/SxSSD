@@ -16,6 +16,9 @@ int main(void)
     passive.segment_count = 2;
     passive.segment_locations = locations;
     assert(tee_v2_cache_init(&cache, 128, 4) == 0);
+    passive.group_count = 1;
+    assert(tee_v2_cache_store_passive(&cache, &passive) == -1);
+    passive.group_count = 0;
     assert(tee_v2_cache_store_passive(&cache, &passive) == 0);
     locations[0] = 99;
     found = tee_v2_cache_find_passive(&cache, 5, 6);

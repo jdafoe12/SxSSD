@@ -10,7 +10,9 @@ int tee_v5_proof_record_error(struct tee_v3_pending_controller *controller,
     struct tee_v3_scoped_error *entry = NULL;
     size_t i;
 
-    if (!controller || error == TEE_V5_PROOF_ERROR_NONE) return -1;
+    if (!controller || error == TEE_V5_PROOF_ERROR_NONE ||
+        (controller->has_error && !controller->error_identity_valid))
+        return -1;
     for (i = 0; i < TEE_V5_PROOF_ERROR_CAPACITY; i++) {
         if (controller->scoped_errors[i].valid &&
             controller->scoped_errors[i].file_id == file_id &&

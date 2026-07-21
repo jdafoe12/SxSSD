@@ -70,6 +70,8 @@ static int tee_v5_delete_chunk_handler(void *opaque, uint8_t file_id,
             TEE_V5_PROOF_ERROR_DELETE_CONFLICT, TEE_V5_NO_FAILED_SEGMENT);
         return 2;
     }
+    if (!tee_v2_cache_find_passive(policy->write->cache, file_id, chunk_id))
+        return 1;
     if (tee_v4_writeback_sync(&g_v4_writeback) != 0) {
         (void)tee_v5_proof_record_error(
             &policy->pending, file_id, chunk_id,

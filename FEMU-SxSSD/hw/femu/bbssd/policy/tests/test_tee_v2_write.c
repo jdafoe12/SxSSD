@@ -71,4 +71,40 @@ static void test_hmac_failure_becomes_normal(void)
     tee_v2_active_metadata_destroy(&active);
 }
 
-int main(void){test_normal_and_guard_paths();test_active_group_and_promotion();test_hmac_failure_becomes_normal();puts("test_tee_v2_write: PASS");return 0;}
+static void test_preflight_is_non_mutating_and_abandon_clears_pending(void)
+{
+    struct tee_v2_format_config config; struct tee_v2_active_metadata active;
+    struct tee_v2_hmac_group_spec spec; struct tee_v2_cache cache;
+    struct tee_v2_write_context write; uint8_t s[512], expected[32];
+    segment(s,1,0x44);
+    tee_v2_hmac_sha256(tee_v2_prototype_key,32,s,512,expected);
+    assert(tee_v2_format_config_init(&config,512,4096));
+    spec=(struct tee_v2_hmac_group_spec){1,1,expected};
+    assert(tee_v2_active_metadata_init(&active,&config,8,0x010203,503,1,1,&spec,1)==0);
+    assert(tee_v2_cache_init(&cache,1000,2)==0);
+    assert(tee_v2_write_context_init(&write,&active,&cache,1000)==0);
+    assert(tee_v2_classify_segment_write(&write,400,s,512,NULL,NULL)==TEE_V2_WRITE_PENDING);
+    assert(!active.arrived[0] && !tee_v1_bitmap_test(&write.pending_bitmap,400));
+    assert(tee_v2_process_segment_write(&write,400,s,512,NULL,NULL)==TEE_V2_WRITE_CHUNK_COMPLETE);
+    assert(tee_v2_cache_is_protected(&cache,400));
+    tee_v2_write_abandon_active(&write);
+    assert(write.active==NULL);
+    tee_v2_write_context_destroy(&write);tee_v2_cache_destroy(&cache);
+    tee_v2_active_metadata_destroy(&active);
+}
+
+static void test_range_guard(void)
+{
+    struct tee_v2_cache cache; struct tee_v2_write_context write;
+    assert(tee_v2_cache_init(&cache,100,2)==0);
+    assert(tee_v2_write_context_init(&write,NULL,&cache,100)==0);
+    assert(tee_v2_write_range_allowed(&write,10,4));
+    assert(tee_v2_cache_mark_protected(&cache,12)==0);
+    assert(!tee_v2_write_range_allowed(&write,10,4));
+    assert(tee_v2_cache_unmark_protected(&cache,12)==0);
+    assert(tee_v1_bitmap_set(&write.pending_bitmap,13)==0);
+    assert(!tee_v2_write_range_allowed(&write,10,4));
+    tee_v2_write_context_destroy(&write);tee_v2_cache_destroy(&cache);
+}
+
+int main(void){test_normal_and_guard_paths();test_active_group_and_promotion();test_hmac_failure_becomes_normal();test_preflight_is_non_mutating_and_abandon_clears_pending();test_range_guard();puts("test_tee_v2_write: PASS");return 0;}

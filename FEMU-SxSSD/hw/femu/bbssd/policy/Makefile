@@ -87,7 +87,10 @@ test_tee_v2_relocation: tests/test_tee_v2_relocation.c $(TEE_V1_SRCS) $(TEE_V2_S
 test_tee_v2_flow: tests/test_tee_v2_flow.c $(TEE_V1_DEPS) $(TEE_V2_DEPS)
 	$(CC) $(CFLAGS) -o $@ tests/test_tee_v2_flow.c $(TEE_V1_SRCS) $(TEE_V2_SRCS)
 
-test-tee-v2: test_tee_v2_format test_tee_v2_active_metadata test_tee_v2_hmac_group test_tee_v2_passive_metadata test_tee_v2_cache test_tee_v2_write test_tee_v2_relocation test_tee_v2_flow
+test_tee_v2_media_status: tests/test_tee_v2_media_status.c ../ftl-write-status.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tee_v2_media_status.c
+
+test-tee-v2: test_tee_v2_format test_tee_v2_active_metadata test_tee_v2_hmac_group test_tee_v2_passive_metadata test_tee_v2_cache test_tee_v2_write test_tee_v2_relocation test_tee_v2_flow test_tee_v2_media_status
 	./test_tee_v2_format
 	./test_tee_v2_active_metadata
 	./test_tee_v2_hmac_group
@@ -96,8 +99,9 @@ test-tee-v2: test_tee_v2_format test_tee_v2_active_metadata test_tee_v2_hmac_gro
 	./test_tee_v2_write
 	./test_tee_v2_relocation
 	./test_tee_v2_flow
+	./test_tee_v2_media_status
 
 test: test-tee-v1 test-tee-v2
 
 clean:
-	rm -f $(POLICIES) test_tee_v1_segment test_tee_v1_bitmap test_tee_v1_guard test_tee_v1_flow test_tee_v2_format test_tee_v2_active_metadata test_tee_v2_hmac_group test_tee_v2_passive_metadata test_tee_v2_cache test_tee_v2_write test_tee_v2_relocation test_tee_v2_flow
+	rm -f $(POLICIES) test_tee_v1_segment test_tee_v1_bitmap test_tee_v1_guard test_tee_v1_flow test_tee_v2_format test_tee_v2_active_metadata test_tee_v2_hmac_group test_tee_v2_passive_metadata test_tee_v2_cache test_tee_v2_write test_tee_v2_relocation test_tee_v2_flow test_tee_v2_media_status

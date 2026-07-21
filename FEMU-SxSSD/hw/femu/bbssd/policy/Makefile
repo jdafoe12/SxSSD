@@ -111,7 +111,7 @@ test-tee-v2: test_tee_v2_format test_tee_v2_active_metadata test_tee_v2_hmac_gro
 	./test_tee_v2_flow
 	./test_tee_v2_media_status
 
-test: test-tee-v1 test-tee-v2 test-tee-v3
+test: test-tee-v1 test-tee-v2 test-tee-v3 test-tee-v4
 
 test_tee_v3_storage: tests/test_tee_v3_storage.c tee/tee-v3-storage.c tee/tee-v3-storage.h $(TEE_V1_SRCS) tee/tee-v2-passive-metadata.h
 	$(CC) $(CFLAGS) -o $@ tests/test_tee_v3_storage.c tee/tee-v1-segment.c tee/tee-v1-bitmap.c tee/tee-v3-storage.c

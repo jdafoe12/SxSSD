@@ -385,9 +385,16 @@ int tee_v4_admin_submit(struct tee_v4_admin *admin, const void *request_buffer,
             }
             if (expected_start != (uint64_t)metadata->segment_count + 1U)
                 return -1;
-            if (admin->metadata_intake(admin->metadata_intake_opaque,
-                                       metadata, groups) != 0) return -1;
-            result = prepare_status(admin, header, TEE_V4_ADMIN_STATUS_OK);
+            i = (uint32_t)admin->metadata_intake(
+                admin->metadata_intake_opaque, metadata, groups);
+            if (i == 2U)
+                result = prepare_status(admin, header,
+                                        TEE_V4_ADMIN_STATUS_BAD_REQUEST);
+            else if (i != 0U)
+                return -1;
+            else
+                result = prepare_status(admin, header,
+                                        TEE_V4_ADMIN_STATUS_OK);
             break;
         }
     default:

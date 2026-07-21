@@ -30,7 +30,13 @@ static int tee_v5_intake_active_metadata(
     const struct tee_v4_admin_hmac_group_wire *groups)
 {
     struct tee_v3_policy_context *policy = opaque;
-    int result = tee_v4_intake_active_metadata(NULL, metadata, groups);
+    int result;
+
+    if (g_v2_active_valid &&
+        (g_v2_active.file_id != metadata->file_id ||
+         g_v2_active.chunk_id != metadata->chunk_id))
+        return 2;
+    result = tee_v4_intake_active_metadata(NULL, metadata, groups);
     if (result == 0 && policy)
         tee_v5_proof_clear_error(&policy->pending, metadata->file_id,
                                  metadata->chunk_id);

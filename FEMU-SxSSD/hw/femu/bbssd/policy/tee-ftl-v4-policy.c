@@ -126,6 +126,10 @@ static int tee_v4_intake_active_metadata(
     uint32_t i;
     int result;
     (void)opaque;
+    if (g_v4_policy.pending.reject_active_supersession && g_v2_active_valid &&
+        (g_v2_active.file_id != metadata->file_id ||
+         g_v2_active.chunk_id != metadata->chunk_id))
+        return 2;
     if (metadata->group_count) {
         specs = calloc(metadata->group_count, sizeof(*specs));
         if (!specs) return -1;

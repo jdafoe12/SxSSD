@@ -18,7 +18,10 @@ int tee_v5_admin_init(struct tee_v5_admin *admin,
 {
     if (!admin) return -1;
     memset(admin, 0, sizeof(*admin));
-    if (policy) policy->pending.error_precedes_passive = true;
+    if (policy) {
+        policy->pending.error_precedes_passive = true;
+        policy->pending.reject_active_supersession = true;
+    }
     return tee_v4_admin_init(&admin->v4, policy, admin_buffer_bytes,
                              response_item_bytes);
 }

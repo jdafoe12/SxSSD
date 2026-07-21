@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "tee-v2-format.h"
+
 #define TEE_V4_ADMIN_MAGIC 0x34544c54U
 #define TEE_V4_ADMIN_VERSION 4U
 #define TEE_V4_ADMIN_DEFAULT_BUFFER_BYTES 4096U
@@ -37,6 +39,7 @@ struct tee_v4_admin_request_header {
     uint64_t request_id;
     uint32_t payload_len;
     uint32_t flags;
+    uint8_t request_mac[TEE_V2_HMAC_SIZE];
 };
 
 struct tee_v4_admin_response_header {
@@ -68,6 +71,8 @@ struct tee_v4_admin_continue_payload {
 
 #define TEE_V4_ADMIN_REQUEST_HEADER_SIZE \
     ((uint32_t)sizeof(struct tee_v4_admin_request_header))
+#define TEE_V4_ADMIN_REQUEST_MAC_OFFSET \
+    ((uint32_t)offsetof(struct tee_v4_admin_request_header, request_mac))
 #define TEE_V4_ADMIN_RESPONSE_HEADER_SIZE \
     ((uint32_t)sizeof(struct tee_v4_admin_response_header))
 #define TEE_V4_ADMIN_CHUNK_QUERY_PAYLOAD_SIZE \

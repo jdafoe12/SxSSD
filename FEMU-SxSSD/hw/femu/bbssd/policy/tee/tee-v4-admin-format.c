@@ -25,8 +25,9 @@ bool tee_v4_admin_mac_span(const struct tee_v4_admin_request_header *header,
     if (!header || !span_out || buffer_bytes < sizeof(*header)) {
         return false;
     }
-    span = sizeof(*header) + (size_t)header->payload_len;
-    if (span < sizeof(*header) || span > buffer_bytes) {
+    span = TEE_V4_ADMIN_REQUEST_MAC_OFFSET + (size_t)header->payload_len;
+    if (span < TEE_V4_ADMIN_REQUEST_MAC_OFFSET ||
+        sizeof(*header) + (size_t)header->payload_len > buffer_bytes) {
         return false;
     }
     *span_out = span;

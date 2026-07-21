@@ -2,11 +2,11 @@ CC = gcc
 CFLAGS = -Wall -Wextra -O2 -fPIC -I. -Iinc
 POLICY_LDFLAGS = -shared
 
-POLICIES = block-interface-policy-eval.so block-interface-policy-baseline.so block-interface-policy-flashguard.so block-interface-flashguard-policy.so zns-policy.so signing-test-policy.so key-sharing-policy.so tee-ftl-v1-policy.so tee-ftl-v2-policy.so tee-ftl-v3-policy.so
+POLICIES = block-interface-policy-eval.so block-interface-policy-baseline.so block-interface-policy-flashguard.so block-interface-flashguard-policy.so zns-policy.so signing-test-policy.so key-sharing-policy.so tee-ftl-v1-policy.so tee-ftl-v2-policy.so tee-ftl-v3-policy.so tee-ftl-v4-policy.so
 
 .PHONY: all clean
 .PHONY: tool
-.PHONY: test test-tee-v1 test-tee-v2 test-tee-v3 test-tee-v3-storage test-tee-v3-read test-tee-v3-proof-timeout test-tee-v4-admin-format test-tee-v4-admin-response test-tee-v4-writeback
+.PHONY: test test-tee-v1 test-tee-v2 test-tee-v3 test-tee-v3-storage test-tee-v3-read test-tee-v3-proof-timeout test-tee-v4 test-tee-v4-admin-format test-tee-v4-admin-response test-tee-v4-writeback test-tee-v4-admin
 
 all: $(POLICIES)
 
@@ -19,8 +19,8 @@ TEE_V2_SRCS = tee/tee-v2-format.c tee/tee-v2-active-metadata.c tee/tee-v2-hmac-g
 TEE_V2_DEPS = tee-ftl-v2-policy.h tee/tee-v2-format.h tee/tee-v2-active-metadata.h tee/tee-v2-hmac-group.h tee/tee-v2-passive-metadata.h tee/tee-v2-cache.h tee/tee-v2-write.h tee/tee-v2-relocation.h $(TEE_V2_SRCS)
 TEE_V3_SRCS = tee/tee-v3-storage.c tee/tee-v3-read.c tee/tee-v3-proof.c tee/tee-v3-policy.c
 TEE_V3_DEPS = tee-ftl-v3-policy.h tee/tee-v3-storage.h tee/tee-v3-read.h tee/tee-v3-proof.h tee/tee-v3-policy.h $(TEE_V3_SRCS)
-TEE_V4_SRCS = tee/tee-v4-admin-format.c tee/tee-v4-admin-response.c tee/tee-v4-writeback.c
-TEE_V4_DEPS = tee/tee-v4-admin-format.h tee/tee-v4-admin-response.h tee/tee-v4-writeback.h $(TEE_V4_SRCS)
+TEE_V4_SRCS = tee/tee-v4-admin-format.c tee/tee-v4-admin-response.c tee/tee-v4-writeback.c tee/tee-v4-admin.c
+TEE_V4_DEPS = tee-ftl-v4-policy.h tee/tee-v4-admin-format.h tee/tee-v4-admin-response.h tee/tee-v4-writeback.h tee/tee-v4-admin.h $(TEE_V4_SRCS)
 
 block-interface-policy-eval.so: block-interface-policy-eval.c $(BLOCK_POLICY_DEPS)
 	$(CC) $(CFLAGS) $(POLICY_LDFLAGS) -o $@ block-interface-policy-eval.c lib/pqueue.c
@@ -51,6 +51,9 @@ tee-ftl-v2-policy.so: tee-ftl-v2-policy.c tee-ftl-v1-policy.c $(BLOCK_POLICY_DEP
 
 tee-ftl-v3-policy.so: tee-ftl-v3-policy.c tee-ftl-v1-policy.c $(BLOCK_POLICY_DEPS) $(TEE_V1_DEPS) $(TEE_V2_DEPS) $(TEE_V3_DEPS)
 	$(CC) $(CFLAGS) $(POLICY_LDFLAGS) -o $@ tee-ftl-v3-policy.c lib/pqueue.c $(TEE_V1_SRCS) $(TEE_V2_SRCS) $(TEE_V3_SRCS)
+
+tee-ftl-v4-policy.so: tee-ftl-v4-policy.c tee-ftl-v3-policy.c tee-ftl-v1-policy.c $(BLOCK_POLICY_DEPS) $(TEE_V1_DEPS) $(TEE_V2_DEPS) $(TEE_V3_DEPS) $(TEE_V4_DEPS)
+	$(CC) $(CFLAGS) $(POLICY_LDFLAGS) -o $@ tee-ftl-v4-policy.c lib/pqueue.c $(TEE_V1_SRCS) $(TEE_V2_SRCS) $(TEE_V3_SRCS) $(TEE_V4_SRCS)
 
 test_tee_v1_segment: tests/test_tee_v1_segment.c tee/tee-v1-segment.c tee/tee-v1-segment.h
 	$(CC) $(CFLAGS) -o $@ tests/test_tee_v1_segment.c tee/tee-v1-segment.c
@@ -152,5 +155,13 @@ test_tee_v4_writeback: tests/test_tee_v4_writeback.c tee/tee-v4-writeback.c tee/
 test-tee-v4-writeback: test_tee_v4_writeback
 	./test_tee_v4_writeback
 
+test_tee_v4_admin: tests/test_tee_v4_admin.c $(TEE_V1_DEPS) $(TEE_V2_DEPS) $(TEE_V3_DEPS) $(TEE_V4_DEPS)
+	$(CC) $(CFLAGS) -o $@ tests/test_tee_v4_admin.c $(TEE_V1_SRCS) $(TEE_V2_SRCS) $(TEE_V3_SRCS) tee/tee-v4-admin-format.c tee/tee-v4-admin-response.c tee/tee-v4-admin.c
+
+test-tee-v4-admin: test_tee_v4_admin
+	./test_tee_v4_admin
+
+test-tee-v4: test-tee-v4-admin-format test-tee-v4-admin-response test-tee-v4-writeback test-tee-v4-admin
+
 clean:
-	rm -f $(POLICIES) test_tee_v1_segment test_tee_v1_bitmap test_tee_v1_guard test_tee_v1_flow test_tee_v2_format test_tee_v2_active_metadata test_tee_v2_hmac_group test_tee_v2_passive_metadata test_tee_v2_cache test_tee_v2_write test_tee_v2_relocation test_tee_v2_flow test_tee_v2_media_status test_tee_v3_storage test_tee_v3_read test_tee_v3_proof_timeout test_tee_v3_flow test_tee_v4_admin_format test_tee_v4_admin_response test_tee_v4_writeback
+	rm -f $(POLICIES) test_tee_v1_segment test_tee_v1_bitmap test_tee_v1_guard test_tee_v1_flow test_tee_v2_format test_tee_v2_active_metadata test_tee_v2_hmac_group test_tee_v2_passive_metadata test_tee_v2_cache test_tee_v2_write test_tee_v2_relocation test_tee_v2_flow test_tee_v2_media_status test_tee_v3_storage test_tee_v3_read test_tee_v3_proof_timeout test_tee_v3_flow test_tee_v4_admin_format test_tee_v4_admin_response test_tee_v4_writeback test_tee_v4_admin

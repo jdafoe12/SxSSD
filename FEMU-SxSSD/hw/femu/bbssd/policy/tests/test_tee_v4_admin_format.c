@@ -19,10 +19,11 @@ static void test_request_header_validation_and_mac_span(void)
     req.flags = 0;
 
     assert(sizeof(req) == TEE_V4_ADMIN_REQUEST_HEADER_SIZE);
+    assert(TEE_V4_ADMIN_REQUEST_MAC_OFFSET == 24);
     assert(tee_v4_admin_request_valid(&req, TEE_V4_ADMIN_DEFAULT_BUFFER_BYTES));
     assert(tee_v4_admin_mac_span(&req, TEE_V4_ADMIN_DEFAULT_BUFFER_BYTES,
                                  &span));
-    assert(span == sizeof(req) + 64);
+    assert(span == TEE_V4_ADMIN_REQUEST_MAC_OFFSET + 64);
 
     req.payload_len = TEE_V4_ADMIN_DEFAULT_BUFFER_BYTES;
     assert(!tee_v4_admin_request_valid(&req,

@@ -94,6 +94,7 @@ static uint64_t ftl_write_pages_raw(struct ssd *ssd, const uint8_t *buffer,
     if (!event.status_list) {
         return 0;
     }
+    ftl_init_page_program_statuses(event.status_list, page_count);
     if (page_success) {
         memset(page_success, 0, sizeof(bool) * page_count);
     }

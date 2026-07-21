@@ -676,14 +676,16 @@ int ftl_backend_raw_write(struct FtlBackend *fb, uint8_t *buffer, struct ppa *pp
                           const void *oob_buf, size_t oob_offset, size_t oob_len,
                           struct FtlBackendEvent *event)
 {
-    const struct ssdparams *spp = &fb->sp;
-    if (!fb || !ppa_list || !ppa_count || !page_size) {
-        return 0;
+    const struct ssdparams *spp;
+    if (!fb || !ppa_list || !ppa_count || !page_size ||
+        (buffer && !fb->mbe)) {
+        return -1;
     }
+    spp = &fb->sp;
 
     uint64_t *offset_list = build_offset_list(&fb->sp, ppa_list, ppa_count, page_size);
     if (!offset_list) {
-        return 0;
+        return -1;
     }
 
     /* Validate each PPA for sequential write and update pSWD state; set status_list */

@@ -19,7 +19,7 @@ int main(void)
     assert(tee_v3_read_summary(&p,16,&s)==TEE_V3_QUERY_OK);
     assert(s.chunk_size_bytes==2500&&s.segment_count==5&&s.number_coefficient==11);
     assert(s.location_item_count==5&&s.location_item_size==sizeof(uint64_t)&&s.location_page_count==3);
-    assert(s.hmac_group_count==2&&s.hmac_group_item_size==sizeof(struct tee_v3_hmac_group_item)&&s.hmac_group_page_count==2);
+    assert(s.hmac_group_count==2&&s.hmac_group_item_size==sizeof(struct tee_v3_hmac_group_item)&&s.hmac_group_page_count==5);
     assert(tee_v3_read_locations(&p,2,out,2,&count)==TEE_V3_QUERY_OK&&count==2&&out[0]==103&&out[1]==104);
     assert(tee_v3_read_locations(&p,4,out,2,&count)==TEE_V3_QUERY_OK&&count==1&&out[0]==105);
     assert(tee_v3_read_hmac_groups(&p,1,gi,1,&count)==TEE_V3_QUERY_OK&&count==1);

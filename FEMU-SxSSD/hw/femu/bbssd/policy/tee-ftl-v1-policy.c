@@ -568,10 +568,10 @@ static uint64_t write_callback(struct ssd *ssd, struct NvmeCommandEvent *event,
                             g_v2_config.segment_size, &header) ||
                         header.segment_index != active_index)
                         continue;
-                    applied = tee_v2_process_segment_write(
-                        &g_v2_write, first_segment + i,
+                    applied = tee_v2_apply_segment_after_media(
+                        &g_v2_write, true, first_segment + i,
                         req_buf + i * g_v2_config.segment_size,
-                        g_v2_config.segment_size, NULL, NULL);
+                        g_v2_config.segment_size);
                     if (applied == TEE_V2_WRITE_ERROR ||
                         applied == TEE_V2_WRITE_REJECTED) {
                         apply_failed = true;

@@ -36,6 +36,12 @@ enum tee_v2_write_result tee_v2_classify_segment_write(
     const uint8_t *segment, size_t segment_size,
     struct tee_v2_passive_metadata **passive_out,
     uint32_t *segment_index_out);
+int tee_v2_preflight_segment_request(
+    struct tee_v2_write_context *write, uint64_t first_location,
+    const uint8_t *segments, size_t segment_size, uint64_t segment_count,
+    enum tee_v2_write_result *results,
+    struct tee_v2_passive_metadata **passives,
+    uint32_t *segment_indices);
 enum tee_v2_write_result tee_v2_process_segment_write(
     struct tee_v2_write_context *write, uint64_t logical_location,
     const uint8_t *segment, size_t segment_size,

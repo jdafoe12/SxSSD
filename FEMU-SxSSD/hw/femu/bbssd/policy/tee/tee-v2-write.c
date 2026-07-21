@@ -90,6 +90,48 @@ enum tee_v2_write_result tee_v2_classify_segment_write(
     return TEE_V2_WRITE_NORMAL;
 }
 
+int tee_v2_preflight_segment_request(
+    struct tee_v2_write_context *write, uint64_t first_location,
+    const uint8_t *segments, size_t segment_size, uint64_t segment_count,
+    enum tee_v2_write_result *results,
+    struct tee_v2_passive_metadata **passives,
+    uint32_t *segment_indices)
+{
+    uint64_t i, j;
+    if (!write || !segments || !segment_size || !segment_count ||
+        !results || !passives || !segment_indices ||
+        segment_count > SIZE_MAX / segment_size ||
+        !tee_v2_write_range_allowed(write, first_location, segment_count))
+        return -1;
+    for (i = 0; i < segment_count; i++) {
+        const uint8_t *segment = segments + (size_t)i * segment_size;
+        results[i] = tee_v2_classify_segment_write(
+            write, first_location + i, segment, segment_size,
+            &passives[i], &segment_indices[i]);
+        if (results[i] == TEE_V2_WRITE_REJECTED ||
+            results[i] == TEE_V2_WRITE_ERROR)
+            return -1;
+        if (results[i] == TEE_V2_WRITE_PENDING) {
+            struct tee_v2_segment_header current;
+            if (!tee_v2_parse_segment_header(segment, segment_size, &current))
+                return -1;
+            for (j = 0; j < i; j++) {
+                struct tee_v2_segment_header previous;
+                if (results[j] != TEE_V2_WRITE_PENDING) continue;
+                if (!tee_v2_parse_segment_header(
+                        segments + (size_t)j * segment_size,
+                        segment_size, &previous))
+                    return -1;
+                if (previous.file_id == current.file_id &&
+                    previous.chunk_id == current.chunk_id &&
+                    previous.segment_index == current.segment_index)
+                    return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 static void clear_group_pending_bitmap(struct tee_v2_write_context *write,
                                        const uint64_t *locations,
                                        uint32_t count)

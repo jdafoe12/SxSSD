@@ -38,6 +38,33 @@ bool tee_v2_write_range_allowed(const struct tee_v2_write_context *write,
                                   first_segment, segment_count);
 }
 
+bool tee_v2_write_page_range_allowed(const struct tee_v2_write_context *write,
+                                     uint64_t first_segment,
+                                     uint64_t segment_count,
+                                     uint32_t segments_per_page)
+{
+    uint64_t page_first, end, page_end;
+    if (!write || !segment_count || !segments_per_page ||
+        first_segment >= write->pending_bitmap.bit_count ||
+        segment_count > write->pending_bitmap.bit_count - first_segment)
+        return false;
+    page_first = first_segment - first_segment % segments_per_page;
+    end = first_segment + segment_count;
+    page_end = end + (segments_per_page - end % segments_per_page) %
+                     segments_per_page;
+    if (page_end > write->pending_bitmap.bit_count)
+        page_end = write->pending_bitmap.bit_count;
+    return tee_v2_write_range_allowed(write, page_first, page_end - page_first);
+}
+
+bool tee_v2_write_can_activate_identity(struct tee_v2_write_context *write,
+                                        uint8_t file_id,
+                                        uint32_t chunk_id)
+{
+    return write && write->cache &&
+           tee_v2_cache_find_passive(write->cache, file_id, chunk_id) == NULL;
+}
+
 void tee_v2_write_abandon_active(struct tee_v2_write_context *write)
 {
     uint32_t i;
@@ -111,13 +138,15 @@ int tee_v2_preflight_segment_request(
         if (results[i] == TEE_V2_WRITE_REJECTED ||
             results[i] == TEE_V2_WRITE_ERROR)
             return -1;
-        if (results[i] == TEE_V2_WRITE_PENDING) {
+        if (results[i] == TEE_V2_WRITE_PENDING ||
+            results[i] == TEE_V2_WRITE_RELOCATION) {
             struct tee_v2_segment_header current;
             if (!tee_v2_parse_segment_header(segment, segment_size, &current))
                 return -1;
             for (j = 0; j < i; j++) {
                 struct tee_v2_segment_header previous;
-                if (results[j] != TEE_V2_WRITE_PENDING) continue;
+                if (results[j] != TEE_V2_WRITE_PENDING &&
+                    results[j] != TEE_V2_WRITE_RELOCATION) continue;
                 if (!tee_v2_parse_segment_header(
                         segments + (size_t)j * segment_size,
                         segment_size, &previous))

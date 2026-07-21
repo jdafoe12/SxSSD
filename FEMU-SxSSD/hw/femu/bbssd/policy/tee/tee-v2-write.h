@@ -30,6 +30,13 @@ void tee_v2_write_context_destroy(struct tee_v2_write_context *write);
 bool tee_v2_write_range_allowed(const struct tee_v2_write_context *write,
                                 uint64_t first_segment,
                                 uint64_t segment_count);
+bool tee_v2_write_page_range_allowed(const struct tee_v2_write_context *write,
+                                     uint64_t first_segment,
+                                     uint64_t segment_count,
+                                     uint32_t segments_per_page);
+bool tee_v2_write_can_activate_identity(struct tee_v2_write_context *write,
+                                        uint8_t file_id,
+                                        uint32_t chunk_id);
 void tee_v2_write_abandon_active(struct tee_v2_write_context *write);
 enum tee_v2_write_result tee_v2_classify_segment_write(
     struct tee_v2_write_context *write, uint64_t logical_location,

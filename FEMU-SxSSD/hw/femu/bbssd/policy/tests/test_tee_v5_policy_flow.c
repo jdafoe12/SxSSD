@@ -293,6 +293,94 @@ static void test_continuous_v1_to_v5_nvme_flow(void)
     api.write_cmd_buffer = write_command_buffer;
     initialize_policy_state();
 
+    {
+        uint8_t same_segments[2][TEE_V2_DEFAULT_SEGMENT_SIZE];
+        uint8_t replacement_segments[2][TEE_V2_DEFAULT_SEGMENT_SIZE];
+        uint32_t i;
+
+        /* Bootstrap active A cannot be deleted while active; this also
+         * records conflict evidence that a rejected SET must preserve. */
+        bytes = make_identity(TEE_V5_ADMIN_CMD_DELETE, 1, 99, 1);
+        assert(dispatch(TEE_V4_ADMIN_SUBMIT_OPCODE, (uint32_t)bytes, &api) ==
+               NVME_SUCCESS);
+        assert(fetch_status(&api, TEE_V5_ADMIN_CMD_DELETE, 1) ==
+               TEE_V5_STATUS_BAD_REQUEST);
+
+        /* Re-submitting metadata for the exact active identity retains the
+         * existing V4 replacement semantics. */
+        prepare_segments(99, 1, same_segments);
+        bytes = make_metadata(2, 99, 1, same_segments);
+        assert(dispatch(TEE_V4_ADMIN_SUBMIT_OPCODE, (uint32_t)bytes, &api) ==
+               NVME_SUCCESS);
+        assert(fetch_status(&api, TEE_V4_ADMIN_CMD_SET_ACTIVE_METADATA, 2) ==
+               TEE_V5_STATUS_OK);
+
+        bytes = make_identity(TEE_V5_ADMIN_CMD_DELETE, 3, 99, 1);
+        assert(dispatch(TEE_V4_ADMIN_SUBMIT_OPCODE, (uint32_t)bytes, &api) ==
+               NVME_SUCCESS);
+        assert(fetch_status(&api, TEE_V5_ADMIN_CMD_DELETE, 3) ==
+               TEE_V5_STATUS_BAD_REQUEST);
+
+        /* A different identity cannot supersede active A without ABORT A. */
+        prepare_segments(50, 5000, replacement_segments);
+        bytes = make_metadata(4, 50, 5000, replacement_segments);
+        assert(dispatch(TEE_V4_ADMIN_SUBMIT_OPCODE, (uint32_t)bytes, &api) ==
+               NVME_SUCCESS);
+        assert(fetch_status(&api, TEE_V4_ADMIN_CMD_SET_ACTIVE_METADATA, 4) ==
+               TEE_V5_STATUS_BAD_REQUEST);
+        assert(g_v2_active_valid);
+        assert(g_v2_active.file_id == 99 && g_v2_active.chunk_id == 1);
+
+        bytes = make_query(TEE_V4_ADMIN_CMD_ONE_BIT_PROOF, 5, 99, 1);
+        assert(dispatch(TEE_V4_ADMIN_SUBMIT_OPCODE, (uint32_t)bytes, &api) ==
+               NVME_SUCCESS);
+        assert(fetch_status(&api, TEE_V4_ADMIN_CMD_ONE_BIT_PROOF, 5) ==
+               TEE_V5_STATUS_OK);
+        assert(proof->state == TEE_V3_PROOF_ERROR);
+        assert(proof->last_error_code == TEE_V5_PROOF_ERROR_DELETE_CONFLICT);
+
+        /* More than the full proof-table capacity of attempted replacements
+         * must remain simple rejections, not consume new failure identities. */
+        for (i = 0; i < TEE_V5_PROOF_ERROR_CAPACITY + 1U; i++) {
+            uint64_t request_id = 6U + i;
+            uint8_t file_id = (uint8_t)(100U + i);
+            uint32_t chunk_id = 6000U + i;
+
+            prepare_segments(file_id, chunk_id, replacement_segments);
+            bytes = make_metadata(request_id, file_id, chunk_id,
+                                  replacement_segments);
+            assert(dispatch(TEE_V4_ADMIN_SUBMIT_OPCODE, (uint32_t)bytes,
+                            &api) == NVME_SUCCESS);
+            assert(fetch_status(&api, TEE_V4_ADMIN_CMD_SET_ACTIVE_METADATA,
+                                request_id) == TEE_V5_STATUS_BAD_REQUEST);
+        }
+        bytes = make_query(TEE_V4_ADMIN_CMD_ONE_BIT_PROOF, 72, 99, 1);
+        assert(dispatch(TEE_V4_ADMIN_SUBMIT_OPCODE, (uint32_t)bytes, &api) ==
+               NVME_SUCCESS);
+        assert(fetch_status(&api, TEE_V4_ADMIN_CMD_ONE_BIT_PROOF, 72) ==
+               TEE_V5_STATUS_OK);
+        assert(proof->state == TEE_V3_PROOF_ERROR);
+        assert(proof->last_error_code == TEE_V5_PROOF_ERROR_DELETE_CONFLICT);
+
+        bytes = make_identity(TEE_V5_ADMIN_CMD_ABORT_ACTIVE, 73, 99, 1);
+        assert(dispatch(TEE_V4_ADMIN_SUBMIT_OPCODE, (uint32_t)bytes, &api) ==
+               NVME_SUCCESS);
+        assert(fetch_status(&api, TEE_V5_ADMIN_CMD_ABORT_ACTIVE, 73) ==
+               TEE_V5_STATUS_OK);
+        bytes = make_metadata(74, 50, 5000, replacement_segments);
+        assert(dispatch(TEE_V4_ADMIN_SUBMIT_OPCODE, (uint32_t)bytes, &api) ==
+               NVME_SUCCESS);
+        assert(fetch_status(&api, TEE_V4_ADMIN_CMD_SET_ACTIVE_METADATA, 74) ==
+               TEE_V5_STATUS_OK);
+        assert(g_v2_active_valid);
+        assert(g_v2_active.file_id == 50 && g_v2_active.chunk_id == 5000);
+        bytes = make_identity(TEE_V5_ADMIN_CMD_ABORT_ACTIVE, 75, 50, 5000);
+        assert(dispatch(TEE_V4_ADMIN_SUBMIT_OPCODE, (uint32_t)bytes, &api) ==
+               NVME_SUCCESS);
+        assert(fetch_status(&api, TEE_V5_ADMIN_CMD_ABORT_ACTIVE, 75) ==
+               TEE_V5_STATUS_OK);
+    }
+
     submit_and_promote(&api, 100, 12, 34, 101);
     bytes = make_query(TEE_V4_ADMIN_CMD_READ_SUMMARY, 101, 12, 34);
     assert(dispatch(TEE_V4_ADMIN_SUBMIT_OPCODE, (uint32_t)bytes, &api) ==

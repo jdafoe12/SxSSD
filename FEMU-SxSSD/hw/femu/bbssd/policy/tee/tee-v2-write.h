@@ -24,6 +24,15 @@ struct tee_v2_write_context {
                           const struct tee_v2_cache *cache,
                           const struct tee_v2_passive_metadata *passive);
     void *promotion_hook_opaque;
+    int (*relocation_observer)(void *opaque, uint8_t file_id,
+                               uint32_t chunk_id, uint32_t segment_index,
+                               uint64_t old_location,
+                               uint64_t new_location);
+    void *relocation_observer_opaque;
+    int (*operation_advance)(void *opaque, uint64_t ops);
+    void *operation_advance_opaque;
+    int (*relocation_cancel)(void *opaque, uint32_t count);
+    void *relocation_cancel_opaque;
 };
 
 int tee_v2_write_context_init(struct tee_v2_write_context *write,
@@ -36,6 +45,25 @@ void tee_v2_write_set_promotion_hook(
     int (*hook)(void *, const struct tee_v2_cache *,
                 const struct tee_v2_passive_metadata *),
     void *opaque);
+void tee_v2_write_set_relocation_observer(
+    struct tee_v2_write_context *write,
+    int (*observer)(void *, uint8_t, uint32_t, uint32_t, uint64_t, uint64_t),
+    void *opaque);
+int tee_v2_write_observe_relocation(struct tee_v2_write_context *write,
+                                    uint8_t file_id, uint32_t chunk_id,
+                                    uint32_t segment_index,
+                                    uint64_t old_location,
+                                    uint64_t new_location);
+void tee_v2_write_set_operation_advance(
+    struct tee_v2_write_context *write,
+    int (*advance)(void *, uint64_t), void *opaque);
+int tee_v2_write_advance_operation(struct tee_v2_write_context *write,
+                                   uint64_t ops);
+void tee_v2_write_set_relocation_cancel(
+    struct tee_v2_write_context *write,
+    int (*cancel)(void *, uint32_t), void *opaque);
+int tee_v2_write_cancel_relocations(struct tee_v2_write_context *write,
+                                    uint32_t count);
 bool tee_v2_write_range_allowed(const struct tee_v2_write_context *write,
                                 uint64_t first_segment,
                                 uint64_t segment_count);

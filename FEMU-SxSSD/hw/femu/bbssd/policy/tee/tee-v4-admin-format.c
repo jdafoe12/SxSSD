@@ -43,12 +43,16 @@ uint32_t tee_v4_admin_total_pages(uint32_t total_items,
     if (items_per_page == 0) {
         return 0;
     }
-    return (total_items + items_per_page - 1U) / items_per_page;
+    return total_items / items_per_page +
+           (total_items % items_per_page != 0U);
 }
 
 uint32_t tee_v4_admin_start_item(uint32_t page_index,
                                  uint32_t items_per_page)
 {
+    if (page_index != 0 && items_per_page > UINT32_MAX / page_index) {
+        return UINT32_MAX;
+    }
     return page_index * items_per_page;
 }
 

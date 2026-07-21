@@ -15,12 +15,17 @@
 #define TEE_V4_ADMIN_FETCH_OPCODE    0xe5U
 #define TEE_V4_ADMIN_CONTINUE_OPCODE 0xe6U
 
+#define TEE_V4_ADMIN_FLAG_SUBMIT   1U
+#define TEE_V4_ADMIN_FLAG_FETCH    2U
+#define TEE_V4_ADMIN_FLAG_CONTINUE 4U
+
 enum tee_v4_admin_command_type {
     TEE_V4_ADMIN_CMD_READ_SUMMARY = 1,
     TEE_V4_ADMIN_CMD_READ_LOCATIONS = 2,
     TEE_V4_ADMIN_CMD_READ_HMAC_GROUPS = 3,
     TEE_V4_ADMIN_CMD_ONE_BIT_PROOF = 4,
-    TEE_V4_ADMIN_CMD_SYNC_METADATA = 5
+    TEE_V4_ADMIN_CMD_SYNC_METADATA = 5,
+    TEE_V4_ADMIN_CMD_SET_ACTIVE_METADATA = 6
 };
 
 enum tee_v4_admin_status {
@@ -67,6 +72,22 @@ struct tee_v4_admin_continue_payload {
     uint64_t request_id;
     uint32_t page_index;
 };
+
+struct tee_v4_admin_active_metadata_payload {
+    uint8_t file_id;
+    uint8_t reserved[3];
+    uint32_t chunk_id;
+    uint64_t chunk_size_bytes;
+    uint32_t segment_count;
+    uint32_t number_coefficient;
+    uint32_t group_count;
+};
+
+struct tee_v4_admin_hmac_group_wire {
+    uint32_t start_segment_index;
+    uint32_t group_segment_count;
+    uint8_t expected_hmac[TEE_V2_HMAC_SIZE];
+};
 #pragma pack(pop)
 
 #define TEE_V4_ADMIN_REQUEST_HEADER_SIZE \
@@ -79,6 +100,10 @@ struct tee_v4_admin_continue_payload {
     ((uint32_t)sizeof(struct tee_v4_admin_chunk_query_payload))
 #define TEE_V4_ADMIN_CONTINUE_PAYLOAD_SIZE \
     ((uint32_t)sizeof(struct tee_v4_admin_continue_payload))
+#define TEE_V4_ADMIN_ACTIVE_METADATA_PAYLOAD_SIZE \
+    ((uint32_t)sizeof(struct tee_v4_admin_active_metadata_payload))
+#define TEE_V4_ADMIN_HMAC_GROUP_WIRE_SIZE \
+    ((uint32_t)sizeof(struct tee_v4_admin_hmac_group_wire))
 
 bool tee_v4_admin_request_valid(
     const struct tee_v4_admin_request_header *header, size_t buffer_bytes);

@@ -87,6 +87,18 @@ int tee_v2_cache_store_passive(struct tee_v2_cache *cache,
     return 0;
 }
 
+int tee_v2_cache_remove_last_passive(struct tee_v2_cache *cache,
+                                     uint8_t file_id, uint32_t chunk_id)
+{
+    struct tee_v2_passive_metadata *last;
+    if (!cache || cache->passive_count == 0) return -1;
+    last = &cache->passive_records[cache->passive_count - 1U];
+    if (last->file_id != file_id || last->chunk_id != chunk_id) return -1;
+    tee_v2_passive_metadata_destroy(last);
+    cache->passive_count--;
+    return 0;
+}
+
 int tee_v2_cache_mark_protected(struct tee_v2_cache *cache, uint64_t location)
 { return cache ? tee_v1_bitmap_set(&cache->protected_bitmap, location) : -1; }
 int tee_v2_cache_unmark_protected(struct tee_v2_cache *cache, uint64_t location)

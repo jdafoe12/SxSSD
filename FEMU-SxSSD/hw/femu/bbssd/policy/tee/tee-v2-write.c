@@ -35,6 +35,61 @@ void tee_v2_write_set_promotion_hook(
     write->promotion_hook_opaque = opaque;
 }
 
+void tee_v2_write_set_relocation_observer(
+    struct tee_v2_write_context *write,
+    int (*observer)(void *, uint8_t, uint32_t, uint32_t, uint64_t, uint64_t),
+    void *opaque)
+{
+    if (!write) return;
+    write->relocation_observer = observer;
+    write->relocation_observer_opaque = opaque;
+}
+
+int tee_v2_write_observe_relocation(struct tee_v2_write_context *write,
+                                    uint8_t file_id, uint32_t chunk_id,
+                                    uint32_t segment_index,
+                                    uint64_t old_location,
+                                    uint64_t new_location)
+{
+    if (!write || !write->relocation_observer) return 0;
+    return write->relocation_observer(write->relocation_observer_opaque,
+                                      file_id, chunk_id, segment_index,
+                                      old_location, new_location);
+}
+
+void tee_v2_write_set_operation_advance(
+    struct tee_v2_write_context *write,
+    int (*advance)(void *, uint64_t), void *opaque)
+{
+    if (!write) return;
+    write->operation_advance = advance;
+    write->operation_advance_opaque = opaque;
+}
+
+int tee_v2_write_advance_operation(struct tee_v2_write_context *write,
+                                   uint64_t ops)
+{
+    if (!write || !write->operation_advance) return 0;
+    return write->operation_advance(write->operation_advance_opaque, ops);
+}
+
+void tee_v2_write_set_relocation_cancel(
+    struct tee_v2_write_context *write,
+    int (*cancel)(void *, uint32_t), void *opaque)
+{
+    if (!write) return;
+    write->relocation_cancel = cancel;
+    write->relocation_cancel_opaque = opaque;
+}
+
+int tee_v2_write_cancel_relocations(struct tee_v2_write_context *write,
+                                    uint32_t count)
+{
+    if (!count) return 0;
+    if (!write || !write->relocation_cancel) return 0;
+    return write->relocation_cancel(write->relocation_cancel_opaque, count);
+}
+
 bool tee_v2_write_range_allowed(const struct tee_v2_write_context *write,
                                 uint64_t first_segment,
                                 uint64_t segment_count)
@@ -206,13 +261,15 @@ static enum tee_v2_write_result promote_active(struct tee_v2_write_context *writ
     uint32_t i;
     if (tee_v2_passive_from_active(&passive, write->active) != 0)
         return TEE_V2_WRITE_ERROR;
-    if (write->promotion_hook &&
-        write->promotion_hook(write->promotion_hook_opaque,
-                              write->cache, &passive) != 0) {
+    if (tee_v2_cache_store_passive(write->cache, &passive) != 0) {
         tee_v2_passive_metadata_destroy(&passive);
         return TEE_V2_WRITE_ERROR;
     }
-    if (tee_v2_cache_store_passive(write->cache, &passive) != 0) {
+    if (write->promotion_hook &&
+        write->promotion_hook(write->promotion_hook_opaque,
+                              write->cache, &passive) != 0) {
+        (void)tee_v2_cache_remove_last_passive(
+            write->cache, passive.file_id, passive.chunk_id);
         tee_v2_passive_metadata_destroy(&passive);
         return TEE_V2_WRITE_ERROR;
     }

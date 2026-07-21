@@ -85,6 +85,7 @@ int tee_v4_admin_response_materialize_page(
     uint32_t start_item;
     size_t payload_bytes;
     size_t total_bytes;
+    size_t item_offset;
 
     if (written) {
         *written = 0;
@@ -103,7 +104,14 @@ int tee_v4_admin_response_materialize_page(
                                                 response->items_per_page);
     start_item = tee_v4_admin_start_item(page_index,
                                          response->items_per_page);
-    payload_bytes = (size_t)returned_items * (size_t)response->item_size;
+    if (response->item_size != 0 &&
+        returned_items > SIZE_MAX / response->item_size) {
+        return -1;
+    }
+    payload_bytes = (size_t)returned_items * response->item_size;
+    if (payload_bytes > SIZE_MAX - sizeof(*header)) {
+        return -1;
+    }
     total_bytes = sizeof(*header) + payload_bytes;
     if (total_bytes > out_capacity) {
         return -1;
@@ -115,8 +123,17 @@ int tee_v4_admin_response_materialize_page(
         response->status, response->total_items, response->item_size,
         response->items_per_page, page_index);
     if (payload_bytes > 0) {
+        if (response->item_size != 0 &&
+            start_item > SIZE_MAX / response->item_size) {
+            return -1;
+        }
+        item_offset = (size_t)start_item * response->item_size;
+        if (item_offset > response->item_bytes_capacity ||
+            payload_bytes > response->item_bytes_capacity - item_offset) {
+            return -1;
+        }
         memcpy((uint8_t *)out + sizeof(*header),
-               response->items + (size_t)start_item * response->item_size,
+               response->items + item_offset,
                payload_bytes);
     }
     *written = total_bytes;

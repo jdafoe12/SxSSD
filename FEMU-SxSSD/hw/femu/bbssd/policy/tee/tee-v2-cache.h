@@ -20,6 +20,8 @@ int tee_v2_cache_init(struct tee_v2_cache *cache, uint64_t segment_count,
 void tee_v2_cache_destroy(struct tee_v2_cache *cache);
 int tee_v2_cache_store_passive(struct tee_v2_cache *cache,
                                const struct tee_v2_passive_metadata *passive);
+int tee_v2_cache_remove_last_passive(struct tee_v2_cache *cache,
+                                     uint8_t file_id, uint32_t chunk_id);
 struct tee_v2_passive_metadata *tee_v2_cache_find_passive(
     struct tee_v2_cache *cache, uint8_t file_id, uint32_t chunk_id);
 int tee_v2_cache_mark_protected(struct tee_v2_cache *cache, uint64_t location);

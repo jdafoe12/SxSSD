@@ -467,6 +467,9 @@ static uint64_t write_callback(struct ssd *ssd, struct NvmeCommandEvent *event,
         uint8_t *pending_snapshot = NULL;
         bool active_snapshot_valid = false;
         bool policy_apply_failed = false;
+        bool relocation_apply_started = false;
+        uint32_t relocation_ops_reserved = 0;
+        bool relocation_reservations_cancelled = false;
         if (!results || !passives || !indices || !old_locations) {
             free(results); free(passives); free(indices); free(old_locations);
             free(req_buf);
@@ -594,20 +597,81 @@ static uint64_t write_callback(struct ssd *ssd, struct NvmeCommandEvent *event,
         if (active_snapshot_valid)
             tee_v2_active_metadata_destroy(&active_snapshot);
         free(pending_snapshot);
-        for (i = 0; i < count; i++) {
-            if (!policy_apply_failed && results[i] == TEE_V2_WRITE_RELOCATION) {
-                /* V2 records mark-new-before-unmark; durable transaction is V4. */
-                tee_v2_cache_mark_protected(&g_v2_cache, first_segment + i);
-                passives[i]->segment_locations[indices[i] - 1] = first_segment + i;
-                tee_v2_cache_unmark_protected(&g_v2_cache, old_locations[i]);
+        /* Reserve every durable relocation record before publishing RAM state. */
+        for (i = 0; i < count && !policy_apply_failed; i++) {
+            if (results[i] == TEE_V2_WRITE_RELOCATION) {
+                if (tee_v2_write_observe_relocation(
+                        &g_v2_write, passives[i]->file_id,
+                        passives[i]->chunk_id, indices[i], old_locations[i],
+                        first_segment + i) != 0) {
+                    event->status = NVME_INTERNAL_DEV_ERROR;
+                    policy_apply_failed = true;
+                } else {
+                    relocation_ops_reserved++;
+                }
             }
+        }
+        if (policy_apply_failed && relocation_ops_reserved) {
+            (void)tee_v2_write_cancel_relocations(
+                &g_v2_write, relocation_ops_reserved);
+            relocation_reservations_cancelled = true;
+        }
+        for (i = 0; i < count && !policy_apply_failed; i++) {
+            if (results[i] == TEE_V2_WRITE_RELOCATION) {
+                /* V2 publishes mark-new, location update, then unmark-old. */
+                relocation_apply_started = true;
+                if (tee_v2_cache_mark_protected(
+                        &g_v2_cache, first_segment + i) != 0) {
+                    event->status = NVME_INTERNAL_DEV_ERROR;
+                    policy_apply_failed = true;
+                    break;
+                }
+                passives[i]->segment_locations[indices[i] - 1] =
+                    first_segment + i;
+                if (tee_v2_cache_unmark_protected(
+                        &g_v2_cache, old_locations[i]) != 0) {
+                    event->status = NVME_INTERNAL_DEV_ERROR;
+                    policy_apply_failed = true;
+                }
+            }
+        }
+        /* Timeout progress is request-based, including normal/non-relocation
+         * aligned writes, and occurs only after policy publication succeeds.
+         */
+        if (!policy_apply_failed &&
+            tee_v2_write_advance_operation(&g_v2_write, 1) != 0) {
+            event->status = NVME_INTERNAL_DEV_ERROR;
+            policy_apply_failed = true;
+        }
+        if (policy_apply_failed && relocation_apply_started) {
+            uint64_t j;
+            /* Restore the whole relocation batch to its pre-publish mirror. */
+            for (j = 0; j <= i && j < count; j++) {
+                if (results[j] != TEE_V2_WRITE_RELOCATION) continue;
+                (void)tee_v2_cache_mark_protected(&g_v2_cache,
+                                                  old_locations[j]);
+                passives[j]->segment_locations[indices[j] - 1] =
+                    old_locations[j];
+                (void)tee_v2_cache_unmark_protected(&g_v2_cache,
+                                                    first_segment + j);
+            }
+        }
+        if (policy_apply_failed && relocation_ops_reserved &&
+            !relocation_reservations_cancelled) {
+            (void)tee_v2_write_cancel_relocations(
+                &g_v2_write, relocation_ops_reserved);
         }
         free(results); free(passives); free(indices); free(old_locations);
         free(req_buf);
         return lat;
     }
     free(req_buf);
-    return block_write(ssd, event);
+    lat = block_write(ssd, event);
+    if (event->status == NVME_SUCCESS &&
+        tee_v2_write_advance_operation(&g_v2_write, 1) != 0) {
+        event->status = NVME_INTERNAL_DEV_ERROR;
+    }
+    return lat;
 #else
     uint16_t status = tee_v1_check_write_allowed(&g_v1_layout,
                                                  &g_v1_protected_bitmap,
@@ -809,20 +873,21 @@ int tee_v2_policy_set_active_metadata(
     uint32_t segment_count, uint32_t number_coefficient,
     const struct tee_v2_hmac_group_spec *groups, uint32_t group_count)
 {
+    struct tee_v2_active_metadata replacement = {0};
+
     if (!g_ctx) return -1;
     if (!tee_v2_write_can_activate_identity(&g_v2_write, file_id, chunk_id))
         return -1;
+    if (tee_v2_active_metadata_init(&replacement, &g_v2_config, file_id,
+                                    chunk_id, chunk_size_bytes, segment_count,
+                                    number_coefficient, groups, group_count) != 0) {
+        return -1;
+    }
     if (g_v2_active_valid) {
         tee_v2_write_abandon_active(&g_v2_write);
         tee_v2_active_metadata_destroy(&g_v2_active);
     }
-    if (tee_v2_active_metadata_init(&g_v2_active, &g_v2_config, file_id,
-                                    chunk_id, chunk_size_bytes, segment_count,
-                                    number_coefficient, groups, group_count) != 0) {
-        g_v2_active_valid = false;
-        g_v2_write.active = NULL;
-        return -1;
-    }
+    g_v2_active = replacement;
     g_v2_active_valid = true;
     g_v2_write.active = &g_v2_active;
     g_v2_write.active_promoted = false;

@@ -5,13 +5,16 @@
 #undef init_policy
 
 #include "tee-ftl-v4-policy.h"
+#include "tee-ftl-v2-policy.h"
 #include "tee/tee-v4-admin.h"
 #include "tee/tee-v3-policy.h"
+#include "tee/tee-v4-writeback.h"
 
 #include <stdlib.h>
 #include <string.h>
 
 #define TEE_V4_RESPONSE_ITEM_BYTES (1024U * 1024U)
+#define TEE_V4_TRANSACTION_SINK_CAPACITY 64U
 
 typedef struct __attribute__((packed)) TeeV4NvmeCmd {
     uint16_t opcode_flags;
@@ -33,6 +36,112 @@ static struct tee_v4_admin g_v4_admin;
 static struct tee_v3_storage g_v4_storage;
 static struct tee_v3_memory_backend g_v4_backend;
 static struct tee_v3_policy_context g_v4_policy;
+static struct tee_v4_writeback g_v4_writeback;
+static struct tee_v4_transaction_record
+    g_v4_pending_transactions[TEE_V4_DEFAULT_RELOCATION_BATCH_MAX];
+static struct tee_v4_transaction_record
+    g_v4_transaction_sink[TEE_V4_TRANSACTION_SINK_CAPACITY];
+static uint32_t g_v4_transaction_sink_count;
+
+static int tee_v4_flush_transactions(
+    void *opaque, const struct tee_v4_transaction_record *records,
+    uint32_t count)
+{
+    struct tee_v3_policy_context *policy = opaque;
+    uint32_t i;
+    bool has_relocation = false;
+    if (!records || !policy || !policy->write || !policy->write->cache ||
+        !policy->storage) {
+        return -1;
+    }
+    for (i = 0; i < count; i++) {
+        if (records[i].type == TEE_V4_TRANSACTION_RELOCATION) {
+            has_relocation = true;
+        }
+    }
+    if (has_relocation &&
+        tee_v3_storage_persist(
+            policy->storage, &policy->write->cache->protected_bitmap,
+            policy->write->cache->passive_records,
+            policy->write->cache->passive_count) != 0) {
+        return -1;
+    }
+    for (i = 0; i < count; i++) {
+        uint32_t slot = g_v4_transaction_sink_count %
+                        TEE_V4_TRANSACTION_SINK_CAPACITY;
+        g_v4_transaction_sink[slot] = records[i];
+        g_v4_transaction_sink[slot].state =
+            TEE_V4_TRANSACTION_PERSISTED;
+        g_v4_transaction_sink_count++;
+    }
+    return 0;
+}
+
+static int tee_v4_persist_promotion(
+    void *opaque, const struct tee_v2_cache *cache,
+    const struct tee_v2_passive_metadata *passive)
+{
+    struct tee_v3_policy_context *policy = opaque;
+    int result;
+    if (tee_v3_policy_persist_promotion(policy, cache, passive) != 0) {
+        return -1;
+    }
+    result = tee_v4_writeback_commit_chunk(
+        &g_v4_writeback, passive->file_id, passive->chunk_id);
+    if (result != 0) {
+        /* V3 is already durable. Keep promotion monotonic and expose the
+         * audit/writeback failure through the pending controller and SYNC.
+         */
+        tee_v3_pending_record_error(&policy->pending, result, 0);
+    }
+    return 0;
+}
+
+static int tee_v4_record_relocation(void *opaque, uint8_t file_id,
+                                    uint32_t chunk_id,
+                                    uint32_t segment_index,
+                                    uint64_t old_location,
+                                    uint64_t new_location)
+{
+    return tee_v4_writeback_reserve_relocation(
+        opaque, file_id, chunk_id, segment_index, old_location, new_location);
+}
+
+static int tee_v4_advance_operation(void *opaque, uint64_t ops)
+{
+    return tee_v4_writeback_advance(opaque, ops);
+}
+
+static int tee_v4_cancel_relocations(void *opaque, uint32_t count)
+{
+    return tee_v4_writeback_cancel_reserved(opaque, count);
+}
+
+static int tee_v4_intake_active_metadata(
+    void *opaque,
+    const struct tee_v4_admin_active_metadata_payload *metadata,
+    const struct tee_v4_admin_hmac_group_wire *groups)
+{
+    struct tee_v2_hmac_group_spec *specs = NULL;
+    uint32_t i;
+    int result;
+    (void)opaque;
+    if (metadata->group_count) {
+        specs = calloc(metadata->group_count, sizeof(*specs));
+        if (!specs) return -1;
+    }
+    for (i = 0; i < metadata->group_count; i++) {
+        specs[i].start_segment_index = groups[i].start_segment_index;
+        specs[i].group_segment_count = groups[i].group_segment_count;
+        specs[i].expected_hmac = groups[i].expected_hmac;
+    }
+    result = tee_v2_policy_set_active_metadata(
+        metadata->file_id, metadata->chunk_id, metadata->chunk_size_bytes,
+        metadata->segment_count, metadata->number_coefficient, specs,
+        metadata->group_count);
+    free(specs);
+    return result;
+}
 
 static int tee_v4_write_hidden_image(void *opaque, const uint8_t *data,
                                      size_t size)
@@ -67,6 +176,7 @@ static uint64_t tee_v4_admin_callback(struct ssd *ssd,
     const TeeV4NvmeCmd *cmd = event->cmd;
     uint32_t length;
     uint8_t *buffer = NULL;
+    uint8_t *response = NULL;
     size_t written = 0;
 
     (void)ssd;
@@ -88,51 +198,55 @@ static uint64_t tee_v4_admin_callback(struct ssd *ssd,
     }
 
     if (event->opcode == TEE_V4_ADMIN_SUBMIT_OPCODE) {
+        int submit_result;
         event->status = api->read_cmd_buffer(event, buffer, length);
-        if (event->status == NVME_SUCCESS &&
-            tee_v4_admin_submit(&g_v4_admin, buffer, length) != 0) {
-            event->status = NVME_INVALID_FIELD | NVME_DNR;
-        }
-        free(buffer);
-        return 0;
-    }
-
-    if (event->opcode == TEE_V4_ADMIN_FETCH_OPCODE) {
-        if (tee_v4_admin_fetch(&g_v4_admin, buffer, length, &written) != 0) {
-            event->status = NVME_INVALID_FIELD | NVME_DNR;
-        } else {
-            event->status = api->write_cmd_buffer(event, buffer,
-                                                  (uint32_t)written);
+        if (event->status == NVME_SUCCESS) {
+            submit_result = tee_v4_admin_submit(&g_v4_admin, buffer, length);
+            if (submit_result == -2) {
+                event->status = NVME_INTERNAL_DEV_ERROR;
+            } else if (submit_result != 0) {
+                event->status = NVME_INVALID_FIELD | NVME_DNR;
+            }
         }
         free(buffer);
         return 0;
     }
 
     event->status = api->read_cmd_buffer(event, buffer, length);
-    if (event->status == NVME_SUCCESS) {
-        const struct tee_v4_admin_continue_payload *payload =
-            (const struct tee_v4_admin_continue_payload *)buffer;
-        uint8_t *response;
+    if (event->status != NVME_SUCCESS) {
+        free(buffer);
+        return 0;
+    }
+    response = calloc(1, TEE_V4_ADMIN_DEFAULT_BUFFER_BYTES);
+    if (!response) {
+        free(buffer);
+        event->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+        return 0;
+    }
 
-        if (length != sizeof(*payload)) {
+    if (event->opcode == TEE_V4_ADMIN_FETCH_OPCODE) {
+        if (tee_v4_admin_fetch(&g_v4_admin, buffer, length, response,
+                               TEE_V4_ADMIN_DEFAULT_BUFFER_BYTES,
+                               &written) != 0) {
             event->status = NVME_INVALID_FIELD | NVME_DNR;
         } else {
-            response = calloc(1, TEE_V4_ADMIN_DEFAULT_BUFFER_BYTES);
-            if (!response) {
-                event->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
-            } else if (tee_v4_admin_continue(
-                           &g_v4_admin, payload->request_id,
-                           payload->page_index, response,
-                           TEE_V4_ADMIN_DEFAULT_BUFFER_BYTES,
-                           &written) != 0) {
-                event->status = NVME_INVALID_FIELD | NVME_DNR;
-            } else {
-                event->status = api->write_cmd_buffer(event, response,
-                                                      (uint32_t)written);
-            }
-            free(response);
+            event->status = api->write_cmd_buffer(event, response,
+                                                  (uint32_t)written);
         }
+        free(response);
+        free(buffer);
+        return 0;
     }
+
+    if (tee_v4_admin_continue(&g_v4_admin, buffer, length, response,
+                              TEE_V4_ADMIN_DEFAULT_BUFFER_BYTES,
+                              &written) != 0) {
+        event->status = NVME_INVALID_FIELD | NVME_DNR;
+    } else {
+        event->status = api->write_cmd_buffer(event, response,
+                                              (uint32_t)written);
+    }
+    free(response);
     free(buffer);
     return 0;
 }
@@ -155,15 +269,35 @@ int init_policy(struct ssd *ssd, struct FtlPolicyAPI *api)
         return -1;
     }
     tee_v3_policy_context_init(&g_v4_policy, &g_v2_write, &g_v4_storage);
+    g_v4_transaction_sink_count = 0;
+    if (tee_v4_writeback_init(
+            &g_v4_writeback, g_v4_pending_transactions,
+            TEE_V4_DEFAULT_RELOCATION_BATCH_MAX,
+            TEE_V4_DEFAULT_RELOCATION_TIMEOUT_OPS,
+            tee_v4_flush_transactions, &g_v4_policy) != 0) {
+        return -1;
+    }
     tee_v2_write_set_promotion_hook(&g_v2_write,
-                                    tee_v3_policy_persist_promotion,
+                                    tee_v4_persist_promotion,
                                     &g_v4_policy);
+    tee_v2_write_set_relocation_observer(&g_v2_write,
+                                         tee_v4_record_relocation,
+                                         &g_v4_writeback);
+    tee_v2_write_set_operation_advance(&g_v2_write,
+                                       tee_v4_advance_operation,
+                                       &g_v4_writeback);
+    tee_v2_write_set_relocation_cancel(&g_v2_write,
+                                       tee_v4_cancel_relocations,
+                                       &g_v4_writeback);
 
     if (tee_v4_admin_init(&g_v4_admin, &g_v4_policy,
                           TEE_V4_ADMIN_DEFAULT_BUFFER_BYTES,
                           TEE_V4_RESPONSE_ITEM_BYTES) != 0) {
         return -1;
     }
+    tee_v4_admin_set_writeback(&g_v4_admin, &g_v4_writeback);
+    tee_v4_admin_set_metadata_intake(&g_v4_admin,
+                                     tee_v4_intake_active_metadata, NULL);
 
     submit_handle = api->register_admin_hook(
         ssd, TEE_V4_ADMIN_SUBMIT_OPCODE, tee_v4_admin_condition,

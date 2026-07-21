@@ -29,6 +29,14 @@ static uint32_t items_per_admin_page(uint32_t admin_buffer_bytes,
     return payload_bytes / item_size ? payload_bytes / item_size : 1U;
 }
 
+static uint32_t requested_items_per_page(uint32_t admin_buffer_bytes,
+                                         uint32_t item_size,
+                                         uint32_t requested)
+{
+    uint32_t maximum = items_per_admin_page(admin_buffer_bytes, item_size);
+    return requested && requested < maximum ? requested : maximum;
+}
+
 static int compute_request_mac(const void *request_buffer,
                                size_t request_bytes,
                                uint8_t out[TEE_V2_HMAC_SIZE])
@@ -51,6 +59,9 @@ static int compute_request_mac(const void *request_buffer,
         memcpy(covered + TEE_V4_ADMIN_REQUEST_MAC_OFFSET, payload,
                header->payload_len);
     }
+    /* V4 authenticates the operation domain through header.flags. Production
+     * key provisioning and a dedicated derived admin key are deferred to V6.
+     */
     tee_v2_hmac_sha256(tee_v2_prototype_key, TEE_V2_PROTOTYPE_KEY_SIZE,
                        covered, span, out);
     free(covered);
@@ -90,6 +101,26 @@ void tee_v4_admin_destroy(struct tee_v4_admin *admin)
     }
     tee_v4_admin_response_destroy(&admin->pending);
     memset(admin, 0, sizeof(*admin));
+}
+
+void tee_v4_admin_set_writeback(struct tee_v4_admin *admin,
+                                struct tee_v4_writeback *writeback)
+{
+    if (admin) {
+        admin->writeback = writeback;
+    }
+}
+
+void tee_v4_admin_set_metadata_intake(
+    struct tee_v4_admin *admin,
+    int (*intake)(void *,
+                  const struct tee_v4_admin_active_metadata_payload *,
+                  const struct tee_v4_admin_hmac_group_wire *),
+    void *opaque)
+{
+    if (!admin) return;
+    admin->metadata_intake = intake;
+    admin->metadata_intake_opaque = opaque;
 }
 
 int tee_v4_admin_sign_request(void *request_buffer, size_t request_bytes)
@@ -167,7 +198,8 @@ static int handle_locations(struct tee_v4_admin *admin,
         &admin->pending, header->command_type, header->request_id,
         TEE_V4_ADMIN_STATUS_OK, locations, summary.location_item_count,
         sizeof(*locations),
-        items_per_admin_page(admin->admin_buffer_bytes, sizeof(*locations)));
+        requested_items_per_page(admin->admin_buffer_bytes,
+                                 sizeof(*locations), query->page_size));
     free(locations);
     return result;
 }
@@ -204,7 +236,8 @@ static int handle_hmac_groups(
         &admin->pending, header->command_type, header->request_id,
         TEE_V4_ADMIN_STATUS_OK, groups, summary.hmac_group_count,
         sizeof(*groups),
-        items_per_admin_page(admin->admin_buffer_bytes, sizeof(*groups)));
+        requested_items_per_page(admin->admin_buffer_bytes,
+                                 sizeof(*groups), query->page_size));
     free(groups);
     return result;
 }
@@ -234,8 +267,8 @@ static int handle_one_bit_proof(
             &admin->pending, header->command_type, header->request_id,
             TEE_V4_ADMIN_STATUS_OK, missing, (uint32_t)written,
             sizeof(*missing),
-            items_per_admin_page(admin->admin_buffer_bytes,
-                                 sizeof(*missing)));
+            requested_items_per_page(admin->admin_buffer_bytes,
+                                     sizeof(*missing), query->page_size));
     } else {
         result = tee_v4_admin_response_prepare_items(
             &admin->pending, header->command_type, header->request_id,
@@ -250,56 +283,160 @@ int tee_v4_admin_submit(struct tee_v4_admin *admin, const void *request_buffer,
 {
     const struct tee_v4_admin_request_header *header = request_buffer;
     const struct tee_v4_admin_chunk_query_payload *query;
+    int result;
 
     if (!admin || !request_buffer ||
         !tee_v4_admin_request_valid(header, request_bytes) ||
+        request_bytes != sizeof(*header) + header->payload_len ||
+        header->flags != TEE_V4_ADMIN_FLAG_SUBMIT ||
+        (admin->has_last_submit_request_id &&
+         header->request_id <= admin->last_submit_request_id) ||
         verify_request_mac(request_buffer, request_bytes) != 0) {
         return -1;
     }
     query = (const struct tee_v4_admin_chunk_query_payload *)
         ((const uint8_t *)request_buffer + sizeof(*header));
-    if (header->payload_len != sizeof(*query) &&
-        header->command_type != TEE_V4_ADMIN_CMD_SYNC_METADATA) {
+    if (header->command_type != TEE_V4_ADMIN_CMD_SYNC_METADATA &&
+        header->command_type != TEE_V4_ADMIN_CMD_SET_ACTIVE_METADATA &&
+        header->payload_len != sizeof(*query)) {
         return -1;
     }
     switch (header->command_type) {
     case TEE_V4_ADMIN_CMD_READ_SUMMARY:
-        return handle_summary(admin, header, query);
+        if (query->reserved[0] || query->reserved[1] || query->reserved[2] ||
+            query->page_size > admin->admin_buffer_bytes) return -1;
+        result = handle_summary(admin, header, query);
+        break;
     case TEE_V4_ADMIN_CMD_READ_LOCATIONS:
-        return handle_locations(admin, header, query);
+        if (query->reserved[0] || query->reserved[1] || query->reserved[2] ||
+            query->page_size > admin->admin_buffer_bytes) return -1;
+        result = handle_locations(admin, header, query);
+        break;
     case TEE_V4_ADMIN_CMD_READ_HMAC_GROUPS:
-        return handle_hmac_groups(admin, header, query);
+        if (query->reserved[0] || query->reserved[1] || query->reserved[2] ||
+            query->page_size > admin->admin_buffer_bytes) return -1;
+        result = handle_hmac_groups(admin, header, query);
+        break;
     case TEE_V4_ADMIN_CMD_ONE_BIT_PROOF:
-        return handle_one_bit_proof(admin, header, query);
+        if (query->reserved[0] || query->reserved[1] || query->reserved[2] ||
+            query->page_size > admin->admin_buffer_bytes) return -1;
+        result = handle_one_bit_proof(admin, header, query);
+        break;
     case TEE_V4_ADMIN_CMD_SYNC_METADATA:
-        return prepare_status(admin, header, TEE_V4_ADMIN_STATUS_OK);
+        if (header->payload_len != 0 || !admin->writeback ||
+            tee_v4_writeback_sync(admin->writeback) != 0) {
+            (void)prepare_status(admin, header,
+                                 TEE_V4_ADMIN_STATUS_INTERNAL_ERROR);
+            return -2;
+        }
+        result = prepare_status(admin, header, TEE_V4_ADMIN_STATUS_OK);
+        break;
+    case TEE_V4_ADMIN_CMD_SET_ACTIVE_METADATA:
+        {
+            const struct tee_v4_admin_active_metadata_payload *metadata;
+            const struct tee_v4_admin_hmac_group_wire *groups;
+            size_t groups_bytes;
+            size_t expected;
+            uint32_t i;
+            uint64_t expected_start = 1;
+
+            if (header->payload_len < sizeof(*metadata) ||
+                !admin->metadata_intake) return -1;
+            metadata = (const void *)((const uint8_t *)request_buffer +
+                                      sizeof(*header));
+            if (metadata->reserved[0] || metadata->reserved[1] ||
+                metadata->reserved[2] || !metadata->chunk_size_bytes ||
+                metadata->chunk_id > 0xFFFFFFU ||
+                !metadata->segment_count || !metadata->number_coefficient ||
+                metadata->number_coefficient > metadata->segment_count ||
+                !metadata->group_count ||
+                metadata->group_count >
+                    (UINT32_MAX - sizeof(*metadata)) / sizeof(*groups)) {
+                return -1;
+            }
+            groups_bytes = (size_t)metadata->group_count * sizeof(*groups);
+            expected = sizeof(*metadata) + groups_bytes;
+            if (expected != header->payload_len) return -1;
+            groups = (const void *)(metadata + 1);
+            for (i = 0; i < metadata->group_count; i++) {
+                if (!groups[i].start_segment_index ||
+                    !groups[i].group_segment_count ||
+                    groups[i].start_segment_index != expected_start ||
+                    groups[i].start_segment_index > metadata->segment_count ||
+                    groups[i].group_segment_count >
+                        metadata->segment_count -
+                            groups[i].start_segment_index + 1U) {
+                    return -1;
+                }
+                expected_start += groups[i].group_segment_count;
+            }
+            if (expected_start != (uint64_t)metadata->segment_count + 1U)
+                return -1;
+            if (admin->metadata_intake(admin->metadata_intake_opaque,
+                                       metadata, groups) != 0) return -1;
+            result = prepare_status(admin, header, TEE_V4_ADMIN_STATUS_OK);
+            break;
+        }
     default:
         return -1;
     }
+    if (result == 0) {
+        admin->last_submit_request_id = header->request_id;
+        admin->has_last_submit_request_id = true;
+    }
+    return result;
 }
 
-int tee_v4_admin_fetch(struct tee_v4_admin *admin, void *response_buffer,
+int tee_v4_admin_fetch(struct tee_v4_admin *admin, const void *request_buffer,
+                       size_t request_bytes, void *response_buffer,
                        size_t response_capacity, size_t *written)
 {
-    if (!admin) {
+    const struct tee_v4_admin_request_header *header = request_buffer;
+
+    if (!admin || !request_buffer ||
+        !tee_v4_admin_request_valid(header, request_bytes) ||
+        request_bytes != sizeof(*header) || header->payload_len != 0 ||
+        header->flags != TEE_V4_ADMIN_FLAG_FETCH ||
+        verify_request_mac(request_buffer, request_bytes) != 0 ||
+        !admin->pending.valid ||
+        admin->pending.command_type != header->command_type ||
+        admin->pending.request_id != header->request_id) {
+        if (written) *written = 0;
         return -1;
     }
     return tee_v4_admin_response_materialize_page(
         &admin->pending, 0, response_buffer, response_capacity, written);
 }
 
-int tee_v4_admin_continue(struct tee_v4_admin *admin, uint64_t request_id,
-                          uint32_t page_index, void *response_buffer,
+int tee_v4_admin_continue(struct tee_v4_admin *admin,
+                          const void *request_buffer, size_t request_bytes,
+                          void *response_buffer,
                           size_t response_capacity, size_t *written)
 {
-    if (!admin || !admin->pending.valid ||
-        admin->pending.request_id != request_id) {
+    const struct tee_v4_admin_request_header *header = request_buffer;
+    const struct tee_v4_admin_continue_payload *payload;
+
+    if (!admin || !request_buffer ||
+        !tee_v4_admin_request_valid(header, request_bytes) ||
+        request_bytes != sizeof(*header) + sizeof(*payload) ||
+        header->payload_len != sizeof(*payload) ||
+        header->flags != TEE_V4_ADMIN_FLAG_CONTINUE ||
+        verify_request_mac(request_buffer, request_bytes) != 0) {
         if (written) {
             *written = 0;
         }
         return -1;
     }
+    payload = (const struct tee_v4_admin_continue_payload *)
+        ((const uint8_t *)request_buffer + sizeof(*header));
+    if (!admin->pending.valid ||
+        admin->pending.command_type != header->command_type ||
+        admin->pending.request_id != header->request_id ||
+        payload->request_id != header->request_id) {
+        if (written) *written = 0;
+        return -1;
+    }
     return tee_v4_admin_response_materialize_page(
-        &admin->pending, page_index, response_buffer, response_capacity,
+        &admin->pending, payload->page_index, response_buffer, response_capacity,
         written);
 }

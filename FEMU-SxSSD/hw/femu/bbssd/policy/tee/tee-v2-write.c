@@ -24,6 +24,17 @@ void tee_v2_write_context_destroy(struct tee_v2_write_context *write)
     memset(write, 0, sizeof(*write));
 }
 
+void tee_v2_write_set_promotion_hook(
+    struct tee_v2_write_context *write,
+    int (*hook)(void *, const struct tee_v2_cache *,
+                const struct tee_v2_passive_metadata *),
+    void *opaque)
+{
+    if (!write) return;
+    write->promotion_hook = hook;
+    write->promotion_hook_opaque = opaque;
+}
+
 bool tee_v2_write_range_allowed(const struct tee_v2_write_context *write,
                                 uint64_t first_segment,
                                 uint64_t segment_count)
@@ -195,6 +206,12 @@ static enum tee_v2_write_result promote_active(struct tee_v2_write_context *writ
     uint32_t i;
     if (tee_v2_passive_from_active(&passive, write->active) != 0)
         return TEE_V2_WRITE_ERROR;
+    if (write->promotion_hook &&
+        write->promotion_hook(write->promotion_hook_opaque,
+                              write->cache, &passive) != 0) {
+        tee_v2_passive_metadata_destroy(&passive);
+        return TEE_V2_WRITE_ERROR;
+    }
     if (tee_v2_cache_store_passive(write->cache, &passive) != 0) {
         tee_v2_passive_metadata_destroy(&passive);
         return TEE_V2_WRITE_ERROR;

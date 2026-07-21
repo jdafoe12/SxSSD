@@ -20,6 +20,10 @@ struct tee_v2_write_context {
     struct tee_v2_cache *cache;
     struct tee_v1_bitmap pending_bitmap;   /* RAM working state, never cache. */
     bool active_promoted;
+    int (*promotion_hook)(void *opaque,
+                          const struct tee_v2_cache *cache,
+                          const struct tee_v2_passive_metadata *passive);
+    void *promotion_hook_opaque;
 };
 
 int tee_v2_write_context_init(struct tee_v2_write_context *write,
@@ -27,6 +31,11 @@ int tee_v2_write_context_init(struct tee_v2_write_context *write,
                               struct tee_v2_cache *cache,
                               uint64_t logical_segment_count);
 void tee_v2_write_context_destroy(struct tee_v2_write_context *write);
+void tee_v2_write_set_promotion_hook(
+    struct tee_v2_write_context *write,
+    int (*hook)(void *, const struct tee_v2_cache *,
+                const struct tee_v2_passive_metadata *),
+    void *opaque);
 bool tee_v2_write_range_allowed(const struct tee_v2_write_context *write,
                                 uint64_t first_segment,
                                 uint64_t segment_count);

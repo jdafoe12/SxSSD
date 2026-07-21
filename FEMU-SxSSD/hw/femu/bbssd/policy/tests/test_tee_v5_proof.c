@@ -185,7 +185,8 @@ static void test_error_table_full_preserves_existing_evidence(void)
     uint32_t i;
 
     fixture_init(&fixture, 1, 1);
-    assert(TEE_V5_PROOF_ERROR_CAPACITY == 8);
+    /* 64 passive cache identities plus one active-conflict identity. */
+    assert(TEE_V5_PROOF_ERROR_CAPACITY == 65);
     for (i = 0; i < TEE_V5_PROOF_ERROR_CAPACITY; i++) {
         assert(tee_v5_proof_record_error(
                    &fixture.controller, 20, 1000 + i,
@@ -201,6 +202,23 @@ static void test_error_table_full_preserves_existing_evidence(void)
         assert_proof_error(&fixture, 20, 1000 + i,
                            TEE_V5_PROOF_ERROR_DELETE_INTEGRITY, i + 1);
     }
+    fixture_destroy(&fixture);
+}
+
+static void test_legacy_global_error_blocks_scoped_insertion(void)
+{
+    struct proof_fixture fixture;
+
+    fixture_init(&fixture, 1, 1);
+    tee_v3_pending_record_error(&fixture.controller, 88, 6);
+
+    /* Global legacy evidence has precedence and cannot be hidden by V5. */
+    assert(tee_v5_proof_record_error(
+               &fixture.controller, 40, 4000,
+               TEE_V5_PROOF_ERROR_DELETE_CONFLICT,
+               TEE_V5_NO_FAILED_SEGMENT) == -1);
+    assert_proof_error(&fixture, 40, 4000, 88, 6);
+    assert_proof_error(&fixture, 41, 4001, 88, 6);
     fixture_destroy(&fixture);
 }
 
@@ -230,6 +248,7 @@ int main(void)
     test_distinct_chunk_errors_survive_and_clear_independently();
     test_error_table_full_preserves_existing_evidence();
     test_legacy_record_resets_stale_scoped_state();
+    test_legacy_global_error_blocks_scoped_insertion();
     puts("test_tee_v5_proof: PASS");
     return 0;
 }

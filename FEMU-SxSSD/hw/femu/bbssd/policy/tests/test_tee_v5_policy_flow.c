@@ -217,6 +217,16 @@ static int fail_image_write(void *opaque, const uint8_t *data, size_t size)
     return -1;
 }
 
+static int fail_transaction_flush(
+    void *opaque, const struct tee_v4_transaction_record *records,
+    uint32_t count)
+{
+    (void)opaque;
+    (void)records;
+    (void)count;
+    return -1;
+}
+
 static void initialize_policy_state(void)
 {
     struct tee_v2_active_metadata bootstrap;
@@ -379,6 +389,44 @@ static void test_continuous_v1_to_v5_nvme_flow(void)
            TEE_V5_STATUS_OK);
     assert(proof->state == TEE_V3_PROOF_DONE);
     assert(proof->done_bit == 1);
+
+    /* The policy must retain more than eight simultaneously supported
+     * failure identities (bounded by 64 passive entries plus one active). */
+    tee_v5_proof_clear_error(&g_v4_policy.pending, 13, 35);
+    for (uint32_t i = 0; i < 9; i++) {
+        uint32_t missing = 0;
+        size_t missing_written = 0;
+
+        g_v2_active_valid = true;
+        g_v2_active.file_id = (uint8_t)(40 + i);
+        g_v2_active.chunk_id = 4000 + i;
+        assert(tee_v5_delete_chunk_handler(&g_v4_policy,
+                                           g_v2_active.file_id,
+                                           g_v2_active.chunk_id) == 2);
+        assert(tee_v3_one_bit_proof_query(
+                   &g_v4_policy.pending, g_v2_active.file_id,
+                   g_v2_active.chunk_id, 0, &missing, 1,
+                   &missing_written, proof) == TEE_V3_QUERY_OK);
+        assert(proof->state == TEE_V3_PROOF_ERROR);
+        assert(proof->last_error_code == TEE_V5_PROOF_ERROR_DELETE_CONFLICT);
+    }
+    g_v2_active_valid = false;
+
+    /* DELETE existence is resolved before writeback synchronization. An
+     * absent identity remains NOT_FOUND even with a failing pending flush,
+     * and must not consume a proof-error slot. */
+    assert(tee_v4_writeback_record_relocation(&g_v4_writeback, 1, 1, 1,
+                                               10, 11) == 0);
+    g_v4_writeback.flush = fail_transaction_flush;
+    assert(tee_v5_delete_chunk_handler(&g_v4_policy, 90, 9000) == 1);
+    {
+        uint32_t missing = 0;
+        size_t missing_written = 0;
+        assert(tee_v3_one_bit_proof_query(&g_v4_policy.pending, 90, 9000,
+                                           0, &missing, 1,
+                                           &missing_written, proof) ==
+               TEE_V3_QUERY_NOT_FOUND);
+    }
 
     /* No-pending response and unsupported command remain explicit. */
     assert(fetch_status(&api, 99, 999) ==

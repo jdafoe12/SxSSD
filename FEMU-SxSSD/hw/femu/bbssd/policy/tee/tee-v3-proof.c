@@ -4,15 +4,16 @@ static void touch(struct tee_v3_pending_controller*c){if(c)c->last_touch_op=c->c
 void tee_v3_pending_init(struct tee_v3_pending_controller*c,struct tee_v2_write_context*w,uint64_t timeout){if(!c)return;memset(c,0,sizeof(*c));c->write=w;c->timeout_ops=timeout?timeout:TEE_V3_DEFAULT_TIMEOUT_OPS;}
 void tee_v3_pending_touch_metadata(struct tee_v3_pending_controller*c){touch(c);}void tee_v3_pending_touch_group(struct tee_v3_pending_controller*c){touch(c);}void tee_v3_pending_touch_arrival(struct tee_v3_pending_controller*c){touch(c);}
 void tee_v3_pending_advance(struct tee_v3_pending_controller*c,uint64_t ops){if(!c)return;c->current_op+=ops;if(c->write&&c->write->active&&!c->write->active_promoted&&c->current_op-c->last_touch_op>=c->timeout_ops)tee_v2_write_abandon_active(c->write);}
-void tee_v3_pending_record_error(struct tee_v3_pending_controller*c,int32_t e,uint32_t i){if(!c)return;c->has_error=true;c->last_error_code=e;c->failed_segment_index=i;}
-static bool error_matches(const struct tee_v3_pending_controller*c,uint8_t file,uint32_t chunk){return c->has_error&&(!c->error_identity_valid||(c->error_file_id==file&&c->error_chunk_id==chunk));}
+void tee_v3_pending_record_error(struct tee_v3_pending_controller*c,int32_t e,uint32_t i){if(!c)return;memset(c->scoped_errors,0,sizeof(c->scoped_errors));c->has_error=true;c->error_identity_valid=false;c->last_error_code=e;c->failed_segment_index=i;}
+static const struct tee_v3_scoped_error *find_scoped_error(const struct tee_v3_pending_controller*c,uint8_t file,uint32_t chunk){size_t i;for(i=0;i<TEE_V3_SCOPED_ERROR_CAPACITY;i++)if(c->scoped_errors[i].valid&&c->scoped_errors[i].file_id==file&&c->scoped_errors[i].chunk_id==chunk)return &c->scoped_errors[i];return NULL;}
+static bool copy_error(const struct tee_v3_pending_controller*c,uint8_t file,uint32_t chunk,struct tee_v3_one_bit_proof*p){const struct tee_v3_scoped_error*e;if(!c->has_error)return false;if(!c->error_identity_valid){p->last_error_code=c->last_error_code;p->failed_segment_index=c->failed_segment_index;return true;}e=find_scoped_error(c,file,chunk);if(!e)return false;p->last_error_code=e->error_code;p->failed_segment_index=e->failed_segment_index;return true;}
 enum tee_v3_query_result tee_v3_one_bit_proof_query(struct tee_v3_pending_controller*c,uint8_t file,uint32_t chunk,uint32_t offset,uint32_t*out,size_t cap,size_t*written,struct tee_v3_one_bit_proof*p)
 {
  struct tee_v2_active_metadata*a;uint32_t i,missing=0,skip=0;size_t n=0;if(written)*written=0;if(!c||!c->write||!p||!written)return TEE_V3_QUERY_INVALID;memset(p,0,sizeof(*p));
- if(c->error_precedes_passive&&error_matches(c,file,chunk)){p->state=TEE_V3_PROOF_ERROR;p->last_error_code=c->last_error_code;p->failed_segment_index=c->failed_segment_index;return TEE_V3_QUERY_OK;}
+ if(c->error_precedes_passive&&copy_error(c,file,chunk,p)){p->state=TEE_V3_PROOF_ERROR;return TEE_V3_QUERY_OK;}
  if(tee_v2_cache_find_passive(c->write->cache,file,chunk)){p->state=TEE_V3_PROOF_DONE;p->done_bit=1;return TEE_V3_QUERY_OK;}
  a=c->write->active;if(!a||a->file_id!=file||a->chunk_id!=chunk)return TEE_V3_QUERY_NOT_FOUND;touch(c);
- if(error_matches(c,file,chunk)){p->state=TEE_V3_PROOF_ERROR;p->last_error_code=c->last_error_code;p->failed_segment_index=c->failed_segment_index;return TEE_V3_QUERY_OK;}
+ if(copy_error(c,file,chunk,p)){p->state=TEE_V3_PROOF_ERROR;return TEE_V3_QUERY_OK;}
  if(tee_v2_active_complete(a)){p->state=TEE_V3_PROOF_ABOUT_TO_PERSIST;p->about_to_persist=1;return TEE_V3_QUERY_OK;}
  if (!out || !cap) return TEE_V3_QUERY_INVALID;
  for (i = 0; i < a->segment_count; i++)

@@ -65,15 +65,16 @@ static int tee_v5_delete_chunk_handler(void *opaque, uint8_t file_id,
     if (!policy || !policy->write || !policy->write->cache) return -2;
     if (g_v2_active_valid && g_v2_active.file_id == file_id &&
         g_v2_active.chunk_id == chunk_id) {
-        tee_v5_proof_record_error(&policy->pending, file_id, chunk_id,
-                                  TEE_V5_PROOF_ERROR_DELETE_CONFLICT,
-                                  TEE_V5_NO_FAILED_SEGMENT);
+        (void)tee_v5_proof_record_error(
+            &policy->pending, file_id, chunk_id,
+            TEE_V5_PROOF_ERROR_DELETE_CONFLICT, TEE_V5_NO_FAILED_SEGMENT);
         return 2;
     }
     if (tee_v4_writeback_sync(&g_v4_writeback) != 0) {
-        tee_v5_proof_record_error(&policy->pending, file_id, chunk_id,
-                                  TEE_V5_PROOF_ERROR_PERSISTENCE_FAILURE,
-                                  TEE_V5_NO_FAILED_SEGMENT);
+        (void)tee_v5_proof_record_error(
+            &policy->pending, file_id, chunk_id,
+            TEE_V5_PROOF_ERROR_PERSISTENCE_FAILURE,
+            TEE_V5_NO_FAILED_SEGMENT);
         return -2;
     }
     result = tee_v5_delete_chunk(policy->write->cache, file_id, chunk_id,
@@ -84,7 +85,7 @@ static int tee_v5_delete_chunk_handler(void *opaque, uint8_t file_id,
         return 0;
     }
     if (result == TEE_V5_DELETE_NOT_FOUND) return 1;
-    tee_v5_proof_record_error(
+    (void)tee_v5_proof_record_error(
         &policy->pending, file_id, chunk_id,
         result == TEE_V5_DELETE_INTEGRITY ?
             TEE_V5_PROOF_ERROR_DELETE_INTEGRITY :

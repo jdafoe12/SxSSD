@@ -26,7 +26,7 @@ static void test_chunk_identity_is_exact_packed_payload(void)
 
     memset(&identity, 0, sizeof(identity));
     identity.file_id = 0x5a;
-    identity.chunk_id = 0x12345678U;
+    identity.chunk_id = 0x00ffffffU;
 
     assert(sizeof(identity) == 8);
     assert(TEE_V5_CHUNK_IDENTITY_PAYLOAD_SIZE == 8);
@@ -37,6 +37,10 @@ static void test_chunk_identity_is_exact_packed_payload(void)
     assert(!tee_v5_chunk_identity_payload_valid(&identity,
                                                  sizeof(identity) + 1));
     identity.reserved[1] = 1;
+    assert(!tee_v5_chunk_identity_payload_valid(&identity, sizeof(identity)));
+
+    memset(identity.reserved, 0, sizeof(identity.reserved));
+    identity.chunk_id = 0x01000000U;
     assert(!tee_v5_chunk_identity_payload_valid(&identity, sizeof(identity)));
 }
 

@@ -155,12 +155,44 @@ static void test_abort_is_exact_and_idempotent(void)
     tee_v5_admin_destroy(&admin);
 }
 
+static void test_out_of_range_chunk_is_malformed_without_dispatch(void)
+{
+    struct tee_v3_policy_context policy;
+    struct tee_v5_admin admin;
+    struct request_with_identity pending;
+    struct request_with_identity malformed;
+    struct callback_state callback = {0};
+
+    memset(&policy, 0, sizeof(policy));
+    assert(tee_v5_admin_init(&admin, &policy,
+                             TEE_V4_ADMIN_DEFAULT_BUFFER_BYTES, 128) == 0);
+    tee_v5_admin_set_abort_handler(&admin, abort_active, &callback);
+
+    /* The largest 24-bit chunk id is valid and reaches the handler. */
+    make_submit(&malformed, TEE_V5_ADMIN_CMD_ABORT_ACTIVE, 50, 7,
+                0x00ffffffU);
+    assert(tee_v5_admin_submit(&admin, &malformed, sizeof(malformed)) == 0);
+    assert(callback.calls == 1);
+    assert(fetch_status(&admin, TEE_V5_ADMIN_CMD_ABORT_ACTIVE, 50) ==
+           TEE_V5_STATUS_OK);
+
+    make_submit(&pending, 99, 51, 1, 2);
+    assert(tee_v5_admin_submit(&admin, &pending, sizeof(pending)) == 0);
+    make_submit(&malformed, TEE_V5_ADMIN_CMD_ABORT_ACTIVE, 52, 7,
+                0x01000000U);
+    assert(tee_v5_admin_submit(&admin, &malformed, sizeof(malformed)) == -1);
+    assert(callback.calls == 1);
+    assert(fetch_status(&admin, 99, 51) == TEE_V5_STATUS_UNSUPPORTED);
+    tee_v5_admin_destroy(&admin);
+}
+
 int main(void)
 {
     test_unsupported_command_is_fetchable_policy_response();
     test_bad_mac_and_malformed_request_preserve_pending();
     test_fetch_without_matching_pending_is_explicit_response();
     test_abort_is_exact_and_idempotent();
+    test_out_of_range_chunk_is_malformed_without_dispatch();
     puts("test_tee_v5_admin: PASS");
     return 0;
 }

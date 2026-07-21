@@ -352,7 +352,7 @@ static void test_continuous_v1_to_v5_nvme_flow(void)
            sizeof(locations_before));
     g_v4_storage.write = fail_image_write;
 
-    bytes = make_identity(TEE_V5_ADMIN_CMD_DELETE, 109, 13, 35);
+    bytes = make_identity(TEE_V5_ADMIN_CMD_DELETE, 122, 13, 35);
     assert(dispatch(TEE_V4_ADMIN_SUBMIT_OPCODE, (uint32_t)bytes, &api) ==
            NVME_INTERNAL_DEV_ERROR);
     assert((NVME_INTERNAL_DEV_ERROR & NVME_DNR) == 0);
@@ -363,19 +363,19 @@ static void test_continuous_v1_to_v5_nvme_flow(void)
     assert(memcmp(g_v2_cache.protected_bitmap.bits, bitmap_before,
                   g_v2_cache.protected_bitmap.byte_count) == 0);
 
-    bytes = make_query(TEE_V4_ADMIN_CMD_ONE_BIT_PROOF, 110, 13, 35);
+    bytes = make_query(TEE_V4_ADMIN_CMD_ONE_BIT_PROOF, 123, 13, 35);
     assert(dispatch(TEE_V4_ADMIN_SUBMIT_OPCODE, (uint32_t)bytes, &api) ==
            NVME_SUCCESS);
-    assert(fetch_status(&api, TEE_V4_ADMIN_CMD_ONE_BIT_PROOF, 110) ==
+    assert(fetch_status(&api, TEE_V4_ADMIN_CMD_ONE_BIT_PROOF, 123) ==
            TEE_V5_STATUS_OK);
     assert(proof->state == TEE_V3_PROOF_ERROR);
     assert(proof->last_error_code == TEE_V5_PROOF_ERROR_PERSISTENCE_FAILURE);
     assert(proof->failed_segment_index == TEE_V5_NO_FAILED_SEGMENT);
 
-    bytes = make_query(TEE_V4_ADMIN_CMD_ONE_BIT_PROOF, 122, 14, 36);
+    bytes = make_query(TEE_V4_ADMIN_CMD_ONE_BIT_PROOF, 124, 14, 36);
     assert(dispatch(TEE_V4_ADMIN_SUBMIT_OPCODE, (uint32_t)bytes, &api) ==
            NVME_SUCCESS);
-    assert(fetch_status(&api, TEE_V4_ADMIN_CMD_ONE_BIT_PROOF, 122) ==
+    assert(fetch_status(&api, TEE_V4_ADMIN_CMD_ONE_BIT_PROOF, 124) ==
            TEE_V5_STATUS_OK);
     assert(proof->state == TEE_V3_PROOF_DONE);
     assert(proof->done_bit == 1);
@@ -383,10 +383,10 @@ static void test_continuous_v1_to_v5_nvme_flow(void)
     /* No-pending response and unsupported command remain explicit. */
     assert(fetch_status(&api, 99, 999) ==
            TEE_V5_STATUS_NO_PENDING_RESPONSE);
-    bytes = make_identity(99, 111, 1, 1);
+    bytes = make_identity(99, 125, 1, 1);
     assert(dispatch(TEE_V4_ADMIN_SUBMIT_OPCODE, (uint32_t)bytes, &api) ==
            NVME_SUCCESS);
-    assert(fetch_status(&api, 99, 111) == TEE_V5_STATUS_UNSUPPORTED);
+    assert(fetch_status(&api, 99, 125) == TEE_V5_STATUS_UNSUPPORTED);
 
     tee_v5_admin_destroy(&g_v5_admin);
     tee_v2_write_context_destroy(&g_v2_write);

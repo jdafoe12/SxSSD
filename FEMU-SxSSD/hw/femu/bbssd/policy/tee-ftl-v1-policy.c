@@ -1,5 +1,10 @@
 #include "block-interface-policy.h"
 #include "tee/tee-v1-guard.h"
+#ifdef TEE_V2_POLICY
+#include "tee-ftl-v2-policy.h"
+#include "tee/tee-v2-relocation.h"
+#include "tee/tee-v2-write.h"
+#endif
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +13,13 @@ static struct block_policy_context *g_ctx = NULL;
 static struct tee_v1_segment_layout g_v1_layout;
 static struct tee_v1_bitmap g_v1_protected_bitmap;
 static struct tee_v1_bitmap g_v1_pending_bitmap;
+#ifdef TEE_V2_POLICY
+static struct tee_v2_format_config g_v2_config;
+static struct tee_v2_active_metadata g_v2_active;
+static bool g_v2_active_valid;
+static struct tee_v2_cache g_v2_cache;
+static struct tee_v2_write_context g_v2_write;
+#endif
 static inline struct block_policy_context *get_policy_ctx(struct ssd *ssd) {
     (void)ssd;
     return g_ctx;
@@ -379,6 +391,91 @@ static bool write_condition(struct ssd *ssd, struct NvmeCommandEvent *event,
 }
 static uint64_t write_callback(struct ssd *ssd, struct NvmeCommandEvent *event,
                                struct FtlPolicyAPI *api, void *context) {
+#ifdef TEE_V2_POLICY
+    struct block_policy_context *ctx = get_policy_ctx(ssd);
+    uint8_t *req_buf;
+    uint64_t req_size = 0;
+    uint64_t start_byte;
+    uint64_t first_segment;
+    uint64_t segment_count;
+    uint64_t i;
+
+    (void)api;
+    (void)context;
+    if (!ctx || !g_v2_config.segment_size) {
+        event->status = NVME_INTERNAL_DEV_ERROR;
+        return 0;
+    }
+    start_byte = event->lba * (uint64_t)ctx->secsz;
+    first_segment = start_byte / g_v2_config.segment_size;
+    segment_count = ((start_byte % g_v2_config.segment_size) +
+                     (uint64_t)event->nsecs * ctx->secsz +
+                     g_v2_config.segment_size - 1) / g_v2_config.segment_size;
+    for (i = 0; i < segment_count; i++) {
+        uint64_t location = first_segment + i;
+        if (tee_v2_cache_is_protected(&g_v2_cache, location) ||
+            tee_v1_bitmap_test(&g_v2_write.pending_bitmap, location)) {
+            event->status = NVME_INVALID_FIELD | NVME_DNR;
+            return 0;
+        }
+    }
+    req_buf = ctx->api->copy_request_data(event->req, 0,
+                                          (uint64_t)event->nsecs * ctx->secsz,
+                                          &req_size);
+    if (!req_buf || req_size != (uint64_t)event->nsecs * ctx->secsz) {
+        free(req_buf);
+        event->status = NVME_INTERNAL_DEV_ERROR;
+        return 0;
+    }
+    if (start_byte % g_v2_config.segment_size == 0 &&
+        req_size % g_v2_config.segment_size == 0) {
+        for (i = 0; i < req_size / g_v2_config.segment_size; i++) {
+            enum tee_v2_write_result result;
+            struct tee_v2_passive_metadata *passive = NULL;
+            uint32_t segment_index = 0;
+            result = tee_v2_process_segment_write(
+                &g_v2_write, first_segment + i,
+                req_buf + i * g_v2_config.segment_size,
+                g_v2_config.segment_size, &passive, &segment_index);
+            if (result == TEE_V2_WRITE_REJECTED || result == TEE_V2_WRITE_ERROR) {
+                free(req_buf);
+                event->status = NVME_INVALID_FIELD | NVME_DNR;
+                return 0;
+            }
+            if (result == TEE_V2_WRITE_RELOCATION) {
+                /* Comparison is performed by the policy-facing helper below. */
+                uint64_t old_location = passive->segment_locations[segment_index - 1];
+                uint64_t old_byte = old_location * g_v2_config.segment_size;
+                uint64_t old_lpn = old_byte / ctx->page_size;
+                size_t old_offset = (size_t)(old_byte % ctx->page_size);
+                PseudoPpa old_ppa = get_maptbl_ent(ctx, old_lpn);
+                uint8_t *page = malloc((size_t)ctx->page_size);
+                bool same = false;
+                if (page && old_offset + g_v2_config.segment_size <= ctx->page_size &&
+                    ctx->api->mapped_ppa(&old_ppa) &&
+                    ctx->api->valid_ppa(ctx->ssd, &old_ppa)) {
+                    ctx->api->read_page_buffer(ctx->ssd, &old_ppa, page,
+                                               -1, NULL, (int64_t)event->stime);
+                    same = memcmp(page + old_offset,
+                                  req_buf + i * g_v2_config.segment_size,
+                                  g_v2_config.segment_size) == 0;
+                }
+                free(page);
+                if (!same) {
+                    free(req_buf);
+                    event->status = NVME_INVALID_FIELD | NVME_DNR;
+                    return 0;
+                }
+                /* V2 models mark-new-before-unmark; durable transaction is V4. */
+                tee_v2_cache_mark_protected(&g_v2_cache, first_segment + i);
+                passive->segment_locations[segment_index - 1] = first_segment + i;
+                tee_v2_cache_unmark_protected(&g_v2_cache, old_location);
+            }
+        }
+    }
+    free(req_buf);
+    return block_write(ssd, event);
+#else
     uint16_t status = tee_v1_check_write_allowed(&g_v1_layout,
                                                  &g_v1_protected_bitmap,
                                                  &g_v1_pending_bitmap,
@@ -391,6 +488,7 @@ static uint64_t write_callback(struct ssd *ssd, struct NvmeCommandEvent *event,
     (void)api;
     (void)context;
     return block_write(ssd, event);
+#endif
 }
 static bool dsm_condition(struct ssd *ssd, struct NvmeCommandEvent *event,
                           struct FtlPolicyAPI *api, void *context) {
@@ -501,6 +599,16 @@ int init_policy(struct ssd *ssd, struct FtlPolicyAPI *api) {
                            g_v1_layout.visible_segments) != 0) {
         return -1;
     }
+#ifdef TEE_V2_POLICY
+    if (!tee_v2_format_config_init(&g_v2_config,
+                                   TEE_V2_DEFAULT_SEGMENT_SIZE,
+                                   (uint32_t)ctx->page_size) ||
+        tee_v2_cache_init(&g_v2_cache, g_v1_layout.visible_segments, 64) != 0 ||
+        tee_v2_write_context_init(&g_v2_write, NULL, &g_v2_cache,
+                                  g_v1_layout.visible_segments) != 0) {
+        return -1;
+    }
+#endif
     for (uint64_t i = 0; i < ctx->tt_pgs_log; i++) {
         ctx->maptbl[i].ppa = UNMAPPED_PPA;
         ctx->rmap[i] = INVALID_LPN;
@@ -544,3 +652,33 @@ int init_policy(struct ssd *ssd, struct FtlPolicyAPI *api) {
     api->register_background_hook(ssd, background_gc_condition, background_gc_callback, NULL);
     return 0;
 }
+
+#ifdef TEE_V2_POLICY
+int tee_v2_policy_set_active_metadata(
+    uint8_t file_id, uint32_t chunk_id, uint64_t chunk_size_bytes,
+    uint32_t segment_count, uint32_t number_coefficient,
+    const struct tee_v2_hmac_group_spec *groups, uint32_t group_count)
+{
+    if (!g_ctx) return -1;
+    if (g_v2_active_valid) tee_v2_active_metadata_destroy(&g_v2_active);
+    if (tee_v2_active_metadata_init(&g_v2_active, &g_v2_config, file_id,
+                                    chunk_id, chunk_size_bytes, segment_count,
+                                    number_coefficient, groups, group_count) != 0) {
+        g_v2_active_valid = false;
+        g_v2_write.active = NULL;
+        return -1;
+    }
+    g_v2_active_valid = true;
+    g_v2_write.active = &g_v2_active;
+    g_v2_write.active_promoted = false;
+    return 0;
+}
+
+void tee_v2_policy_clear_active_metadata(void)
+{
+    if (g_v2_active_valid) tee_v2_active_metadata_destroy(&g_v2_active);
+    g_v2_active_valid = false;
+    g_v2_write.active = NULL;
+    g_v2_write.active_promoted = false;
+}
+#endif

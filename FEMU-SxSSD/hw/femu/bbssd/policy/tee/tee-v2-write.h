@@ -27,6 +27,15 @@ int tee_v2_write_context_init(struct tee_v2_write_context *write,
                               struct tee_v2_cache *cache,
                               uint64_t logical_segment_count);
 void tee_v2_write_context_destroy(struct tee_v2_write_context *write);
+bool tee_v2_write_range_allowed(const struct tee_v2_write_context *write,
+                                uint64_t first_segment,
+                                uint64_t segment_count);
+void tee_v2_write_abandon_active(struct tee_v2_write_context *write);
+enum tee_v2_write_result tee_v2_classify_segment_write(
+    struct tee_v2_write_context *write, uint64_t logical_location,
+    const uint8_t *segment, size_t segment_size,
+    struct tee_v2_passive_metadata **passive_out,
+    uint32_t *segment_index_out);
 enum tee_v2_write_result tee_v2_process_segment_write(
     struct tee_v2_write_context *write, uint64_t logical_location,
     const uint8_t *segment, size_t segment_size,

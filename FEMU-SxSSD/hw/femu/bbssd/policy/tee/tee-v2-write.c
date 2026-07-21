@@ -24,6 +24,72 @@ void tee_v2_write_context_destroy(struct tee_v2_write_context *write)
     memset(write, 0, sizeof(*write));
 }
 
+bool tee_v2_write_range_allowed(const struct tee_v2_write_context *write,
+                                uint64_t first_segment,
+                                uint64_t segment_count)
+{
+    if (!write || !write->cache || segment_count == 0 ||
+        first_segment >= write->pending_bitmap.bit_count ||
+        segment_count > write->pending_bitmap.bit_count - first_segment)
+        return false;
+    return !tee_v1_bitmap_any_set(&write->cache->protected_bitmap,
+                                  first_segment, segment_count) &&
+           !tee_v1_bitmap_any_set(&write->pending_bitmap,
+                                  first_segment, segment_count);
+}
+
+void tee_v2_write_abandon_active(struct tee_v2_write_context *write)
+{
+    uint32_t i;
+    if (!write || !write->active) return;
+    for (i = 0; i < write->active->segment_count; i++) {
+        if (write->active->pending[i] &&
+            write->active->segment_locations[i] != TEE_V2_LOCATION_UNSET) {
+            tee_v1_bitmap_clear(&write->pending_bitmap,
+                                write->active->segment_locations[i]);
+            write->active->pending[i] = false;
+        }
+    }
+    write->active = NULL;
+    write->active_promoted = false;
+}
+
+enum tee_v2_write_result tee_v2_classify_segment_write(
+    struct tee_v2_write_context *write, uint64_t logical_location,
+    const uint8_t *segment, size_t segment_size,
+    struct tee_v2_passive_metadata **passive_out,
+    uint32_t *segment_index_out)
+{
+    struct tee_v2_segment_header header;
+    struct tee_v2_passive_metadata *passive;
+    if (passive_out) *passive_out = NULL;
+    if (segment_index_out) *segment_index_out = 0;
+    if (!write || !write->cache || !segment ||
+        logical_location >= write->pending_bitmap.bit_count)
+        return TEE_V2_WRITE_ERROR;
+    if (!tee_v2_write_range_allowed(write, logical_location, 1))
+        return TEE_V2_WRITE_REJECTED;
+    if (!tee_v2_parse_segment_header(segment, segment_size, &header))
+        return TEE_V2_WRITE_NORMAL;
+    if (write->active && !write->active_promoted &&
+        tee_v2_active_matches_segment(write->active, segment, segment_size,
+                                      &header)) {
+        if (write->active->arrived[header.segment_index - 1])
+            return TEE_V2_WRITE_REJECTED;
+        return TEE_V2_WRITE_PENDING;
+    }
+    passive = tee_v2_cache_find_passive(write->cache, header.file_id,
+                                         header.chunk_id);
+    if (passive && tee_v2_passive_matches(passive, header.file_id,
+                                           header.chunk_id,
+                                           header.segment_index)) {
+        if (passive_out) *passive_out = passive;
+        if (segment_index_out) *segment_index_out = header.segment_index;
+        return TEE_V2_WRITE_RELOCATION;
+    }
+    return TEE_V2_WRITE_NORMAL;
+}
+
 static void clear_group_pending_bitmap(struct tee_v2_write_context *write,
                                        const uint64_t *locations,
                                        uint32_t count)
@@ -61,23 +127,20 @@ enum tee_v2_write_result tee_v2_process_segment_write(
     struct tee_v2_passive_metadata **passive_out,
     uint32_t *segment_index_out)
 {
+    enum tee_v2_write_result classification;
     struct tee_v2_segment_header header;
-    struct tee_v2_passive_metadata *passive;
     struct tee_v2_hmac_group_state *group;
     uint64_t *group_locations = NULL;
     enum tee_v2_hmac_result hmac_result;
     uint32_t i;
 
-    if (passive_out) *passive_out = NULL;
-    if (segment_index_out) *segment_index_out = 0;
-    if (!write || !write->cache || !segment ||
-        logical_location >= write->pending_bitmap.bit_count)
-        return TEE_V2_WRITE_ERROR;
-    if (tee_v2_cache_is_protected(write->cache, logical_location) ||
-        tee_v1_bitmap_test(&write->pending_bitmap, logical_location))
-        return TEE_V2_WRITE_REJECTED;
+    classification = tee_v2_classify_segment_write(
+        write, logical_location, segment, segment_size,
+        passive_out, segment_index_out);
+    if (classification != TEE_V2_WRITE_PENDING)
+        return classification;
     if (!tee_v2_parse_segment_header(segment, segment_size, &header))
-        return TEE_V2_WRITE_NORMAL;
+        return TEE_V2_WRITE_ERROR;
 
     if (write->active && !write->active_promoted &&
         tee_v2_active_matches_segment(write->active, segment, segment_size,
@@ -112,14 +175,5 @@ enum tee_v2_write_result tee_v2_process_segment_write(
                TEE_V2_WRITE_GROUP_VERIFIED : TEE_V2_WRITE_GROUP_VERIFIED;
     }
 
-    passive = tee_v2_cache_find_passive(write->cache, header.file_id,
-                                         header.chunk_id);
-    if (passive && tee_v2_passive_matches(passive, header.file_id,
-                                           header.chunk_id,
-                                           header.segment_index)) {
-        if (passive_out) *passive_out = passive;
-        if (segment_index_out) *segment_index_out = header.segment_index;
-        return TEE_V2_WRITE_RELOCATION;
-    }
     return TEE_V2_WRITE_NORMAL;
 }

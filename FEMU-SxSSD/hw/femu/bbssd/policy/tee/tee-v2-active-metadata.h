@@ -50,6 +50,8 @@ int tee_v2_active_metadata_init(struct tee_v2_active_metadata *active,
                                 const struct tee_v2_hmac_group_spec *groups,
                                 uint32_t group_count);
 void tee_v2_active_metadata_destroy(struct tee_v2_active_metadata *active);
+int tee_v2_active_metadata_clone(struct tee_v2_active_metadata *clone,
+                                 const struct tee_v2_active_metadata *active);
 bool tee_v2_active_matches_segment(const struct tee_v2_active_metadata *active,
                                    const uint8_t *segment, size_t segment_size,
                                    struct tee_v2_segment_header *header_out);

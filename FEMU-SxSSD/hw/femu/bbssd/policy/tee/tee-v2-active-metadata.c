@@ -87,6 +87,44 @@ void tee_v2_active_metadata_destroy(struct tee_v2_active_metadata *active)
     memset(active, 0, sizeof(*active));
 }
 
+int tee_v2_active_metadata_clone(struct tee_v2_active_metadata *clone,
+                                 const struct tee_v2_active_metadata *active)
+{
+    size_t bytes_size;
+    if (!clone || !active || !active->segment_count || !active->group_count)
+        return -1;
+    memset(clone, 0, sizeof(*clone));
+    bytes_size = (size_t)active->config.segment_size * active->segment_count;
+    clone->segment_locations = malloc(sizeof(uint64_t) * active->segment_count);
+    clone->segment_bytes = malloc(bytes_size);
+    clone->arrived = malloc(sizeof(bool) * active->segment_count);
+    clone->pending = malloc(sizeof(bool) * active->segment_count);
+    clone->groups = malloc(sizeof(*clone->groups) * active->group_count);
+    if (!clone->segment_locations || !clone->segment_bytes ||
+        !clone->arrived || !clone->pending || !clone->groups) {
+        tee_v2_active_metadata_destroy(clone);
+        return -1;
+    }
+    clone->config = active->config;
+    clone->file_id = active->file_id;
+    clone->chunk_id = active->chunk_id;
+    clone->chunk_size_bytes = active->chunk_size_bytes;
+    clone->segment_count = active->segment_count;
+    clone->number_coefficient = active->number_coefficient;
+    clone->group_count = active->group_count;
+    clone->group_capacity = active->group_capacity;
+    memcpy(clone->segment_locations, active->segment_locations,
+           sizeof(uint64_t) * active->segment_count);
+    memcpy(clone->segment_bytes, active->segment_bytes, bytes_size);
+    memcpy(clone->arrived, active->arrived,
+           sizeof(bool) * active->segment_count);
+    memcpy(clone->pending, active->pending,
+           sizeof(bool) * active->segment_count);
+    memcpy(clone->groups, active->groups,
+           sizeof(*clone->groups) * active->group_count);
+    return 0;
+}
+
 bool tee_v2_active_matches_segment(const struct tee_v2_active_metadata *active,
                                    const uint8_t *segment, size_t segment_size,
                                    struct tee_v2_segment_header *header_out)

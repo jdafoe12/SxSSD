@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -Wall -Wextra -O2 -fPIC -I. -Iinc
 POLICY_LDFLAGS = -shared
 
-POLICIES = block-interface-policy-eval.so block-interface-policy-baseline.so block-interface-policy-flashguard.so block-interface-flashguard-policy.so zns-policy.so signing-test-policy.so key-sharing-policy.so tee-ftl-v1-policy.so tee-ftl-v2-policy.so
+POLICIES = block-interface-policy-eval.so block-interface-policy-baseline.so block-interface-policy-flashguard.so block-interface-flashguard-policy.so zns-policy.so signing-test-policy.so key-sharing-policy.so tee-ftl-v1-policy.so tee-ftl-v2-policy.so tee-ftl-v3-policy.so
 
 .PHONY: all clean
 .PHONY: tool
@@ -17,6 +17,8 @@ TEE_V1_SRCS = tee/tee-v1-segment.c tee/tee-v1-bitmap.c tee/tee-v1-guard.c
 TEE_V1_DEPS = tee/tee-v1-segment.h tee/tee-v1-bitmap.h tee/tee-v1-guard.h $(TEE_V1_SRCS)
 TEE_V2_SRCS = tee/tee-v2-format.c tee/tee-v2-active-metadata.c tee/tee-v2-hmac-group.c tee/tee-v2-passive-metadata.c tee/tee-v2-cache.c tee/tee-v2-write.c tee/tee-v2-relocation.c
 TEE_V2_DEPS = tee-ftl-v2-policy.h tee/tee-v2-format.h tee/tee-v2-active-metadata.h tee/tee-v2-hmac-group.h tee/tee-v2-passive-metadata.h tee/tee-v2-cache.h tee/tee-v2-write.h tee/tee-v2-relocation.h $(TEE_V2_SRCS)
+TEE_V3_SRCS = tee/tee-v3-storage.c tee/tee-v3-read.c tee/tee-v3-proof.c tee/tee-v3-policy.c
+TEE_V3_DEPS = tee-ftl-v3-policy.h tee/tee-v3-storage.h tee/tee-v3-read.h tee/tee-v3-proof.h tee/tee-v3-policy.h $(TEE_V3_SRCS)
 
 block-interface-policy-eval.so: block-interface-policy-eval.c $(BLOCK_POLICY_DEPS)
 	$(CC) $(CFLAGS) $(POLICY_LDFLAGS) -o $@ block-interface-policy-eval.c lib/pqueue.c
@@ -44,6 +46,9 @@ tee-ftl-v1-policy.so: tee-ftl-v1-policy.c $(BLOCK_POLICY_DEPS) $(TEE_V1_DEPS)
 
 tee-ftl-v2-policy.so: tee-ftl-v2-policy.c tee-ftl-v1-policy.c $(BLOCK_POLICY_DEPS) $(TEE_V1_DEPS) $(TEE_V2_DEPS)
 	$(CC) $(CFLAGS) $(POLICY_LDFLAGS) -o $@ tee-ftl-v2-policy.c lib/pqueue.c $(TEE_V1_SRCS) $(TEE_V2_SRCS)
+
+tee-ftl-v3-policy.so: tee-ftl-v3-policy.c tee-ftl-v1-policy.c $(BLOCK_POLICY_DEPS) $(TEE_V1_DEPS) $(TEE_V2_DEPS) $(TEE_V3_DEPS)
+	$(CC) $(CFLAGS) $(POLICY_LDFLAGS) -o $@ tee-ftl-v3-policy.c lib/pqueue.c $(TEE_V1_SRCS) $(TEE_V2_SRCS) $(TEE_V3_SRCS)
 
 test_tee_v1_segment: tests/test_tee_v1_segment.c tee/tee-v1-segment.c tee/tee-v1-segment.h
 	$(CC) $(CFLAGS) -o $@ tests/test_tee_v1_segment.c tee/tee-v1-segment.c

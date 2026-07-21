@@ -1,4 +1,5 @@
 #include "ftl.h"
+#include "ftl-write-status.h"
 #include "device-signing.h"
 #include "bbm.h"
 #include "policy-engine.h"
@@ -77,9 +78,11 @@ static uint64_t ftl_write_pages_raw(struct ssd *ssd, const uint8_t *buffer,
                                     WritePageOobCallback fill_oob,
                                     void *oob_ctx,
                                     uint64_t start_lpn,
-                                    int64_t stime_ns)
+                                    int64_t stime_ns,
+                                    bool *page_success)
 {
     struct BbmEvent event = {0};
+    int raw_write_rc;
     uint64_t page_size = eswd_page_size_bytes(ssd);
     uint8_t *oob_pages = NULL;
     size_t oob_offset = 0;
@@ -87,11 +90,19 @@ static uint64_t ftl_write_pages_raw(struct ssd *ssd, const uint8_t *buffer,
     if (!ssd || !buffer || !ppas || page_count == 0) {
         return 0;
     }
+    event.status_list = g_malloc0(sizeof(int) * page_count);
+    if (!event.status_list) {
+        return 0;
+    }
+    if (page_success) {
+        memset(page_success, 0, sizeof(bool) * page_count);
+    }
 
     if (fill_oob && ftl_get_oob_range(ssd, oob_handle, &oob_offset, &oob_len) &&
         oob_len > 0) {
         oob_pages = g_malloc0((size_t)page_count * oob_len);
         if (!oob_pages) {
+            g_free(event.status_list);
             return 0;
         }
         for (uint32_t i = 0; i < page_count; i++) {
@@ -104,13 +115,22 @@ static uint64_t ftl_write_pages_raw(struct ssd *ssd, const uint8_t *buffer,
     event.type = BBM_EVENT_POLICY_IO;
     event.count = page_count;
     event.stime = stime_ns;
-    bbm_raw_write(ssd->fb, ssd->bbm, (uint8_t *)buffer, ppas, page_count,
-                  page_size, oob_pages, oob_offset, oob_len, &event);
+    raw_write_rc = bbm_raw_write(ssd->fb, ssd->bbm, (uint8_t *)buffer,
+                                 ppas, page_count, page_size, oob_pages,
+                                 oob_offset, oob_len, &event);
     g_free(oob_pages);
     for (uint32_t i = 0; i < page_count; i++) {
-        mark_page_valid(ssd, &ppas[i]);
+        bool succeeded = ftl_page_program_succeeded(raw_write_rc,
+                                                    event.status_list[i]);
+        if (page_success) {
+            page_success[i] = succeeded;
+        }
+        if (succeeded) {
+            mark_page_valid(ssd, &ppas[i]);
+            ssd->stats.phys_page_programs++;
+        }
     }
-    ssd->stats.phys_page_programs += page_count;
+    g_free(event.status_list);
     return (uint64_t)event.lat;
 }
 
@@ -127,6 +147,7 @@ static uint64_t ftl_write_direct_pages(struct ssd *ssd, uint32_t eswd_id,
 {
     struct eswd *e;
     PseudoPpa *ppas;
+    bool *page_success;
     uint32_t pages_until_end;
     uint64_t lat;
     if (!ssd || eswd_id >= ssd->tt_eswds || !buffer || !page_count) {
@@ -142,7 +163,10 @@ static uint64_t ftl_write_direct_pages(struct ssd *ssd, uint32_t eswd_id,
     }
 
     ppas = g_malloc0(sizeof(*ppas) * page_count);
-    if (!ppas) {
+    page_success = g_malloc0(sizeof(*page_success) * page_count);
+    if (!ppas || !page_success) {
+        g_free(ppas);
+        g_free(page_success);
         return 0;
     }
     for (uint32_t i = 0; i < page_count; i++) {
@@ -153,23 +177,26 @@ static uint64_t ftl_write_direct_pages(struct ssd *ssd, uint32_t eswd_id,
     }
     if (!page_count) {
         g_free(ppas);
+        g_free(page_success);
         return 0;
     }
 
     lat = ftl_write_pages_raw(ssd, buffer, ppas, page_count, oob_handle,
-                              fill_oob, oob_ctx, start_lpn, stime_ns);
+                              fill_oob, oob_ctx, start_lpn, stime_ns,
+                              page_success);
     for (uint32_t i = 0; i < page_count; i++) {
         uint64_t lpn = start_lpn + i;
 
-        if (ppa_out) {
+        if (page_success[i] && ppa_out) {
             *ppa_out = ppas[i];
         }
-        if (on_page_commit) {
+        if (page_success[i] && on_page_commit) {
             on_page_commit(commit_ctx, ssd, lpn, &ppas[i]);
         }
         eswd_increment_wp(ssd, eswd_id);
     }
     g_free(ppas);
+    g_free(page_success);
     return lat;
 }
 
@@ -185,6 +212,7 @@ static uint64_t ftl_flush_staged_page(struct ssd *ssd, uint32_t eswd_id,
 {
     PseudoPpa ppa;
     uint64_t lat;
+    bool page_success = false;
 
     if (!ssd || !e || e->staged_valid_lbas != eswd_lbas_per_page(ssd)) {
         return 0;
@@ -194,13 +222,14 @@ static uint64_t ftl_flush_staged_page(struct ssd *ssd, uint32_t eswd_id,
     }
 
     lat = ftl_write_pages_raw(ssd, e->staged_page_buf, &ppa, 1, oob_handle,
-                              fill_oob, oob_ctx, page_lpn, stime_ns);
+                              fill_oob, oob_ctx, page_lpn, stime_ns,
+                              &page_success);
     eswd_increment_wp(ssd, eswd_id);
     e->staged_valid_lbas = 0;
-    if (ppa_out) {
+    if (page_success && ppa_out) {
         *ppa_out = ppa;
     }
-    if (on_page_commit) {
+    if (page_success && on_page_commit) {
         on_page_commit(commit_ctx, ssd, page_lpn, &ppa);
     }
     return lat;

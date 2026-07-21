@@ -375,6 +375,7 @@ int bbm_raw_write(struct FtlBackend *fb, const struct bbm *ctx,
     }
     struct ppa *phys = g_malloc0(sizeof(struct ppa) * ppa_count);
     int *bev_status = NULL;
+    bool owns_bev_status = false;
 
     if (!phys) {
         return -1;
@@ -387,9 +388,12 @@ int bbm_raw_write(struct FtlBackend *fb, const struct bbm *ctx,
         bev.cmd = bbm_cmd_to_backend(event->cmd);
         bev.type = bbm_type_to_backend(event->type);
         bev.stime = event->stime;
-        if (ppa_count > 0) {
+        if (event->status_list) {
+            bev.status_list = event->status_list;
+        } else if (ppa_count > 0) {
             bev_status = g_malloc0(sizeof(int) * ppa_count);
             bev.status_list = bev_status;
+            owns_bev_status = true;
         }
     }
 
@@ -403,7 +407,9 @@ int bbm_raw_write(struct FtlBackend *fb, const struct bbm *ctx,
         event->lat = bev.lat;
         event->count = bev.count;
     }
-    g_free(bev_status);
+    if (owns_bev_status) {
+        g_free(bev_status);
+    }
     g_free(phys);
     return rc;
 }

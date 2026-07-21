@@ -6,7 +6,7 @@ POLICIES = block-interface-policy-eval.so block-interface-policy-baseline.so blo
 
 .PHONY: all clean
 .PHONY: tool
-.PHONY: test test-tee-v1 test-tee-v2 test-tee-v3-storage
+.PHONY: test test-tee-v1 test-tee-v2 test-tee-v3-storage test-tee-v3-read
 
 all: $(POLICIES)
 
@@ -109,5 +109,11 @@ test_tee_v3_storage: tests/test_tee_v3_storage.c tee/tee-v3-storage.c tee/tee-v3
 test-tee-v3-storage: test_tee_v3_storage
 	./test_tee_v3_storage
 
+test_tee_v3_read: tests/test_tee_v3_read.c tee/tee-v3-read.c tee/tee-v3-read.h tee/tee-v2-passive-metadata.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tee_v3_read.c tee/tee-v3-read.c
+
+test-tee-v3-read: test_tee_v3_read
+	./test_tee_v3_read
+
 clean:
-	rm -f $(POLICIES) test_tee_v1_segment test_tee_v1_bitmap test_tee_v1_guard test_tee_v1_flow test_tee_v2_format test_tee_v2_active_metadata test_tee_v2_hmac_group test_tee_v2_passive_metadata test_tee_v2_cache test_tee_v2_write test_tee_v2_relocation test_tee_v2_flow test_tee_v2_media_status test_tee_v3_storage
+	rm -f $(POLICIES) test_tee_v1_segment test_tee_v1_bitmap test_tee_v1_guard test_tee_v1_flow test_tee_v2_format test_tee_v2_active_metadata test_tee_v2_hmac_group test_tee_v2_passive_metadata test_tee_v2_cache test_tee_v2_write test_tee_v2_relocation test_tee_v2_flow test_tee_v2_media_status test_tee_v3_storage test_tee_v3_read

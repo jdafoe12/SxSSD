@@ -107,4 +107,25 @@ static void test_range_guard(void)
     tee_v2_write_context_destroy(&write);tee_v2_cache_destroy(&cache);
 }
 
-int main(void){test_normal_and_guard_paths();test_active_group_and_promotion();test_hmac_failure_becomes_normal();test_preflight_is_non_mutating_and_abandon_clears_pending();test_range_guard();puts("test_tee_v2_write: PASS");return 0;}
+static void test_request_preflight_rejects_duplicate_active_index(void)
+{
+    struct tee_v2_format_config config; struct tee_v2_active_metadata active;
+    struct tee_v2_hmac_group_spec spec; struct tee_v2_cache cache;
+    struct tee_v2_write_context write; uint8_t s[2][512], expected[32];
+    enum tee_v2_write_result results[2];
+    struct tee_v2_passive_metadata *passives[2]; uint32_t indices[2];
+    segment(s[0],1,0x55);memcpy(s[1],s[0],512);
+    tee_v2_hmac_sha256(tee_v2_prototype_key,32,s[0],512,expected);
+    assert(tee_v2_format_config_init(&config,512,4096));
+    spec=(struct tee_v2_hmac_group_spec){1,1,expected};
+    assert(tee_v2_active_metadata_init(&active,&config,8,0x010203,503,1,1,&spec,1)==0);
+    assert(tee_v2_cache_init(&cache,1000,2)==0);
+    assert(tee_v2_write_context_init(&write,&active,&cache,1000)==0);
+    assert(tee_v2_preflight_segment_request(&write,500,&s[0][0],512,2,
+                                             results,passives,indices)==-1);
+    assert(!active.arrived[0] && !tee_v1_bitmap_test(&write.pending_bitmap,500));
+    tee_v2_write_context_destroy(&write);tee_v2_cache_destroy(&cache);
+    tee_v2_active_metadata_destroy(&active);
+}
+
+int main(void){test_normal_and_guard_paths();test_active_group_and_promotion();test_hmac_failure_becomes_normal();test_preflight_is_non_mutating_and_abandon_clears_pending();test_range_guard();test_request_preflight_rejects_duplicate_active_index();puts("test_tee_v2_write: PASS");return 0;}

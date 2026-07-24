@@ -30,19 +30,6 @@
 #define ZNS_INVALID_TRANSITION 0x01bfU
 #define ZNS_DNR 0x4000U
 
-enum zns_scratch_offset {
-    ZNS_PAGE_OFFSET = 0,
-    ZNS_IO_REQUEST_OFFSET = 4096,
-    ZNS_IO_RESULT_OFFSET = 4160,
-    ZNS_ZONE_OFFSET = 4224,
-    ZNS_POLICY_OFFSET = 4288,
-    ZNS_REPORT_OFFSET = 4352,
-    ZNS_BLOB_DESCRIPTOR_OFFSET = 4448,
-    ZNS_GEOMETRY_OFFSET = 4480,
-    ZNS_ESWD_CONFIG_OFFSET = 4576,
-    ZNS_NAMESPACE_CONFIG_OFFSET = 4608,
-};
-
 static void zns_zero(sxs_u8 *data, sxs_u32 length)
 {
     for (sxs_u32 i = 0; i < length; i++) {
@@ -50,51 +37,37 @@ static void zns_zero(sxs_u8 *data, sxs_u32 length)
     }
 }
 
-static sxs_s64 zns_policy_read(struct sxs_bpf_context *context,
+static sxs_s64 zns_policy_read(struct sxs_policy_context *context,
                                struct zns_policy_state *state)
 {
-    sxs_s64 result = sxs_state_read(ZNS_POLICY_OBJECT, 0, 0,
-                                    ZNS_POLICY_OFFSET, sizeof(*state));
-
-    if (result == 0) {
-        *state = *(struct zns_policy_state *)(context->scratch +
-                                              ZNS_POLICY_OFFSET);
-    }
-    return result;
+    (void)context;
+    return sxs_state_read(ZNS_POLICY_OBJECT, 0, 0, state, sizeof(*state));
 }
 
-static sxs_s64 zns_policy_write(struct sxs_bpf_context *context,
+static sxs_s64 zns_policy_write(struct sxs_policy_context *context,
                                 const struct zns_policy_state *state)
 {
-    *(struct zns_policy_state *)(context->scratch + ZNS_POLICY_OFFSET) =
-        *state;
-    return sxs_state_write(ZNS_POLICY_OBJECT, 0, 0,
-                           ZNS_POLICY_OFFSET, sizeof(*state));
+    (void)context;
+    return sxs_state_write(ZNS_POLICY_OBJECT, 0, 0, state, sizeof(*state));
 }
 
-static sxs_s64 zns_zone_read(struct sxs_bpf_context *context, sxs_u32 zone_id,
+static sxs_s64 zns_zone_read(struct sxs_policy_context *context, sxs_u32 zone_id,
                              struct zns_zone_state *zone)
 {
-    sxs_s64 result = sxs_state_read(ZNS_ZONE_OBJECT, zone_id, 0,
-                                    ZNS_ZONE_OFFSET, sizeof(*zone));
-
-    if (result == 0) {
-        *zone = *(struct zns_zone_state *)(context->scratch + ZNS_ZONE_OFFSET);
-    }
-    return result;
+    (void)context;
+    return sxs_state_read(ZNS_ZONE_OBJECT, zone_id, 0, zone, sizeof(*zone));
 }
 
-static sxs_s64 zns_zone_write(struct sxs_bpf_context *context, sxs_u32 zone_id,
+static sxs_s64 zns_zone_write(struct sxs_policy_context *context, sxs_u32 zone_id,
                               const struct zns_zone_state *zone)
 {
-    *(struct zns_zone_state *)(context->scratch + ZNS_ZONE_OFFSET) = *zone;
-    return sxs_state_write(ZNS_ZONE_OBJECT, zone_id, 0,
-                           ZNS_ZONE_OFFSET, sizeof(*zone));
+    (void)context;
+    return sxs_state_write(ZNS_ZONE_OBJECT, zone_id, 0, zone, sizeof(*zone));
 }
 
 static sxs_u16 zns_set_status(sxs_u16 status)
 {
-    sxs_completion_status_set(status, 0, 0, 0, 0);
+    sxs_completion_status_set(status);
     return status;
 }
 
@@ -166,7 +139,7 @@ static sxs_u16 zns_check_limits(const struct zns_policy_state *state,
     return ZNS_SUCCESS;
 }
 
-static sxs_s64 zns_close_one_implicit(struct sxs_bpf_context *context,
+static sxs_s64 zns_close_one_implicit(struct sxs_policy_context *context,
                                       struct zns_policy_state *state)
 {
     struct zns_zone_state candidate;
@@ -180,7 +153,7 @@ static sxs_s64 zns_close_one_implicit(struct sxs_bpf_context *context,
             candidate.state == ZNS_STATE_IMPLICITLY_OPEN) {
             candidate.state = ZNS_STATE_CLOSED;
             if (zns_zone_write(context, id, &candidate) != 0) {
-                return -SXS_BPF_EIO;
+                return -SXS_WASM_EIO;
             }
             if (state->open_zones != 0) {
                 state->open_zones--;
@@ -191,7 +164,7 @@ static sxs_s64 zns_close_one_implicit(struct sxs_bpf_context *context,
     return 0;
 }
 
-static sxs_u16 zns_ensure_implicit_open(struct sxs_bpf_context *context,
+static sxs_u16 zns_ensure_implicit_open(struct sxs_policy_context *context,
                                         struct zns_policy_state *state,
                                         struct zns_zone_state *zone)
 {
@@ -254,8 +227,7 @@ static void zns_remove_open_active(struct zns_policy_state *state,
 static void zns_finish_if_full(struct zns_policy_state *state,
                                struct zns_zone_state *zone)
 {
-    sxs_u64 write_pointer = sxs_eswd_effective_wp_get(zone->eswd_id,
-                                                       0, 0, 0, 0);
+    sxs_u64 write_pointer = sxs_eswd_effective_wp_get(zone->eswd_id);
 
     if ((sxs_s64)write_pointer < 0 ||
         write_pointer != zone->start_lba + zone->capacity) {
@@ -275,16 +247,12 @@ static void zns_finish_if_full(struct zns_policy_state *state,
     }
 }
 
-static sxs_u64 zns_write(struct sxs_bpf_context *context, sxs_u32 append)
+static sxs_u64 zns_write(struct sxs_policy_context *context, sxs_u32 append)
 {
     struct zns_policy_state state;
     struct zns_zone_state zone;
-    struct sxs_bpf_eswd_stage_write_request *request =
-        (struct sxs_bpf_eswd_stage_write_request *)(context->scratch +
-                                                     ZNS_IO_REQUEST_OFFSET);
-    struct sxs_bpf_page_result *result =
-        (struct sxs_bpf_page_result *)(context->scratch +
-                                       ZNS_IO_RESULT_OFFSET);
+    struct sxs_eswd_stage_write_request request;
+    struct sxs_page_result result;
     sxs_u64 command_lba = append ?
         ((sxs_u64)context->event.nvme.cdw11 << 32) |
              context->event.nvme.cdw10 : context->event.nvme.lba;
@@ -315,16 +283,16 @@ static sxs_u64 zns_write(struct sxs_bpf_context *context, sxs_u32 append)
         zns_set_status(status | ZNS_DNR);
         return 0;
     }
-    write_lba = sxs_eswd_effective_wp_get(zone.eswd_id, 0, 0, 0, 0);
+    write_lba = sxs_eswd_effective_wp_get(zone.eswd_id);
     if ((sxs_s64)write_lba < 0 ||
         (append && command_lba != zone.start_lba)) {
         zns_set_status(ZNS_INVALID_FIELD | ZNS_DNR);
         return 0;
     }
-    status = sxs_eswd_range_check(SXS_BPF_ESWD_CHECK_SEQUENTIAL_WRITE,
+    status = sxs_eswd_range_check(SXS_ESWD_CHECK_SEQUENTIAL_WRITE,
                                   zone.eswd_id,
                                   append ? write_lba : command_lba,
-                                  lba_count, 0);
+                                  lba_count);
     if (status != ZNS_SUCCESS) {
         zns_set_status(status);
         return 0;
@@ -335,19 +303,18 @@ static sxs_u64 zns_write(struct sxs_bpf_context *context, sxs_u32 append)
         return 0;
     }
 
-    request->eswd_id = zone.eswd_id;
-    request->lba_count = lba_count;
-    request->start_lba = append ? write_lba : command_lba;
-    request->request_byte_offset = 0;
-    request->result_offset = ZNS_IO_RESULT_OFFSET;
-    request->reserved = 0;
-    if (sxs_eswd_stage_write(ZNS_IO_REQUEST_OFFSET, 0, 0, 0, 0) != 0 ||
-        result->status != 0) {
+    request = (struct sxs_eswd_stage_write_request) {
+        .eswd_id = zone.eswd_id,
+        .lba_count = lba_count,
+        .start_lba = append ? write_lba : command_lba,
+        .request_byte_offset = 0,
+    };
+    if (sxs_eswd_stage_write(&request, &result) != 0 || result.status != 0) {
         zns_set_status(ZNS_INTERNAL_ERROR | ZNS_DNR);
         return 0;
     }
     if (append) {
-        sxs_completion_result_set(write_lba, 0, 0, 0, 0);
+        sxs_completion_result_set(write_lba);
     }
     zns_finish_if_full(&state, &zone);
     if (zns_zone_write(context, zone_id, &zone) != 0 ||
@@ -356,19 +323,16 @@ static sxs_u64 zns_write(struct sxs_bpf_context *context, sxs_u32 append)
         return 0;
     }
     zns_set_status(ZNS_SUCCESS);
-    return result->latency_ns;
+    return result.latency_ns;
 }
 
-static sxs_u64 zns_read(struct sxs_bpf_context *context)
+static sxs_u64 zns_read(struct sxs_policy_context *context)
 {
     struct zns_policy_state state;
     struct zns_zone_state zone;
-    struct sxs_bpf_eswd_page_read_request *request =
-        (struct sxs_bpf_eswd_page_read_request *)(context->scratch +
-                                                   ZNS_IO_REQUEST_OFFSET);
-    struct sxs_bpf_page_result *result =
-        (struct sxs_bpf_page_result *)(context->scratch +
-                                       ZNS_IO_RESULT_OFFSET);
+    struct sxs_eswd_page_read_request request;
+    struct sxs_page_result result;
+    sxs_u8 page[SXS_WASM_MAX_PAGE_BYTES];
     sxs_u64 end_lba;
     sxs_u64 current_lba;
     sxs_u64 output_offset = 0;
@@ -399,8 +363,7 @@ static sxs_u64 zns_read(struct sxs_bpf_context *context)
         zns_set_status(status | ZNS_DNR);
         return 0;
     }
-    effective_write_pointer = sxs_eswd_effective_wp_get(zone.eswd_id,
-                                                         0, 0, 0, 0);
+    effective_write_pointer = sxs_eswd_effective_wp_get(zone.eswd_id);
     if ((sxs_s64)effective_write_pointer < 0 ||
         (!state.cross_zone_read &&
          end_lba > zone.start_lba + state.zone_size_lbas) ||
@@ -420,25 +383,25 @@ static sxs_u64 zns_read(struct sxs_bpf_context *context)
         if (sectors > end_lba - current_lba) {
             sectors = end_lba - current_lba;
         }
-        request->eswd_id = zone.eswd_id;
-        request->data_offset = ZNS_PAGE_OFFSET;
-        request->page_lba = page_lba;
-        request->data_length = state.sectors_per_page * state.sector_size;
-        request->result_offset = ZNS_IO_RESULT_OFFSET;
-        if (sxs_eswd_page_read(ZNS_IO_REQUEST_OFFSET, 0, 0, 0, 0) != 0 ||
-            result->status != 0) {
+        request = (struct sxs_eswd_page_read_request) {
+            .eswd_id = zone.eswd_id,
+            .page_lba = page_lba,
+        };
+        if (sxs_eswd_page_read(&request, page,
+                               state.sectors_per_page * state.sector_size,
+                               &result) != 0 || result.status != 0) {
             zns_set_status(ZNS_INTERNAL_ERROR | ZNS_DNR);
             return 0;
         }
         bytes = (sxs_u64)sectors * state.sector_size;
         if (sxs_request_write(output_offset,
-                              ZNS_PAGE_OFFSET + page_offset * state.sector_size,
-                              bytes, 0, 0) != 0) {
+                              page + page_offset * state.sector_size,
+                              bytes) != 0) {
             zns_set_status(ZNS_INTERNAL_ERROR | ZNS_DNR);
             return 0;
         }
-        if (result->latency_ns > maximum_latency) {
-            maximum_latency = result->latency_ns;
+        if (result.latency_ns > maximum_latency) {
+            maximum_latency = result.latency_ns;
         }
         output_offset += bytes;
         current_lba += sectors;
@@ -447,7 +410,7 @@ static sxs_u64 zns_read(struct sxs_bpf_context *context)
     return maximum_latency;
 }
 
-static sxs_u16 zns_open(struct sxs_bpf_context *context,
+static sxs_u16 zns_open(struct sxs_policy_context *context,
                         struct zns_policy_state *state,
                         struct zns_zone_state *zone)
 {
@@ -524,7 +487,7 @@ static sxs_u16 zns_finish(struct zns_policy_state *state,
         old_state != ZNS_STATE_EXPLICITLY_OPEN) {
         return ZNS_INVALID_TRANSITION;
     }
-    if (sxs_eswd_advance_wp(zone->eswd_id, 0, 0, 0, 0) != 0) {
+    if (sxs_eswd_advance_wp(zone->eswd_id) != 0) {
         return ZNS_INTERNAL_ERROR | ZNS_DNR;
     }
     zns_remove_open_active(state, old_state);
@@ -542,7 +505,7 @@ static sxs_u16 zns_reset(struct zns_policy_state *state,
 
     *latency = 0;
     if (old_state == ZNS_STATE_EMPTY) {
-        if (sxs_eswd_reset(zone->eswd_id, 0, 0, 0, 0) != 0) {
+        if (sxs_eswd_reset(zone->eswd_id) != 0) {
             return ZNS_INTERNAL_ERROR | ZNS_DNR;
         }
         zone->attributes = 0;
@@ -554,9 +517,9 @@ static sxs_u16 zns_reset(struct zns_policy_state *state,
         return ZNS_INVALID_TRANSITION;
     }
     zns_remove_open_active(state, old_state);
-    *latency = sxs_eswd_erase(zone->eswd_id, 0, 0, 0, 0);
+    *latency = sxs_eswd_erase(zone->eswd_id);
     if ((sxs_s64)*latency < 0 ||
-        sxs_eswd_reset(zone->eswd_id, 0, 0, 0, 0) != 0) {
+        sxs_eswd_reset(zone->eswd_id) != 0) {
         return ZNS_INTERNAL_ERROR | ZNS_DNR;
     }
     zone->attributes = 0;
@@ -564,7 +527,7 @@ static sxs_u16 zns_reset(struct zns_policy_state *state,
     return ZNS_SUCCESS;
 }
 
-static sxs_u64 zns_management_send(struct sxs_bpf_context *context)
+static sxs_u64 zns_management_send(struct sxs_policy_context *context)
 {
     struct zns_policy_state state;
     sxs_u64 start_lba = ((sxs_u64)context->event.nvme.cdw11 << 32) |
@@ -655,13 +618,11 @@ static sxs_u32 zns_report_match(sxs_u32 filter, sxs_u8 state)
     }
 }
 
-static sxs_u64 zns_management_receive(struct sxs_bpf_context *context)
+static sxs_u64 zns_management_receive(struct sxs_policy_context *context)
 {
     struct zns_policy_state state;
-    struct zns_report_header *header =
-        (struct zns_report_header *)(context->scratch + ZNS_REPORT_OFFSET);
-    struct zns_report_descriptor *descriptor =
-        (struct zns_report_descriptor *)(context->scratch + ZNS_REPORT_OFFSET);
+    struct zns_report_header header;
+    struct zns_report_descriptor descriptor;
     sxs_u64 start_lba = ((sxs_u64)context->event.nvme.cdw11 << 32) |
                         context->event.nvme.cdw10;
     sxs_u64 data_size = ((sxs_u64)context->event.nvme.cdw12 + 1) << 2;
@@ -675,15 +636,15 @@ static sxs_u64 zns_management_receive(struct sxs_bpf_context *context)
 
     if (zns_policy_read(context, &state) != 0 ||
         (action != ZNS_REPORT && action != ZNS_REPORT_EXTENDED) ||
-        filter > ZNS_REPORT_OFFLINE || data_size < sizeof(*header) ||
+        filter > ZNS_REPORT_OFFLINE || data_size < sizeof(header) ||
         start_lba >= zns_total_lbas(&state) ||
         start_lba % state.zone_size_lbas != 0 || data_size > 1024U * 1024U) {
         zns_set_status(ZNS_INVALID_FIELD | ZNS_DNR);
         return 0;
     }
     first_zone = start_lba / state.zone_size_lbas;
-    maximum_descriptors = (data_size - sizeof(*header)) /
-                          sizeof(*descriptor);
+    maximum_descriptors = (data_size - sizeof(header)) /
+                          sizeof(descriptor);
     for (sxs_u32 id = first_zone; id < state.zone_count; id++) {
         struct zns_zone_state zone;
 
@@ -698,10 +659,9 @@ static sxs_u64 zns_management_receive(struct sxs_bpf_context *context)
             }
         }
     }
-    zns_zero((sxs_u8 *)header, sizeof(*header));
-    header->zone_count = matches;
-    if (sxs_command_write(0, ZNS_REPORT_OFFSET,
-                          sizeof(*header), 0, 0) != 0) {
+    zns_zero((sxs_u8 *)&header, sizeof(header));
+    header.zone_count = matches;
+    if (sxs_command_write(0, &header, sizeof(header)) != 0) {
         zns_set_status(ZNS_INTERNAL_ERROR | ZNS_DNR);
         return 0;
     }
@@ -714,21 +674,19 @@ static sxs_u64 zns_management_receive(struct sxs_bpf_context *context)
             !zns_report_match(filter, zone.state)) {
             continue;
         }
-        zns_zero((sxs_u8 *)descriptor, sizeof(*descriptor));
-        descriptor->type = ZNS_ZONE_TYPE_SEQ_WRITE;
-        descriptor->state = zone.state << 4;
-        descriptor->attributes = zone.attributes;
-        descriptor->capacity = zone.capacity;
-        descriptor->start_lba = zone.start_lba;
+        zns_zero((sxs_u8 *)&descriptor, sizeof(descriptor));
+        descriptor.type = ZNS_ZONE_TYPE_SEQ_WRITE;
+        descriptor.state = zone.state << 4;
+        descriptor.attributes = zone.attributes;
+        descriptor.capacity = zone.capacity;
+        descriptor.start_lba = zone.start_lba;
         write_pointer = (zone.state == ZNS_STATE_FULL ||
                          zone.state == ZNS_STATE_READ_ONLY ||
                          zone.state == ZNS_STATE_OFFLINE) ? ~0ULL :
-            sxs_eswd_effective_wp_get(zone.eswd_id, 0, 0, 0, 0);
-        descriptor->write_pointer = write_pointer;
-        if (sxs_command_write(sizeof(*header) +
-                                  emitted * sizeof(*descriptor),
-                              ZNS_REPORT_OFFSET,
-                              sizeof(*descriptor), 0, 0) != 0) {
+            sxs_eswd_effective_wp_get(zone.eswd_id);
+        descriptor.write_pointer = write_pointer;
+        if (sxs_command_write(sizeof(header) + emitted * sizeof(descriptor),
+                              &descriptor, sizeof(descriptor)) != 0) {
             zns_set_status(ZNS_INTERNAL_ERROR | ZNS_DNR);
             return 0;
         }
@@ -738,59 +696,47 @@ static sxs_u64 zns_management_receive(struct sxs_bpf_context *context)
     return 0;
 }
 
-static sxs_s64 zns_stage_blob(struct sxs_bpf_context *context, sxs_u32 kind)
+static sxs_s64 zns_stage_blob(sxs_u32 kind, const sxs_u8 blob[4096])
 {
-    struct sxs_bpf_namespace_blob *descriptor =
-        (struct sxs_bpf_namespace_blob *)(context->scratch +
-                                           ZNS_BLOB_DESCRIPTOR_OFFSET);
-
-    descriptor->kind = kind;
-    descriptor->destination_offset = 0;
-    descriptor->source_offset = ZNS_PAGE_OFFSET;
-    descriptor->length = 4096;
-    return sxs_namespace_blob_stage(ZNS_BLOB_DESCRIPTOR_OFFSET, 0, 0, 0, 0);
+    return sxs_namespace_blob_stage(kind, 0, blob, 4096);
 }
 
-static sxs_u64 zns_init(struct sxs_bpf_context *context)
+static sxs_u64 zns_init(struct sxs_policy_context *context)
 {
-    struct sxs_bpf_geometry *geometry =
-        (struct sxs_bpf_geometry *)(context->scratch + ZNS_GEOMETRY_OFFSET);
-    struct sxs_bpf_eswd_config *eswd_config =
-        (struct sxs_bpf_eswd_config *)(context->scratch +
-                                        ZNS_ESWD_CONFIG_OFFSET);
-    struct sxs_bpf_namespace_config *namespace_config =
-        (struct sxs_bpf_namespace_config *)(context->scratch +
-                                             ZNS_NAMESPACE_CONFIG_OFFSET);
+    struct sxs_geometry geometry;
+    struct sxs_eswd_config eswd_config;
+    struct sxs_namespace_config namespace_config;
     struct zns_policy_state state;
+    sxs_u8 blob[4096];
     sxs_u64 zone_count;
     sxs_u64 zone_size;
 
-    if (sxs_geometry_get(ZNS_GEOMETRY_OFFSET, 0, 0, 0, 0) != 0 ||
-        geometry->total_luns == 0 || geometry->sectors_per_page == 0) {
-        return SXS_BPF_ACTION_ERROR;
+    if (sxs_geometry_get(&geometry) != 0 || geometry.total_luns == 0 ||
+        geometry.sectors_per_page == 0) {
+        return SXS_WASM_ACTION_ERROR;
     }
-    zone_count = geometry->total_blocks_log / geometry->total_luns;
-    zone_size = (sxs_u64)geometry->total_luns * geometry->pages_per_block *
-                geometry->sectors_per_page;
+    zone_count = geometry.total_blocks_log / geometry.total_luns;
+    zone_size = (sxs_u64)geometry.total_luns * geometry.pages_per_block *
+                geometry.sectors_per_page;
     if (zone_count == 0 || zone_count > 0xffffffffULL || zone_size == 0 ||
-        (sxs_u64)geometry->sectors_per_page * geometry->sector_size >
-            SXS_BPF_MAX_PAGE_BYTES ||
+        (sxs_u64)geometry.sectors_per_page * geometry.sector_size >
+            SXS_WASM_MAX_PAGE_BYTES ||
         sxs_state_create(ZNS_ZONE_OBJECT, sizeof(struct zns_zone_state),
                          zone_count, 0, 0) != 0 ||
         sxs_state_create(ZNS_POLICY_OBJECT, sizeof(struct zns_policy_state),
                          1, 0, 0) != 0) {
-        return SXS_BPF_ACTION_ERROR;
+        return SXS_WASM_ACTION_ERROR;
     }
 
-    if (!(context->flags & SXS_BPF_FLAG_STATE_RESTORED)) {
+    if (!(context->flags & SXS_FLAG_STATE_RESTORED)) {
         state = (struct zns_policy_state) {
             .zone_count = zone_count,
-            .sectors_per_page = geometry->sectors_per_page,
-            .sector_size = geometry->sector_size,
+            .sectors_per_page = geometry.sectors_per_page,
+            .sector_size = geometry.sector_size,
             .zone_size_lbas = zone_size,
         };
         if (zns_policy_write(context, &state) != 0) {
-            return SXS_BPF_ACTION_ERROR;
+            return SXS_WASM_ACTION_ERROR;
         }
         for (sxs_u32 id = 0; id < state.zone_count; id++) {
             struct zns_zone_state zone = {
@@ -801,87 +747,96 @@ static sxs_u64 zns_init(struct sxs_bpf_context *context)
             };
 
             if (zns_zone_write(context, id, &zone) != 0) {
-                return SXS_BPF_ACTION_ERROR;
+                return SXS_WASM_ACTION_ERROR;
             }
         }
     }
 
-    eswd_config->striping_level = 0;
-    eswd_config->blocks_per_eswd = geometry->total_luns;
-    namespace_config->csi = ZNS_CSI_ZONED;
-    namespace_config->noiob = 1;
-    namespace_config->nsze = zone_count * zone_size;
-    namespace_config->ncap = namespace_config->nsze;
-    namespace_config->nuse = namespace_config->ncap;
-    namespace_config->namespace_blob_length = 4096;
-    namespace_config->controller_blob_length = 4096;
-    if (sxs_eswd_config_stage(ZNS_ESWD_CONFIG_OFFSET, 0, 0, 0, 0) != 0 ||
-        sxs_namespace_config_stage(ZNS_NAMESPACE_CONFIG_OFFSET,
-                                   0, 0, 0, 0) != 0) {
-        return SXS_BPF_ACTION_ERROR;
+    eswd_config.striping_level = 0;
+    eswd_config.blocks_per_eswd = geometry.total_luns;
+    namespace_config.csi = ZNS_CSI_ZONED;
+    namespace_config.noiob = 1;
+    namespace_config.nsze = zone_count * zone_size;
+    namespace_config.ncap = namespace_config.nsze;
+    namespace_config.nuse = namespace_config.ncap;
+    namespace_config.namespace_blob_length = 4096;
+    namespace_config.controller_blob_length = 4096;
+    if (sxs_eswd_config_stage(&eswd_config) != 0 ||
+        sxs_namespace_config_stage(&namespace_config) != 0) {
+        return SXS_WASM_ACTION_ERROR;
     }
 
-    zns_zero(context->scratch + ZNS_PAGE_OFFSET, 4096);
-    *(sxs_u32 *)(context->scratch + ZNS_PAGE_OFFSET + 4) = 0xffffffffU;
-    *(sxs_u32 *)(context->scratch + ZNS_PAGE_OFFSET + 8) = 0xffffffffU;
+    zns_zero(blob, sizeof(blob));
+    *(sxs_u32 *)(blob + 4) = 0xffffffffU;
+    *(sxs_u32 *)(blob + 8) = 0xffffffffU;
     for (sxs_u32 format = 0; format < 16; format++) {
-        *(sxs_u64 *)(context->scratch + ZNS_PAGE_OFFSET + 2816 +
-                     format * 16) = zone_size;
+        *(sxs_u64 *)(blob + 2816 + format * 16) = zone_size;
     }
-    if (zns_stage_blob(context, SXS_BPF_NAMESPACE_BLOB_NS) != 0) {
-        return SXS_BPF_ACTION_ERROR;
+    if (zns_stage_blob(SXS_NAMESPACE_BLOB_NS, blob) != 0) {
+        return SXS_WASM_ACTION_ERROR;
     }
-    zns_zero(context->scratch + ZNS_PAGE_OFFSET, 4096);
-    if (zns_stage_blob(context, SXS_BPF_NAMESPACE_BLOB_CTRL) != 0 ||
-        sxs_ftl_finalize_stage(0, 0, 0, 0, 0) != 0 ||
-        sxs_subscribe(SXS_BPF_EVENT_NVME_IO, ZNS_CMD_READ,
-                      ZNS_PAIR_READ, 0, 0) != 0 ||
-        sxs_subscribe(SXS_BPF_EVENT_NVME_IO, ZNS_CMD_WRITE,
-                      ZNS_PAIR_WRITE, 0, 0) != 0 ||
-        sxs_subscribe(SXS_BPF_EVENT_NVME_IO, ZNS_CMD_APPEND,
-                      ZNS_PAIR_APPEND, 0, 0) != 0 ||
-        sxs_subscribe(SXS_BPF_EVENT_NVME_IO, ZNS_CMD_MGMT_SEND,
-                      ZNS_PAIR_MGMT_SEND, 0, 0) != 0 ||
-        sxs_subscribe(SXS_BPF_EVENT_NVME_IO, ZNS_CMD_MGMT_RECEIVE,
-                      ZNS_PAIR_MGMT_RECEIVE, 0, 0) != 0) {
-        return SXS_BPF_ACTION_ERROR;
+    zns_zero(blob, sizeof(blob));
+    if (zns_stage_blob(SXS_NAMESPACE_BLOB_CTRL, blob) != 0 ||
+        sxs_ftl_finalize_stage() != 0 ||
+        sxs_subscribe(SXS_EVENT_NVME_IO, ZNS_CMD_READ,
+                      ZNS_PAIR_READ, 0) != 0 ||
+        sxs_subscribe(SXS_EVENT_NVME_IO, ZNS_CMD_WRITE,
+                      ZNS_PAIR_WRITE, 0) != 0 ||
+        sxs_subscribe(SXS_EVENT_NVME_IO, ZNS_CMD_APPEND,
+                      ZNS_PAIR_APPEND, 0) != 0 ||
+        sxs_subscribe(SXS_EVENT_NVME_IO, ZNS_CMD_MGMT_SEND,
+                      ZNS_PAIR_MGMT_SEND, 0) != 0 ||
+        sxs_subscribe(SXS_EVENT_NVME_IO, ZNS_CMD_MGMT_RECEIVE,
+                      ZNS_PAIR_MGMT_RECEIVE, 0) != 0) {
+        return SXS_WASM_ACTION_ERROR;
     }
     return 0;
 }
 
-sxs_u64 policy_main(void *memory, sxs_u64 memory_size)
+SXS_EXPORT_INIT
+sxs_s32 sxs_policy_init(void)
 {
-    struct sxs_bpf_context *context = memory;
+    struct sxs_policy_context context;
+    sxs_s32 result = sxs_context_get(&context);
 
-    if (!context || memory_size != sizeof(*context) ||
-        context->abi_version != SXS_BPF_ABI_VERSION ||
-        context->context_size != sizeof(*context)) {
-        return SXS_BPF_ACTION_ERROR;
+    return result == 0 ? (sxs_s32)zns_init(&context) : result;
+}
+
+SXS_EXPORT_CONDITION
+sxs_s32 sxs_policy_condition(sxs_u32 pair_id)
+{
+    struct sxs_policy_context context;
+    sxs_s32 result = sxs_context_get(&context);
+
+    if (result != 0 || context.pair_id != pair_id) {
+        return result != 0 ? result : -SXS_WASM_EINVAL;
     }
-    if (context->phase == SXS_BPF_PHASE_INIT) {
-        return zns_init(context);
+    switch (pair_id) {
+    case ZNS_PAIR_READ: return context.event.nvme.opcode == ZNS_CMD_READ;
+    case ZNS_PAIR_WRITE: return context.event.nvme.opcode == ZNS_CMD_WRITE;
+    case ZNS_PAIR_APPEND: return context.event.nvme.opcode == ZNS_CMD_APPEND;
+    case ZNS_PAIR_MGMT_SEND:
+        return context.event.nvme.opcode == ZNS_CMD_MGMT_SEND;
+    case ZNS_PAIR_MGMT_RECEIVE:
+        return context.event.nvme.opcode == ZNS_CMD_MGMT_RECEIVE;
+    default: return 0;
     }
-    if (context->phase == SXS_BPF_PHASE_CONDITION) {
-        switch (context->pair_id) {
-        case ZNS_PAIR_READ: return context->event.nvme.opcode == ZNS_CMD_READ;
-        case ZNS_PAIR_WRITE: return context->event.nvme.opcode == ZNS_CMD_WRITE;
-        case ZNS_PAIR_APPEND: return context->event.nvme.opcode == ZNS_CMD_APPEND;
-        case ZNS_PAIR_MGMT_SEND:
-            return context->event.nvme.opcode == ZNS_CMD_MGMT_SEND;
-        case ZNS_PAIR_MGMT_RECEIVE:
-            return context->event.nvme.opcode == ZNS_CMD_MGMT_RECEIVE;
-        default: return 0;
-        }
+}
+
+SXS_EXPORT_ACTION
+sxs_u64 sxs_policy_action(sxs_u32 pair_id)
+{
+    struct sxs_policy_context context;
+
+    if (sxs_context_get(&context) != 0 || context.pair_id != pair_id) {
+        return SXS_WASM_ACTION_ERROR;
     }
-    if (context->phase != SXS_BPF_PHASE_ACTION) {
-        return SXS_BPF_ACTION_ERROR;
-    }
-    switch (context->pair_id) {
-    case ZNS_PAIR_READ: return zns_read(context);
-    case ZNS_PAIR_WRITE: return zns_write(context, 0);
-    case ZNS_PAIR_APPEND: return zns_write(context, 1);
-    case ZNS_PAIR_MGMT_SEND: return zns_management_send(context);
-    case ZNS_PAIR_MGMT_RECEIVE: return zns_management_receive(context);
-    default: return SXS_BPF_ACTION_ERROR;
+    switch (pair_id) {
+    case ZNS_PAIR_READ: return zns_read(&context);
+    case ZNS_PAIR_WRITE: return zns_write(&context, 0);
+    case ZNS_PAIR_APPEND: return zns_write(&context, 1);
+    case ZNS_PAIR_MGMT_SEND: return zns_management_send(&context);
+    case ZNS_PAIR_MGMT_RECEIVE: return zns_management_receive(&context);
+    default: return SXS_WASM_ACTION_ERROR;
     }
 }

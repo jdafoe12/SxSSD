@@ -59,6 +59,7 @@
 *.msi
 *.dll
 *.so
+*.wasm
 *.mo
 *.fn
 *.ky

@@ -1,7 +1,7 @@
-#ifndef SXS_ZNS_BPF_POLICY_H
-#define SXS_ZNS_BPF_POLICY_H
+#ifndef SXS_ZNS_WASM_POLICY_H
+#define SXS_ZNS_WASM_POLICY_H
 
-#include "policy-bpf-abi.h"
+#include "policy-wasm-abi.h"
 
 #define ZNS_ZONE_TYPE_SEQ_WRITE 0x02U
 #define ZNS_ZA_FINISHED_BY_CONTROLLER 0x01U
@@ -68,4 +68,4 @@ struct zns_policy_state {
     sxs_u64 zone_size_lbas;
 };
 
-#endif /* SXS_ZNS_BPF_POLICY_H */
+#endif /* SXS_ZNS_WASM_POLICY_H */

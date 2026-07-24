@@ -11,7 +11,8 @@ if [[ -f /etc/debian_version ]]; then
 
 	# Additional dependencies
 	apt-get install -y libnuma-dev
-    apt-get install -y clang llvm cmake ninja-build
+    # WAMR policy runtime and freestanding wasm32 policy toolchain.
+    apt-get install -y clang lld llvm cmake ninja-build libssl-dev
 else
     echo "pkgdep: unsupported system type ($SYSTEM), please install QEMU depencies manually"
 	exit 1

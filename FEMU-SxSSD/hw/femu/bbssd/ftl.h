@@ -2,14 +2,13 @@
 #define __FEMU_FTL_H
 
 #include "../nvme.h"
-#include "./bbm.h" // we have access to PseudoPpa and PseudoPba through this.
+#include "./bbm.h"
 #include "eswd-config.h"
 #include "eswd-layout.h"
 
 struct policy_engine;
 
 struct FtlBackend;
-struct FtlPolicyAPI;  /* Forward declaration */
 struct FemuCtrl;
 
 #define INVALID_PPA     (~(0ULL))
@@ -31,10 +30,7 @@ struct NamespacePersonalityConfig {
     size_t ctrl_csi_data_len;
 };
 
-/*
- * Internal event record copied into the pointer-free uBPF context. The native
- * pointer is visible only to trusted helpers and the built-in meta-interface.
- */
+/* Internal event record copied into the pointer-free WebAssembly context. */
 struct NvmeCommandEvent {
     uint8_t opcode;         /* NVMe command opcode (e.g. NVME_CMD_READ, NVME_CMD_WRITE) */
     bool is_admin;          /* true for admin-queue commands, false for I/O queue commands */
@@ -52,44 +48,12 @@ struct NvmeCommandEvent {
     uint16_t status;        /* NVMe completion status for generic/custom handlers */
 };
 
-struct ssd; /* Forward declaration */
-
-/* Trusted callback type used only by the fixed meta-interface table. */
-typedef bool (*NvmeHookCondition)(struct ssd *ssd,
-                                  struct NvmeCommandEvent *event,
-                                  struct FtlPolicyAPI *api,
-                                  void *context);
-typedef uint64_t (*NvmeHookCallback)(struct ssd *ssd,
-                                     struct NvmeCommandEvent *event,
-                                     struct FtlPolicyAPI *api,
-                                     void *context);
-struct AdminHook {
-    uint8_t opcode;
-    NvmeHookCondition condition;
-    NvmeHookCallback callback;
-    void *context;
-    bool active;
-};
-
-// enum {
-//     NAND_READ =  0,
-//     NAND_WRITE = 1,
-//     NAND_ERASE = 2,
-
-//     NAND_READ_LATENCY = 40000,
-//     NAND_PROG_LATENCY = 200000,
-//     NAND_ERASE_LATENCY = 2000000,
-// }; // probably remove... I think no need to add to ftl-backend - not even used in ftl.c! 
-
-/* enum {
-    USER_IO = 0,
-    GC_IO = 1,
-};*/
+struct ssd;
 
 /* Page/sector status: use backend enum (PG_FREE, PG_INVALID, PG_VALID from ftl-backend.h via bbm.h). */
 
-enum { // these things should be done in backend, or no? may be policy level.? TODO: Remove. It definitely seems this information is policy level.
-       // GC_DELAY is always enabled ipmplicitly. 
+/* Runtime controls accepted by bb_flip(). */
+enum {
     FEMU_ENABLE_GC_DELAY = 1,
     FEMU_DISABLE_GC_DELAY = 2,
 
@@ -242,33 +206,15 @@ struct eswd {
     int64_t stime; 
 };*/
 
-/*
- * Private interface for the built-in meta-interface policy.  This is not the
- * ordinary-policy ABI: installed policies receive only policy-bpf-abi.h and
- * reach FTL mechanisms through phase-checked uBPF helpers.
- */
-struct FtlPolicyAPI {
-    uint32_t version;
-    uint16_t (*read_cmd_buffer)(struct NvmeCommandEvent *event, void *dst,
-                                uint32_t length);
-    uint16_t (*write_cmd_buffer)(struct NvmeCommandEvent *event, const void *src,
-                                 uint32_t length);
-};
-
 struct ssd { // This needs to be dissected and probably renamed
     char *ssdname;
+    // ssd is inside of FemuCtrl, but we point back to it in here.
     struct FemuCtrl *ctrl;
     struct FtlBackend *fb; /* backend timing/error model */
     struct bbm *bbm;     /* bad block manager / OP mapping context */
    // struct ssdparams sp;
     struct ssd_channel *ch;
     
-    /* Policy-owned context (opaque to mechanism) */
-    void *policy_private;
-    
-    /* DEPRECATED: These will be moved to policy context */
-    PseudoPpa *maptbl; /* page level mapping table */
-
     /* eSWD state (mechanism owns eSWD structs and layout) */
     struct eswd *eswds;
     uint32_t tt_eswds;
@@ -277,27 +223,21 @@ struct ssd { // This needs to be dissected and probably renamed
     bool eswd_config_set;
     bool eswd_layout_finalized;
     
-    /* DEPRECATED: Policy-level fields, will be moved to policy_private */
-    struct eswd *cur_eswd;
-    void *eswd_policy_ctx;  /* opaque; policy may use for its own context */
-
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;
     struct rte_ring **to_poller;
     bool *dataplane_started_ptr;
     QemuThread ftl_thread;
 
-    /* Policy engine (holds FTL/backend/pSWD hook arrays; dispatch runs there) */
+    /* Common runtime and dispatcher for installed and built-in policies. */
     struct policy_engine *policy_engine;
-    
-    /* Private bridge used only by the built-in meta-interface policy. */
-    struct FtlPolicyAPI *policy_api;
 
     /*
      * CPU frequency scaling factor: host_mhz / ctrl_mhz.
      * Applied to policy dispatch wall-clock time to model a slower SSD
      * controller CPU.
      */
+    /* Evaluation-time controller/host CPU frequency ratio. */
     double cpu_scale_factor;
 
     /* Per-run statistics counters; reset/dumped via FEMU_STATS_RESET/DUMP flip */
@@ -332,6 +272,9 @@ int ftl_policy_page_append(struct ssd *ssd, uint32_t eswd_id,
                            const uint8_t *oob_data, uint32_t oob_length,
                            PseudoPpa *ppa_out, uint64_t *latency_out,
                            int64_t stime_ns);
+int ftl_policy_page_read(struct ssd *ssd, const PseudoPpa *ppa,
+                         uint8_t *page_data, int oob_handle, void *oob_data,
+                         int64_t stime_ns, uint64_t *latency_out);
 int ftl_policy_page_migrate(struct ssd *ssd, const PseudoPpa *source,
                             uint32_t destination_eswd_id,
                             PseudoPpa *destination_out,
@@ -368,10 +311,7 @@ uint64_t ftl_eswd_erase_physical(struct ssd *ssd, uint32_t eswd_id, int64_t stim
 /* PPA to physical page index (for policy rmap; index in [0, tt_pgs_log)) */
 uint64_t ppa_to_pgidx(struct ssd *ssd, PseudoPpa *ppa);
 
-/* ========== DEPRECATED: Policy-level operations (will be removed) ========== */
-/* Mapping table operations */
-PseudoPpa get_maptbl_ent(struct ssd *ssd, uint64_t lpn);
-void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, PseudoPpa *ppa);
+/* Host-visible capacity queries used by controller setup. */
 uint64_t get_total_logical_pages(struct ssd *ssd);
 uint64_t get_advertised_nsze_lbas(struct ssd *ssd);
 
@@ -436,6 +376,12 @@ uint16_t ftl_read_cmd_buffer(struct NvmeCommandEvent *event, void *dst,
                              uint32_t length);
 uint16_t ftl_write_cmd_buffer(struct NvmeCommandEvent *event, const void *src,
                               uint32_t length);
+int ftl_command_data_read(struct NvmeCommandEvent *event,
+                          uint32_t command_offset, void *destination,
+                          uint32_t length);
+int ftl_command_data_write(struct NvmeCommandEvent *event,
+                           uint32_t command_offset, const void *source,
+                           uint32_t length);
 void ftl_set_completion_result_u64(struct NvmeCommandEvent *event,
                                    uint64_t value);
 int ftl_get_page_status(struct ssd *ssd, const PseudoPpa *ppa);

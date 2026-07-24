@@ -1,5 +1,5 @@
-#ifndef FEMU_POLICY_BPF_STATE_H
-#define FEMU_POLICY_BPF_STATE_H
+#ifndef FEMU_POLICY_WASM_STATE_H
+#define FEMU_POLICY_WASM_STATE_H
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -44,4 +44,4 @@ int64_t pe_policy_state_fill_u64(
     struct pe_policy_state_transaction *transaction, bool init_phase,
     uint32_t object_id, uint64_t value);
 
-#endif /* FEMU_POLICY_BPF_STATE_H */
+#endif /* FEMU_POLICY_WASM_STATE_H */

@@ -4,9 +4,9 @@
 #include "policy-engine.h"
 #include "eswd-config.h"
 #include "eswd-layout.h"
-#include "meta-interface-policy.h"
 #include "qemu/timer.h"
 #include <errno.h>
+#include <openssl/crypto.h>
 #include <stdlib.h>
 #include <string.h>
 //#include "../backend/ftl-backend.h"
@@ -77,6 +77,9 @@ static bool ftl_get_oob_range(struct ssd *ssd, int oob_handle,
  * Private physical-write primitive: program one or more page-sized buffers to the
  * given PseudoPpas via bbm_raw_write, then mark the pages valid.
  */
+
+ // TODO: look over this in details. Is this what we want? is it general enouph?
+ // Also, what is the purpose of each write function? even, of each function in this file?
 static uint64_t ftl_write_pages_raw(struct ssd *ssd, const uint8_t *buffer,
                                     PseudoPpa *ppas, uint32_t page_count,
                                     int oob_handle,
@@ -228,6 +231,20 @@ int ftl_policy_page_append(struct ssd *ssd, uint32_t eswd_id,
         return -1;
     }
     *latency_out = latency;
+    return 0;
+}
+
+int ftl_policy_page_read(struct ssd *ssd, const PseudoPpa *ppa,
+                         uint8_t *page_data, int oob_handle, void *oob_data,
+                         int64_t stime_ns, uint64_t *latency_out)
+{
+    if (!ssd || !ppa || !page_data || !latency_out ||
+        !valid_ppa(ssd, (PseudoPpa *)ppa)) {
+        return -1;
+    }
+    *latency_out = read_page_buffer(ssd, ppa, page_data, oob_handle, oob_data,
+                                    stime_ns);
+    ssd->stats.phys_page_reads++;
     return 0;
 }
 
@@ -619,6 +636,69 @@ uint16_t ftl_write_cmd_buffer(struct NvmeCommandEvent *event, const void *src,
     return NVME_SUCCESS;
 }
 
+#define FTL_MAX_COMMAND_TRANSFER_BYTES (1024U * 1024U)
+
+static int ftl_command_data_transfer(struct NvmeCommandEvent *event,
+                                     bool write_to_host,
+                                     uint32_t command_offset, void *buffer,
+                                     uint32_t length)
+{
+    uint8_t *temporary;
+    uint64_t total;
+    uint16_t status;
+    int rc = -EIO;
+
+    if (!event || !buffer || length == 0 ||
+        command_offset > FTL_MAX_COMMAND_TRANSFER_BYTES ||
+        length > FTL_MAX_COMMAND_TRANSFER_BYTES - command_offset) {
+        return -EINVAL;
+    }
+    total = command_offset + length;
+    temporary = g_try_malloc0(total);
+    if (!temporary) {
+        return -ENOMEM;
+    }
+    if (write_to_host) {
+        if (command_offset != 0) {
+            status = ftl_read_cmd_buffer(event, temporary, total);
+            if (status != NVME_SUCCESS) {
+                goto cleanup;
+            }
+        }
+        memcpy(temporary + command_offset, buffer, length);
+        status = ftl_write_cmd_buffer(event, temporary, total);
+    } else {
+        status = ftl_read_cmd_buffer(event, temporary, total);
+        if (status == NVME_SUCCESS) {
+            memcpy(buffer, temporary + command_offset, length);
+        }
+    }
+    if (status == NVME_SUCCESS) {
+        rc = 0;
+    }
+
+cleanup:
+    OPENSSL_cleanse(temporary, total);
+    g_free(temporary);
+    return rc;
+}
+
+int ftl_command_data_read(struct NvmeCommandEvent *event,
+                          uint32_t command_offset, void *destination,
+                          uint32_t length)
+{
+    return ftl_command_data_transfer(event, false, command_offset, destination,
+                                     length);
+}
+
+int ftl_command_data_write(struct NvmeCommandEvent *event,
+                           uint32_t command_offset, const void *source,
+                           uint32_t length)
+{
+    return ftl_command_data_transfer(event, true, command_offset,
+                                     (void *)source, length);
+}
+
 void ftl_set_completion_result_u64(struct NvmeCommandEvent *event,
                                    uint64_t value)
 {
@@ -852,7 +932,7 @@ void mark_page_valid(struct ssd *ssd, PseudoPpa *ppa)
 
 /* ======================================================== 
  * --- Mechanism API: eSWD query and state operations ---
- * These expose eSWD primitives to policies without making policy decisions.
+ * These expose eSWD primitives to policies.
  * ======================================================== */
 
 struct eswd *get_eswd_by_id(struct ssd *ssd, uint32_t eswd_id)
@@ -938,8 +1018,6 @@ uint64_t eswd_get_wp_lba(struct ssd *ssd, uint32_t eswd_id)
 }
 
 
-// This should not be ZNS specific. But I think it is general enouph now. It is just
-// a matter of naming?
 uint16_t eswd_check_seq_write(struct ssd *ssd, uint32_t eswd_id,
                               uint64_t slba, uint32_t nlb)
 {
@@ -1075,6 +1153,12 @@ uint64_t ftl_eswd_erase_physical(struct ssd *ssd, uint32_t eswd_id, int64_t stim
     }
 
     g_free(bbm_ev.status_list);
+    if (layout->blks_per_eswd >
+        UINT64_MAX - ssd->stats.block_erases) {
+        ssd->stats.block_erases = UINT64_MAX;
+    } else {
+        ssd->stats.block_erases += layout->blks_per_eswd;
+    }
     return maxlat;
 }
 
@@ -1271,7 +1355,6 @@ int configure_namespace_personality(struct ssd *ssd,
 void ssd_init(FemuCtrl *n)
 {
     struct ssd *ssd = n->ssd;
-   // struct ssdparams *spp = &ssd->fb->sp;
 
     ftl_assert(ssd);
     ssd->ctrl = n;
@@ -1280,17 +1363,12 @@ void ssd_init(FemuCtrl *n)
     if (!ssd->fb) {
         ssd->fb = g_malloc0(sizeof(struct FtlBackend));
     }
-    ftl_backend_init(ssd->fb, n->mbe, &n->bb_params); /* Note that fb is part of ssd. 
-                                                * Additionally, ssdParams is part of fb and thus hidden from the higher
-                                                * ftl layers. 
-                                                * */
+    ftl_backend_init(ssd->fb, n->mbe, &n->bb_params);
     if (!ssd->bbm) {
         ssd->bbm = g_malloc0(sizeof(*ssd->bbm));
     }
     bbm_init(ssd->bbm, &n->bb_params, &ssd->fb->sp);
     struct ssdparams *spp = &ssd->fb->sp;
-
-   // ssd_init_params(spp, n); // removed becuase it is handled in the backend. The ssdParams are relevant to hardware geometry. 
 
     /* initialize ssd pseudophysical internal layout architecture */
     ssd->ch = g_malloc0(sizeof(struct ssd_channel) * spp->nchs);
@@ -1298,20 +1376,14 @@ void ssd_init(FemuCtrl *n)
         ssd_init_ch(ssd, &ssd->ch[i]); 
     }
 
-    /* Create policy engine (holds FTL, backend, pSWD hook arrays) and wire to BBM and backend */
-    ssd->policy_engine = pe_create();
+    /* Create the common runtime used by installed and built-in policies. */
+    ssd->policy_engine = pe_create(ssd);
     bbm_set_policy_engine(ssd->bbm, ssd->policy_engine);
-    pe_set_bbm(ssd->policy_engine, ssd->bbm);
-    ftl_backend_set_pswd_transition_notify(ssd->fb, pe_dispatch_pswd_transition, ssd->policy_engine);
+    ftl_backend_set_pswd_transition_notify(
+        ssd->fb, pe_dispatch_pswd_transition, ssd->policy_engine);
 
-    /* Private I/O bridge for the built-in meta-interface policy. */
-    ssd->policy_api = g_malloc0(sizeof(struct FtlPolicyAPI));
-    ssd->policy_api->version = 1;
-    ssd->policy_api->read_cmd_buffer = ftl_read_cmd_buffer;
-    ssd->policy_api->write_cmd_buffer = ftl_write_cmd_buffer;
-
-    if (m_interface_policy_init(ssd) != 0) {
-        fprintf(stderr, "[FTL] Failed to initialize meta interface policy\n");
+    if (pe_bootstrap_meta_interface_policy(ssd->policy_engine, ssd) != 0) {
+        fprintf(stderr, "[FTL] Failed to bootstrap meta-interface policy\n");
         abort();
     }
 

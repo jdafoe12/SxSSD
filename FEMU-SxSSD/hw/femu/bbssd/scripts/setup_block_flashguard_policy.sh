@@ -8,7 +8,7 @@ NS_DEVICE="${NS_DEVICE:-/dev/nvme0n1}"
 POLICY_ID="${POLICY_ID:-102}"
 POLICY_VERSION="${POLICY_VERSION:-1}"
 SESSION_MODE="${SESSION_MODE:-confidential}"
-POLICY_PATH="${POLICY_PATH:-$POLICY_DIR/block-interface-policy-flashguard.bpf.o}"
+POLICY_PATH="${POLICY_PATH:-$POLICY_DIR/block-interface-policy-flashguard.wasm}"
 
 fail() {
     echo "[setup-block-flashguard] ERROR: $*" >&2

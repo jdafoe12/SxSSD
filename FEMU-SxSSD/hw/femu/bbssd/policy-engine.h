@@ -6,14 +6,16 @@
 #include "bbm.h"
 #include "qemu/thread.h"
 
-#define MAX_RUNTIME_POLICIES 16
-#define MAX_PRIVILEGED_ADMIN_HOOKS 16
-#define MAX_ORDINARY_SUBSCRIPTIONS                                      \
+#define MAX_STORED_RUNTIME_POLICIES 16
+#define MAX_FIRMWARE_RUNTIME_POLICIES 4
+#define MAX_RUNTIME_POLICIES \
+    (MAX_STORED_RUNTIME_POLICIES + MAX_FIRMWARE_RUNTIME_POLICIES)
+#define MAX_POLICY_SUBSCRIPTIONS                                        \
     (MAX_NVME_HOOKS + MAX_ADMIN_HOOKS + MAX_BACKEND_EVENT_HOOKS +      \
      MAX_PSWD_TRANSITION_HOOKS + MAX_BACKGROUND_HOOKS)
 #define MAX_POLICY_OWNED_OOB 16
 
-struct pe_bpf_vm;
+struct pe_wamr_vm;
 struct pe_policy_state_store;
 
 enum pe_runtime_state {
@@ -22,6 +24,8 @@ enum pe_runtime_state {
     PE_RUNTIME_ACTIVE,
     PE_RUNTIME_DRAINING,
 };
+
+#define PE_FIRMWARE_POLICY_ID_BASE 0xffff0000U
 
 struct policy_storage_desc {
     uint32_t policy_id;
@@ -43,8 +47,10 @@ struct runtime_policy_record {
     uint32_t policy_id;
     uint32_t policy_version;
     uint32_t generation;
+    enum pe_policy_privilege privilege;
+    enum pe_policy_origin origin;
     enum pe_runtime_state state;
-    struct pe_bpf_vm *vm;
+    struct pe_wamr_vm *vm;
     struct pe_policy_state_store *state_store;
     QemuMutex execution_lock;
     bool gc_active;
@@ -53,7 +59,7 @@ struct runtime_policy_record {
     uint32_t owned_oob_count;
 };
 
-struct pe_bpf_subscription {
+struct pe_policy_subscription {
     bool active;
     uint8_t event_kind;
     uint16_t flags;
@@ -66,12 +72,9 @@ struct pe_bpf_subscription {
 };
 
 struct policy_engine {
-    /* The meta-interface is the only native policy callback table. */
-    struct AdminHook privileged_admin_hooks[MAX_PRIVILEGED_ADMIN_HOOKS];
-    struct pe_bpf_subscription
-        subscriptions[MAX_ORDINARY_SUBSCRIPTIONS];
+    struct pe_policy_subscription
+        subscriptions[MAX_POLICY_SUBSCRIPTIONS];
     struct runtime_policy_record runtime_policies[MAX_RUNTIME_POLICIES];
-    struct bbm *bbm_ctx;
     struct ssd *ssd;
     QemuMutex management_lock;
     QemuMutex state_lock;
@@ -95,22 +98,19 @@ void pe_dispatch_pswd_transition(struct FtlBackend *fb,
                                  void *notify_ctx);
 void pe_dispatch_background_event(struct policy_engine *pe, struct ssd *ssd);
 
-int pe_register_privileged_admin_hook(struct policy_engine *pe, uint8_t opcode,
-                                      NvmeHookCondition condition,
-                                      NvmeHookCallback callback,
-                                      void *context);
-
 bool pe_has_nvme_hook(struct policy_engine *pe, uint8_t opcode);
 bool pe_has_admin_hook(struct policy_engine *pe, uint8_t opcode);
 
-struct policy_engine *pe_create(void);
-void pe_set_bbm(struct policy_engine *pe, struct bbm *ctx);
-int pe_read_policy_payload(struct ssd *ssd,
-                           const struct policy_storage_desc *desc,
-                           uint8_t **payload_out);
+struct policy_engine *pe_create(struct ssd *ssd);
 int pe_validate_policy_image(const uint8_t *image, size_t image_size);
 int pe_activate_stored_policy(struct policy_engine *pe, struct ssd *ssd,
                               const struct policy_storage_desc *desc);
+int pe_activate_firmware_policy(struct policy_engine *pe, struct ssd *ssd,
+                                uint32_t policy_id, uint32_t policy_version,
+                                const uint8_t *artifact, size_t artifact_size,
+                                enum pe_policy_privilege privilege);
+int pe_bootstrap_meta_interface_policy(struct policy_engine *pe,
+                                       struct ssd *ssd);
 int pe_deactivate_policy(struct policy_engine *pe, uint32_t policy_id);
 int pe_can_remove_policy_state(struct policy_engine *pe, uint32_t policy_id,
                                uint32_t generation);

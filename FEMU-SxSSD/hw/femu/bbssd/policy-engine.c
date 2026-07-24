@@ -1,16 +1,17 @@
 #include "qemu/osdep.h"
 #include "policy-engine.h"
-#include "policy-bpf-runtime.h"
-#include "policy-bpf-state.h"
-#include "policy-bpf-vm.h"
-#include "policy/policy-bpf-abi.h"
+#include "policy-runtime.h"
+#include "policy-state.h"
+#include "policy-wamr-vm.h"
+#include "meta-interface-policy.h"
+#include "policy/policy-wasm-abi.h"
 #include "qemu/error-report.h"
 
 #include <elf.h>
 #include <inttypes.h>
 #include <openssl/crypto.h>
 
-static __thread uint16_t pe_executing_slots;
+static __thread uint32_t pe_executing_slots;
 
 static int runtime_policy_slot_by_id(struct policy_engine *pe,
                                      uint32_t policy_id)
@@ -45,6 +46,8 @@ static void runtime_policy_clear_identity(struct runtime_policy_record *record)
     record->policy_id = 0;
     record->policy_version = 0;
     record->generation = 0;
+    record->privilege = PE_PRIVILEGE_NORMAL;
+    record->origin = PE_ORIGIN_STORED;
     record->state = PE_RUNTIME_INACTIVE;
     record->vm = NULL;
     record->state_store = NULL;
@@ -54,22 +57,7 @@ static void runtime_policy_clear_identity(struct runtime_policy_record *record)
     memset(record->owned_oob, 0, sizeof(record->owned_oob));
 }
 
-static bool privileged_opcode_registered(const struct policy_engine *pe,
-                                         uint8_t opcode)
-{
-    int i;
-
-    for (i = 0; i < MAX_PRIVILEGED_ADMIN_HOOKS; i++) {
-        if (pe->privileged_admin_hooks[i].active &&
-            pe->privileged_admin_hooks[i].callback &&
-            pe->privileged_admin_hooks[i].opcode == opcode) {
-            return true;
-        }
-    }
-    return false;
-}
-
-int pe_activation_stage_subscription(struct pe_bpf_execution *execution,
+int pe_activation_stage_subscription(struct pe_policy_execution *execution,
                                      uint32_t event_kind, uint32_t selector,
                                      uint32_t pair_id, uint32_t flags)
 {
@@ -77,70 +65,256 @@ int pe_activation_stage_subscription(struct pe_bpf_execution *execution,
     uint32_t i;
 
     if (!execution || !execution->engine || !execution->owner ||
-        execution->authoritative_phase != SXS_BPF_PHASE_INIT ||
+        execution->authoritative_phase != SXS_PHASE_INIT ||
         !execution->activation) {
-        return -SXS_BPF_EPERM;
+        return -SXS_WASM_EPERM;
     }
     activation = execution->activation;
     if (flags != 0 || pair_id == 0 || pair_id > UINT16_MAX) {
-        return -SXS_BPF_EINVAL;
+        return -SXS_WASM_EINVAL;
     }
     switch (event_kind) {
-    case SXS_BPF_EVENT_NVME_IO:
+    case SXS_EVENT_NVME_IO:
         if (selector > UINT8_MAX) {
-            return -SXS_BPF_EINVAL;
+            return -SXS_WASM_EINVAL;
         }
         break;
-    case SXS_BPF_EVENT_NVME_ADMIN:
+    case SXS_EVENT_NVME_ADMIN:
         if (selector > UINT8_MAX) {
-            return -SXS_BPF_EINVAL;
-        }
-        if (privileged_opcode_registered(execution->engine,
-                                         (uint8_t)selector)) {
-            return -SXS_BPF_EPERM;
+            return -SXS_WASM_EINVAL;
         }
         break;
-    case SXS_BPF_EVENT_BACKEND:
-        if (selector != SXS_BPF_SELECTOR_ANY &&
+    case SXS_EVENT_BACKEND:
+        if (selector != SXS_WASM_SELECTOR_ANY &&
             selector > FTL_BACKEND_EVENT_ERASE) {
-            return -SXS_BPF_EINVAL;
+            return -SXS_WASM_EINVAL;
         }
         break;
-    case SXS_BPF_EVENT_PSWD_TRANSITION:
-        if (selector != SXS_BPF_SELECTOR_ANY && selector > PSWD_BAD) {
-            return -SXS_BPF_EINVAL;
+    case SXS_EVENT_PSWD_TRANSITION:
+        if (selector != SXS_WASM_SELECTOR_ANY && selector > PSWD_BAD) {
+            return -SXS_WASM_EINVAL;
         }
         break;
-    case SXS_BPF_EVENT_BACKGROUND:
+    case SXS_EVENT_BACKGROUND:
         if (selector != 0) {
-            return -SXS_BPF_EINVAL;
+            return -SXS_WASM_EINVAL;
         }
         break;
     default:
-        return -SXS_BPF_EINVAL;
+        return -SXS_WASM_EINVAL;
     }
     if (activation->subscription_count >=
-        SXS_BPF_MAX_SUBSCRIPTIONS_PER_POLICY) {
-        return -SXS_BPF_ENOSPC;
+        SXS_WASM_MAX_SUBSCRIPTIONS_PER_POLICY) {
+        return -SXS_WASM_ENOSPC;
     }
     for (i = 0; i < activation->subscription_count; i++) {
-        struct pe_bpf_subscription *existing =
+        struct pe_policy_subscription *existing =
             &activation->subscriptions[i];
 
         if (existing->event_kind == event_kind &&
             existing->selector == selector && existing->pair_id == pair_id &&
             existing->flags == flags) {
-            return -SXS_BPF_EEXIST;
+            return -SXS_WASM_EEXIST;
         }
     }
 
     activation->subscriptions[activation->subscription_count++] =
-        (struct pe_bpf_subscription) {
+        (struct pe_policy_subscription) {
             .event_kind = event_kind,
             .selector = selector,
             .pair_id = pair_id,
             .flags = flags,
         };
+    return 0;
+}
+
+int pe_activation_stage_eswd_config(
+    struct pe_policy_execution *execution,
+    const struct sxs_eswd_config *source)
+{
+    struct pe_activation_transaction *activation;
+
+    if (!execution || !execution->engine || !execution->owner ||
+        execution->authoritative_phase != SXS_PHASE_INIT ||
+        !execution->activation || !source) {
+        return -SXS_WASM_EPERM;
+    }
+    activation = execution->activation;
+    if (activation->eswd_config_staged &&
+        memcmp(&activation->eswd_config, source, sizeof(*source)) != 0) {
+        return -SXS_WASM_EBUSY;
+    }
+    activation->eswd_config = *source;
+    activation->eswd_config_staged = true;
+    return 0;
+}
+
+int pe_activation_stage_namespace_config(
+    struct pe_policy_execution *execution,
+    const struct sxs_namespace_config *source)
+{
+    struct pe_activation_transaction *activation;
+
+    if (!execution || !execution->engine || !execution->owner ||
+        execution->authoritative_phase != SXS_PHASE_INIT ||
+        !execution->activation || !source) {
+        return -SXS_WASM_EPERM;
+    }
+    if (source->namespace_blob_length > PE_MAX_NAMESPACE_BLOB_BYTES ||
+        source->controller_blob_length > PE_MAX_NAMESPACE_BLOB_BYTES) {
+        return -SXS_WASM_ENOSPC;
+    }
+    activation = execution->activation;
+    if (activation->namespace_config_staged) {
+        return memcmp(&activation->namespace_config, source,
+                      sizeof(*source)) == 0
+                   ? 0
+                   : -SXS_WASM_EBUSY;
+    }
+    activation->namespace_blob =
+        source->namespace_blob_length
+            ? g_try_malloc0(source->namespace_blob_length)
+            : NULL;
+    activation->controller_blob =
+        source->controller_blob_length
+            ? g_try_malloc0(source->controller_blob_length)
+            : NULL;
+    activation->namespace_blob_written =
+        source->namespace_blob_length
+            ? g_try_malloc0(source->namespace_blob_length)
+            : NULL;
+    activation->controller_blob_written =
+        source->controller_blob_length
+            ? g_try_malloc0(source->controller_blob_length)
+            : NULL;
+    if ((source->namespace_blob_length &&
+         (!activation->namespace_blob ||
+          !activation->namespace_blob_written)) ||
+        (source->controller_blob_length &&
+         (!activation->controller_blob ||
+          !activation->controller_blob_written))) {
+        g_clear_pointer(&activation->namespace_blob, g_free);
+        g_clear_pointer(&activation->controller_blob, g_free);
+        g_clear_pointer(&activation->namespace_blob_written, g_free);
+        g_clear_pointer(&activation->controller_blob_written, g_free);
+        return -SXS_WASM_ENOMEM;
+    }
+    activation->namespace_config = *source;
+    activation->namespace_config_staged = true;
+    return 0;
+}
+
+int pe_activation_stage_ftl_finalize(struct pe_policy_execution *execution)
+{
+    if (!execution || !execution->engine || !execution->owner ||
+        execution->authoritative_phase != SXS_PHASE_INIT ||
+        !execution->activation) {
+        return -SXS_WASM_EPERM;
+    }
+    execution->activation->finalize_staged = true;
+    return 0;
+}
+
+int pe_activation_stage_oob(struct pe_policy_execution *execution,
+                            uint32_t object_id, uint32_t bytes_per_page)
+{
+    struct pe_activation_transaction *activation;
+    uint32_t existing_bytes;
+    int existing_handle;
+    uint32_t i;
+
+    if (!execution || !execution->engine || !execution->owner ||
+        execution->authoritative_phase != SXS_PHASE_INIT ||
+        !execution->activation) {
+        return -SXS_WASM_EPERM;
+    }
+    if (object_id == 0 || bytes_per_page == 0) {
+        return -SXS_WASM_EINVAL;
+    }
+    activation = execution->activation;
+    for (i = 0; i < activation->oob_count; i++) {
+        if (activation->oob[i].object_id == object_id) {
+            return activation->oob[i].bytes_per_page == bytes_per_page
+                       ? 0
+                       : -SXS_WASM_EINVAL;
+        }
+    }
+    if (activation->oob_count >= PE_MAX_STAGED_OOB) {
+        return -SXS_WASM_ENOSPC;
+    }
+    existing_handle = pe_runtime_owned_oob_handle(execution->owner, object_id,
+                                                  &existing_bytes);
+    if (existing_handle >= 0 && existing_bytes != bytes_per_page) {
+        return -SXS_WASM_EINVAL;
+    }
+    activation->oob[activation->oob_count++] = (struct pe_staged_oob) {
+        .object_id = object_id,
+        .bytes_per_page = bytes_per_page,
+        .committed_handle = existing_handle,
+        .already_committed = existing_handle >= 0,
+    };
+    return 0;
+}
+
+int pe_activation_stage_namespace_blob(
+    struct pe_policy_execution *execution, uint32_t kind,
+    uint32_t destination_offset, const void *source, uint32_t length)
+{
+    uint8_t *destination;
+    uint8_t *written;
+    uint32_t total_length;
+
+    if (!execution || !execution->engine || !execution->owner ||
+        execution->authoritative_phase != SXS_PHASE_INIT ||
+        !execution->activation ||
+        !execution->activation->namespace_config_staged) {
+        return -SXS_WASM_EPERM;
+    }
+    if (!source && length) {
+        return -SXS_WASM_EINVAL;
+    }
+    if (kind == SXS_NAMESPACE_BLOB_NS) {
+        destination = execution->activation->namespace_blob;
+        written = execution->activation->namespace_blob_written;
+        total_length =
+            execution->activation->namespace_config.namespace_blob_length;
+    } else if (kind == SXS_NAMESPACE_BLOB_CTRL) {
+        destination = execution->activation->controller_blob;
+        written = execution->activation->controller_blob_written;
+        total_length =
+            execution->activation->namespace_config.controller_blob_length;
+    } else {
+        return -SXS_WASM_EINVAL;
+    }
+    if (destination_offset > total_length ||
+        length > total_length - destination_offset ||
+        (!destination && length)) {
+        return -SXS_WASM_EINVAL;
+    }
+    if (length) {
+        memcpy(destination + destination_offset, source, length);
+        memset(written + destination_offset, 1, length);
+    }
+    return 0;
+}
+
+int pe_runtime_set_gc_active(struct pe_policy_execution *execution,
+                             uint32_t active)
+{
+    bool any_active = false;
+    int i;
+
+    if (!execution || !execution->engine || !execution->owner ||
+        execution->authoritative_phase != SXS_PHASE_ACTION || active > 1) {
+        return -SXS_WASM_EPERM;
+    }
+    qemu_mutex_lock(&execution->engine->management_lock);
+    execution->owner->gc_active = active;
+    for (i = 0; i < MAX_RUNTIME_POLICIES; i++) {
+        any_active |= execution->engine->runtime_policies[i].gc_active;
+    }
+    execution->engine->ssd->stats.gc_active = any_active;
+    qemu_mutex_unlock(&execution->engine->management_lock);
     return 0;
 }
 
@@ -163,88 +337,47 @@ int pe_runtime_owned_oob_handle(const struct runtime_policy_record *owner,
     return -1;
 }
 
-int pe_read_policy_payload(struct ssd *ssd,
-                           const struct policy_storage_desc *desc,
-                           uint8_t **payload_out)
+static int pe_read_policy_payload(struct ssd *ssd,
+                                  const struct policy_storage_desc *desc,
+                                  uint8_t **payload_out)
 {
-    uint32_t page_size;
-    uint32_t pages_per_block;
-    uint32_t page_count;
-    struct ppa *ppa_list = NULL;
     uint8_t *payload = NULL;
-    uint32_t i;
-    int rc = -1;
 
     if (!ssd || !desc || !desc->blocks || !payload_out ||
         desc->policy_size_bytes == 0 ||
-        desc->policy_size_bytes > SXS_BPF_MAX_ARTIFACT_BYTES) {
+        desc->policy_size_bytes > SXS_WASM_MAX_ARTIFACT_BYTES) {
         return -1;
     }
-    page_size = ssd->fb->sp.secs_per_pg * ssd->fb->sp.secsz;
-    pages_per_block = ssd->fb->sp.pgs_per_blk;
-    page_count = (desc->policy_size_bytes + page_size - 1) / page_size;
-    payload = g_malloc0((size_t)page_count * page_size);
-    ppa_list = g_malloc0(sizeof(*ppa_list) * page_count);
-
-    for (i = 0; i < page_count; i++) {
-        uint32_t block_index = i / pages_per_block;
-        uint32_t page_index = i % pages_per_block;
-
-        if (block_index >= desc->block_count) {
-            goto cleanup;
-        }
-        ppa_list[i].g.ch = desc->blocks[block_index].g.ch;
-        ppa_list[i].g.lun = desc->blocks[block_index].g.lun;
-        ppa_list[i].g.pl = desc->blocks[block_index].g.pl;
-        ppa_list[i].g.blk = desc->blocks[block_index].g.blk;
-        ppa_list[i].g.pg = page_index;
-        ppa_list[i].g.sec = 0;
-    }
-    if (ftl_backend_raw_read(ssd->fb, payload, ppa_list, page_count,
-                             page_size, NULL, 0, 0, NULL) != 0) {
-        goto cleanup;
-    }
-    if (desc->expected_payload &&
-        memcmp(payload, desc->expected_payload,
-               desc->policy_size_bytes) != 0) {
-        goto cleanup;
+    *payload_out = NULL;
+    payload = g_try_malloc(desc->policy_size_bytes);
+    if (!payload ||
+        bbm_policy_storage_read(ssd->fb, ssd->bbm, desc->blocks,
+                                desc->block_count, payload,
+                                desc->policy_size_bytes) != 0 ||
+        (desc->expected_payload &&
+         memcmp(payload, desc->expected_payload,
+                desc->policy_size_bytes) != 0)) {
+        g_free(payload);
+        return -1;
     }
     *payload_out = payload;
-    payload = NULL;
-    rc = 0;
-
-cleanup:
-    g_free(ppa_list);
-    g_free(payload);
-    return rc;
+    return 0;
 }
-
-static void initialize_public_context(struct pe_bpf_execution *execution,
-                                      enum sxs_bpf_phase phase,
-                                      uint32_t event_kind, uint32_t pair_id)
+static void initialize_execution(struct pe_policy_execution *execution,
+                                 enum sxs_phase phase,
+                                 uint32_t event_kind, uint32_t pair_id)
 {
-    struct runtime_policy_record *owner = execution->owner;
-
-    memset(&execution->public_context, 0,
-           sizeof(execution->public_context));
     execution->authoritative_phase = phase;
     execution->authoritative_event_kind = event_kind;
-    execution->public_context.abi_version = SXS_BPF_ABI_VERSION;
-    execution->public_context.context_size =
-        sizeof(execution->public_context);
-    execution->public_context.phase = phase;
-    execution->public_context.event_kind = event_kind;
-    execution->public_context.policy_id = owner->policy_id;
-    execution->public_context.policy_version = owner->policy_version;
-    execution->public_context.generation = owner->generation;
-    execution->public_context.pair_id = pair_id;
+    execution->pair_id = pair_id;
+    execution->flags = 0;
+    memset(&execution->event_snapshot, 0, sizeof(execution->event_snapshot));
 }
 
-static void copy_nvme_event(struct pe_bpf_execution *execution,
+static void copy_nvme_event(struct pe_policy_execution *execution,
                             struct NvmeCommandEvent *event)
 {
-    struct sxs_bpf_nvme_event *destination =
-        &execution->public_context.event.nvme;
+    struct sxs_nvme_event *destination = &execution->event_snapshot.nvme;
     NvmeCmd *command = event->cmd;
 
     destination->opcode = event->opcode;
@@ -266,11 +399,11 @@ static void copy_nvme_event(struct pe_bpf_execution *execution,
     }
 }
 
-static void copy_backend_event(struct pe_bpf_execution *execution,
+static void copy_backend_event(struct pe_policy_execution *execution,
                                struct FtlBackendEvent *event)
 {
-    struct sxs_bpf_backend_event *destination =
-        &execution->public_context.event.backend;
+    struct sxs_backend_event *destination =
+        &execution->event_snapshot.backend;
 
     destination->command = event->cmd;
     destination->io_type = event->type;
@@ -279,11 +412,10 @@ static void copy_backend_event(struct pe_bpf_execution *execution,
     destination->latency_ns = event->lat;
 }
 
-static void copy_pswd_event(struct pe_bpf_execution *execution,
+static void copy_pswd_event(struct pe_policy_execution *execution,
                             const struct PswdStateTransitionEvent *event)
 {
-    struct sxs_bpf_pswd_event *destination =
-        &execution->public_context.event.pswd;
+    struct sxs_pswd_event *destination = &execution->event_snapshot.pswd;
 
     destination->old_state = event->old_state;
     destination->new_state = event->new_state;
@@ -292,28 +424,28 @@ static void copy_pswd_event(struct pe_bpf_execution *execution,
     destination->write_pointer = event->wp;
 }
 
-static void build_event_execution(struct pe_bpf_execution *execution,
-                                  enum sxs_bpf_phase phase,
-                                  const struct pe_bpf_subscription *subscription,
+static void build_event_execution(struct pe_policy_execution *execution,
+                                  enum sxs_phase phase,
+                                  const struct pe_policy_subscription *subscription,
                                   void *native_event)
 {
-    initialize_public_context(execution, phase, subscription->event_kind,
-                              subscription->pair_id);
+    initialize_execution(execution, phase, subscription->event_kind,
+                         subscription->pair_id);
     switch (subscription->event_kind) {
-    case SXS_BPF_EVENT_NVME_IO:
-    case SXS_BPF_EVENT_NVME_ADMIN:
+    case SXS_EVENT_NVME_IO:
+    case SXS_EVENT_NVME_ADMIN:
         execution->native_event.nvme = native_event;
         copy_nvme_event(execution, native_event);
         break;
-    case SXS_BPF_EVENT_BACKEND:
+    case SXS_EVENT_BACKEND:
         execution->native_event.backend = native_event;
         copy_backend_event(execution, native_event);
         break;
-    case SXS_BPF_EVENT_PSWD_TRANSITION:
+    case SXS_EVENT_PSWD_TRANSITION:
         execution->native_event.pswd = native_event;
         copy_pswd_event(execution, native_event);
         break;
-    case SXS_BPF_EVENT_BACKGROUND:
+    case SXS_EVENT_BACKGROUND:
         break;
     default:
         g_assert_not_reached();
@@ -334,12 +466,12 @@ static void record_runtime_fault(struct runtime_policy_record *record,
 }
 
 static bool execute_subscription(struct policy_engine *pe,
-                                 const struct pe_bpf_subscription *subscription,
+                                 const struct pe_policy_subscription *subscription,
                                  void *native_event, uint64_t *action_result,
                                  bool *action_fault)
 {
     struct runtime_policy_record *record;
-    struct pe_bpf_execution execution = {0};
+    struct pe_policy_execution execution = {0};
     uint16_t slot = subscription->owner_runtime_slot;
     uint64_t result = 0;
     int rc;
@@ -361,13 +493,12 @@ static bool execute_subscription(struct policy_engine *pe,
     }
     qemu_mutex_unlock(&pe->management_lock);
 
-    pe_executing_slots |= (uint16_t)(1U << slot);
+    pe_executing_slots |= 1U << slot;
     execution.engine = pe;
     execution.owner = record;
-    build_event_execution(&execution, SXS_BPF_PHASE_CONDITION,
+    build_event_execution(&execution, SXS_PHASE_CONDITION,
                           subscription, native_event);
-    rc = pe_bpf_vm_execute(record->vm, &execution.public_context,
-                           sizeof(execution.public_context), &result);
+    rc = pe_wamr_vm_execute(record->vm, &execution, &result);
     if (rc != 0 || result > 1) {
         record_runtime_fault(record, "condition");
         goto no_match;
@@ -377,45 +508,44 @@ static bool execute_subscription(struct policy_engine *pe,
     }
 
     memset(&execution.native_event, 0, sizeof(execution.native_event));
-    build_event_execution(&execution, SXS_BPF_PHASE_ACTION,
+    build_event_execution(&execution, SXS_PHASE_ACTION,
                           subscription, native_event);
     result = 0;
-    rc = pe_bpf_vm_execute(record->vm, &execution.public_context,
-                           sizeof(execution.public_context), &result);
-    if (rc != 0 || result == SXS_BPF_ACTION_ERROR) {
+    rc = pe_wamr_vm_execute(record->vm, &execution, &result);
+    if (rc != 0 || result == SXS_WASM_ACTION_ERROR) {
         record_runtime_fault(record, "action");
         *action_fault = true;
     }
     *action_result = result;
-    pe_executing_slots &= (uint16_t)~(1U << slot);
+    pe_executing_slots &= ~(1U << slot);
     OPENSSL_cleanse(&execution, sizeof(execution));
     qemu_mutex_unlock(&record->execution_lock);
     return true;
 
 no_match:
-    pe_executing_slots &= (uint16_t)~(1U << slot);
+    pe_executing_slots &= ~(1U << slot);
     OPENSSL_cleanse(&execution, sizeof(execution));
     qemu_mutex_unlock(&record->execution_lock);
     return false;
 }
 
-static bool subscription_matches(const struct pe_bpf_subscription *subscription,
+static bool subscription_matches(const struct pe_policy_subscription *subscription,
                                  uint32_t event_kind, uint32_t selector)
 {
     if (!subscription->active || subscription->event_kind != event_kind) {
         return false;
     }
-    if (event_kind == SXS_BPF_EVENT_BACKGROUND) {
+    if (event_kind == SXS_EVENT_BACKGROUND) {
         return true;
     }
     return subscription->selector == selector ||
-           subscription->selector == SXS_BPF_SELECTOR_ANY;
+           subscription->selector == SXS_WASM_SELECTOR_ANY;
 }
 
 static int subscription_oldest_first(const void *left, const void *right)
 {
-    const struct pe_bpf_subscription *a = left;
-    const struct pe_bpf_subscription *b = right;
+    const struct pe_policy_subscription *a = left;
+    const struct pe_policy_subscription *b = right;
 
     return a->registration_sequence < b->registration_sequence ? -1 :
            a->registration_sequence > b->registration_sequence ? 1 : 0;
@@ -423,22 +553,26 @@ static int subscription_oldest_first(const void *left, const void *right)
 
 static int subscription_newest_first(const void *left, const void *right)
 {
-    return -subscription_oldest_first(left, right);
+    const struct pe_policy_subscription *a = left;
+    const struct pe_policy_subscription *b = right;
+
+    return a->registration_sequence > b->registration_sequence ? -1 :
+           a->registration_sequence < b->registration_sequence ? 1 : 0;
 }
 
-static struct pe_bpf_subscription *
+static struct pe_policy_subscription *
 snapshot_subscriptions(struct policy_engine *pe, uint32_t event_kind,
                        uint32_t selector, bool newest_first,
                        size_t *count_out)
 {
-    struct pe_bpf_subscription *snapshot;
+    struct pe_policy_subscription *snapshot;
     size_t count = 0;
     int i;
 
-    snapshot = g_new(struct pe_bpf_subscription,
-                     MAX_ORDINARY_SUBSCRIPTIONS);
+    snapshot = g_new(struct pe_policy_subscription,
+                     MAX_POLICY_SUBSCRIPTIONS);
     qemu_mutex_lock(&pe->management_lock);
-    for (i = 0; i < MAX_ORDINARY_SUBSCRIPTIONS; i++) {
+    for (i = 0; i < MAX_POLICY_SUBSCRIPTIONS; i++) {
         if (subscription_matches(&pe->subscriptions[i], event_kind,
                                  selector)) {
             snapshot[count++] = pe->subscriptions[i];
@@ -455,7 +589,7 @@ snapshot_subscriptions(struct policy_engine *pe, uint32_t event_kind,
 uint64_t pe_dispatch_nvme_cmd(struct policy_engine *pe, struct ssd *ssd,
                               struct NvmeCommandEvent *event)
 {
-    struct pe_bpf_subscription *subscriptions;
+    struct pe_policy_subscription *subscriptions;
     size_t count;
     size_t i;
 
@@ -463,7 +597,7 @@ uint64_t pe_dispatch_nvme_cmd(struct policy_engine *pe, struct ssd *ssd,
         return 0;
     }
     subscriptions = snapshot_subscriptions(
-        pe, SXS_BPF_EVENT_NVME_IO, event->opcode, true, &count);
+        pe, SXS_EVENT_NVME_IO, event->opcode, true, &count);
     for (i = 0; i < count; i++) {
         uint64_t result = 0;
         bool fault;
@@ -488,32 +622,15 @@ uint64_t pe_dispatch_nvme_cmd(struct policy_engine *pe, struct ssd *ssd,
 uint64_t pe_dispatch_admin_cmd(struct policy_engine *pe, struct ssd *ssd,
                                struct NvmeCommandEvent *event)
 {
-    struct pe_bpf_subscription *subscriptions;
+    struct pe_policy_subscription *subscriptions;
     size_t count;
     size_t i;
 
     if (!pe || !ssd || !event) {
         return 0;
     }
-    for (i = 0; i < MAX_PRIVILEGED_ADMIN_HOOKS; i++) {
-        struct AdminHook *hook = &pe->privileged_admin_hooks[i];
-        bool should_fire;
-
-        if (!hook->active || !hook->callback ||
-            hook->opcode != event->opcode) {
-            continue;
-        }
-        should_fire = !hook->condition ||
-            hook->condition(ssd, event, ssd->policy_api, hook->context);
-        if (should_fire) {
-            event->lat = hook->callback(ssd, event, ssd->policy_api,
-                                        hook->context);
-            return event->lat;
-        }
-    }
-
     subscriptions = snapshot_subscriptions(
-        pe, SXS_BPF_EVENT_NVME_ADMIN, event->opcode, true, &count);
+        pe, SXS_EVENT_NVME_ADMIN, event->opcode, true, &count);
     for (i = 0; i < count; i++) {
         uint64_t result = 0;
         bool fault;
@@ -539,7 +656,7 @@ void pe_dispatch_backend_event(struct policy_engine *pe, struct FtlBackend *fb,
                                struct bbm *ctx,
                                struct FtlBackendEvent *event)
 {
-    struct pe_bpf_subscription *subscriptions;
+    struct pe_policy_subscription *subscriptions;
     size_t count;
     size_t i;
 
@@ -547,7 +664,7 @@ void pe_dispatch_backend_event(struct policy_engine *pe, struct FtlBackend *fb,
         return;
     }
     subscriptions = snapshot_subscriptions(
-        pe, SXS_BPF_EVENT_BACKEND, event->cmd, false, &count);
+        pe, SXS_EVENT_BACKEND, event->cmd, false, &count);
     for (i = 0; i < count; i++) {
         uint64_t ignored;
         bool fault;
@@ -562,15 +679,15 @@ void pe_dispatch_pswd_transition(struct FtlBackend *fb,
                                  void *notify_ctx)
 {
     struct policy_engine *pe = notify_ctx;
-    struct pe_bpf_subscription *subscriptions;
+    struct pe_policy_subscription *subscriptions;
     size_t count;
     size_t i;
 
-    if (!pe || !fb || !event || !pe->bbm_ctx) {
+    if (!pe || !fb || !event) {
         return;
     }
     subscriptions = snapshot_subscriptions(
-        pe, SXS_BPF_EVENT_PSWD_TRANSITION, event->new_state, false, &count);
+        pe, SXS_EVENT_PSWD_TRANSITION, event->new_state, false, &count);
     for (i = 0; i < count; i++) {
         uint64_t ignored;
         bool fault;
@@ -583,7 +700,7 @@ void pe_dispatch_pswd_transition(struct FtlBackend *fb,
 
 void pe_dispatch_background_event(struct policy_engine *pe, struct ssd *ssd)
 {
-    struct pe_bpf_subscription *subscriptions;
+    struct pe_policy_subscription *subscriptions;
     size_t count;
     size_t i;
 
@@ -591,7 +708,7 @@ void pe_dispatch_background_event(struct policy_engine *pe, struct ssd *ssd)
         return;
     }
     subscriptions = snapshot_subscriptions(
-        pe, SXS_BPF_EVENT_BACKGROUND, 0, false, &count);
+        pe, SXS_EVENT_BACKGROUND, 0, false, &count);
     for (i = 0; i < count; i++) {
         uint64_t ignored;
         bool fault;
@@ -604,52 +721,6 @@ void pe_dispatch_background_event(struct policy_engine *pe, struct ssd *ssd)
     g_free(subscriptions);
 }
 
-int pe_register_privileged_admin_hook(struct policy_engine *pe, uint8_t opcode,
-                                      NvmeHookCondition condition,
-                                      NvmeHookCallback callback,
-                                      void *context)
-{
-    int free_slot = -1;
-    int i;
-
-    if (!pe || !callback) {
-        return -1;
-    }
-    qemu_mutex_lock(&pe->management_lock);
-    for (i = 0; i < MAX_PRIVILEGED_ADMIN_HOOKS; i++) {
-        if (pe->privileged_admin_hooks[i].callback) {
-            if (pe->privileged_admin_hooks[i].opcode == opcode) {
-                goto fail;
-            }
-        } else if (free_slot < 0) {
-            free_slot = i;
-        }
-    }
-    for (i = 0; i < MAX_ORDINARY_SUBSCRIPTIONS; i++) {
-        if (pe->subscriptions[i].active &&
-            pe->subscriptions[i].event_kind == SXS_BPF_EVENT_NVME_ADMIN &&
-            pe->subscriptions[i].selector == opcode) {
-            goto fail;
-        }
-    }
-    if (free_slot < 0) {
-        goto fail;
-    }
-    pe->privileged_admin_hooks[free_slot] = (struct AdminHook) {
-        .opcode = opcode,
-        .condition = condition,
-        .callback = callback,
-        .context = context,
-        .active = true,
-    };
-    qemu_mutex_unlock(&pe->management_lock);
-    return free_slot;
-
-fail:
-    qemu_mutex_unlock(&pe->management_lock);
-    return -1;
-}
-
 bool pe_has_nvme_hook(struct policy_engine *pe, uint8_t opcode)
 {
     bool found = false;
@@ -659,9 +730,9 @@ bool pe_has_nvme_hook(struct policy_engine *pe, uint8_t opcode)
         return false;
     }
     qemu_mutex_lock(&pe->management_lock);
-    for (i = 0; i < MAX_ORDINARY_SUBSCRIPTIONS; i++) {
+    for (i = 0; i < MAX_POLICY_SUBSCRIPTIONS; i++) {
         if (pe->subscriptions[i].active &&
-            pe->subscriptions[i].event_kind == SXS_BPF_EVENT_NVME_IO &&
+            pe->subscriptions[i].event_kind == SXS_EVENT_NVME_IO &&
             pe->subscriptions[i].selector == opcode) {
             found = true;
             break;
@@ -680,10 +751,10 @@ bool pe_has_admin_hook(struct policy_engine *pe, uint8_t opcode)
         return false;
     }
     qemu_mutex_lock(&pe->management_lock);
-    found = privileged_opcode_registered(pe, opcode);
-    for (i = 0; !found && i < MAX_ORDINARY_SUBSCRIPTIONS; i++) {
+    found = false;
+    for (i = 0; i < MAX_POLICY_SUBSCRIPTIONS; i++) {
         if (pe->subscriptions[i].active &&
-            pe->subscriptions[i].event_kind == SXS_BPF_EVENT_NVME_ADMIN &&
+            pe->subscriptions[i].event_kind == SXS_EVENT_NVME_ADMIN &&
             pe->subscriptions[i].selector == opcode) {
             found = true;
         }
@@ -692,11 +763,24 @@ bool pe_has_admin_hook(struct policy_engine *pe, uint8_t opcode)
     return found;
 }
 
-struct policy_engine *pe_create(void)
+struct policy_engine *pe_create(struct ssd *ssd)
 {
-    struct policy_engine *pe = g_new0(struct policy_engine, 1);
+    struct policy_engine *pe;
+    char *error = NULL;
     int i;
 
+    if (pe_wamr_runtime_initialize(&error) != 0) {
+        error_report("failed to initialize policy runtime: %s",
+                     error ? error : "unknown WAMR error");
+        g_free(error);
+        abort();
+    }
+    if (!ssd) {
+        error_report("cannot create policy engine without an SSD");
+        abort();
+    }
+    pe = g_new0(struct policy_engine, 1);
+    pe->ssd = ssd;
     qemu_mutex_init(&pe->management_lock);
     qemu_mutex_init(&pe->state_lock);
     for (i = 0; i < MAX_RUNTIME_POLICIES; i++) {
@@ -707,21 +791,14 @@ struct policy_engine *pe_create(void)
     return pe;
 }
 
-void pe_set_bbm(struct policy_engine *pe, struct bbm *ctx)
-{
-    if (pe) {
-        pe->bbm_ctx = ctx;
-    }
-}
-
 int pe_validate_policy_image(const uint8_t *image, size_t image_size)
 {
     char *error = NULL;
-    int rc = pe_bpf_vm_validate(image, image_size, &error);
+    int rc = pe_wamr_vm_validate(image, image_size, &error);
 
     if (rc != 0) {
-        warn_report("invalid ordinary policy: %s",
-                    error ? error : "unknown uBPF loader error");
+        warn_report("invalid stored policy: %s",
+                    error ? error : "unknown WAMR loader error");
     }
     g_free(error);
     return rc;
@@ -732,7 +809,7 @@ static uint32_t count_free_subscriptions(const struct policy_engine *pe)
     uint32_t count = 0;
     int i;
 
-    for (i = 0; i < MAX_ORDINARY_SUBSCRIPTIONS; i++) {
+    for (i = 0; i < MAX_POLICY_SUBSCRIPTIONS; i++) {
         if (!pe->subscriptions[i].active) {
             count++;
         }
@@ -745,8 +822,8 @@ static void remove_policy_subscriptions_locked(
 {
     int i;
 
-    for (i = 0; i < MAX_ORDINARY_SUBSCRIPTIONS; i++) {
-        struct pe_bpf_subscription *subscription = &pe->subscriptions[i];
+    for (i = 0; i < MAX_POLICY_SUBSCRIPTIONS; i++) {
+        struct pe_policy_subscription *subscription = &pe->subscriptions[i];
 
         if (subscription->active &&
             subscription->owner_policy_id == policy_id &&
@@ -764,9 +841,9 @@ static void publish_subscriptions_locked(
     int i;
 
     g_assert(count_free_subscriptions(pe) >= activation->subscription_count);
-    for (i = 0; i < MAX_ORDINARY_SUBSCRIPTIONS &&
+    for (i = 0; i < MAX_POLICY_SUBSCRIPTIONS &&
                 published < activation->subscription_count; i++) {
-        struct pe_bpf_subscription *destination = &pe->subscriptions[i];
+        struct pe_policy_subscription *destination = &pe->subscriptions[i];
 
         if (destination->active) {
             continue;
@@ -803,6 +880,48 @@ static bool blob_complete(const uint8_t *written, uint32_t length)
     return true;
 }
 
+/*
+ * An admin selector owned by a privileged policy is an exclusive resource,
+ * not a priority contest. Privilege permits claiming it; it does not reorder
+ * unrelated policy execution.
+ */
+static bool privileged_subscriptions_available(
+    const struct policy_engine *pe,
+    const struct runtime_policy_record *activating_record,
+    const struct pe_activation_transaction *activation)
+{
+    uint32_t staged;
+    int active;
+
+    for (staged = 0; staged < activation->subscription_count; staged++) {
+        const struct pe_policy_subscription *candidate =
+            &activation->subscriptions[staged];
+
+        if (candidate->event_kind != SXS_EVENT_NVME_ADMIN) {
+            continue;
+        }
+        for (active = 0; active < MAX_POLICY_SUBSCRIPTIONS; active++) {
+            const struct pe_policy_subscription *existing =
+                &pe->subscriptions[active];
+            const struct runtime_policy_record *existing_owner;
+
+            if (!existing->active ||
+                existing->event_kind != SXS_EVENT_NVME_ADMIN ||
+                existing->selector != candidate->selector ||
+                existing->owner_runtime_slot >= MAX_RUNTIME_POLICIES) {
+                continue;
+            }
+            existing_owner =
+                &pe->runtime_policies[existing->owner_runtime_slot];
+            if (activating_record->privilege == PE_PRIVILEGE_PRIVILEGED ||
+                existing_owner->privilege == PE_PRIVILEGE_PRIVILEGED) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static int validate_activation_transaction(
     struct policy_engine *pe, struct runtime_policy_record *record,
     const struct pe_activation_transaction *activation)
@@ -818,7 +937,8 @@ static int validate_activation_transaction(
 
     page_size = (uint64_t)pe->ssd->fb->sp.secs_per_pg *
                 pe->ssd->fb->sp.secsz;
-    if (page_size > SXS_BPF_MAX_PAGE_BYTES ||
+    if (page_size > SXS_WASM_MAX_PAGE_BYTES ||
+        !privileged_subscriptions_available(pe, record, activation) ||
         !blob_complete(activation->namespace_blob_written,
                        activation->namespace_config.namespace_blob_length) ||
         !blob_complete(activation->controller_blob_written,
@@ -990,26 +1110,151 @@ static void activation_transaction_destroy(
     g_free(activation);
 }
 
+/*
+ * The artifact source is intentionally outside this function.  Firmware and
+ * stored policies enter the same loader, INIT transaction, validation, and
+ * publication path once their host-assigned identity has been reserved.
+ */
+static int activate_policy_artifact(struct policy_engine *pe,
+                                    struct runtime_policy_record *record,
+                                    uint16_t slot, const uint8_t *artifact,
+                                    size_t artifact_size, bool restored)
+{
+    const struct pe_wamr_load_config load_config = {
+        .privilege = record->privilege,
+    };
+    struct pe_activation_transaction *activation = NULL;
+    struct pe_policy_execution execution = {0};
+    struct pe_wamr_vm *vm = NULL;
+    uint64_t result = SXS_WASM_ACTION_ERROR;
+    char *error = NULL;
+
+    vm = pe_wamr_vm_create_with_config(artifact, artifact_size, &load_config,
+                                        &error);
+    if (!vm) {
+        warn_report("failed to load policy id=%u: %s", record->policy_id,
+                    error ? error : "unknown WAMR error");
+        goto fail;
+    }
+    activation = g_new0(struct pe_activation_transaction, 1);
+    activation->state_transaction = pe_policy_state_transaction_begin(
+        record->state_store, &pe->state_bytes, &pe->state_lock);
+    if (!activation->state_transaction) {
+        goto fail;
+    }
+    execution.engine = pe;
+    execution.owner = record;
+    execution.activation = activation;
+    initialize_execution(&execution, SXS_PHASE_INIT, SXS_EVENT_NONE, 0);
+    if (restored) {
+        execution.flags |= SXS_FLAG_STATE_RESTORED;
+    }
+    if (pe_wamr_vm_execute(vm, &execution, &result) != 0 || result != 0) {
+        OPENSSL_cleanse(&execution, sizeof(execution));
+        warn_report("policy id=%u INIT failed (result=%" PRIu64 ")",
+                    record->policy_id, result);
+        goto fail;
+    }
+    OPENSSL_cleanse(&execution, sizeof(execution));
+
+    qemu_mutex_lock(&pe->management_lock);
+    if (record->state != PE_RUNTIME_ACTIVATING || record->vm ||
+        count_free_subscriptions(pe) < activation->subscription_count ||
+        validate_activation_transaction(pe, record, activation) != 0 ||
+        pe_policy_state_transaction_commit(
+            activation->state_transaction, &record->state_store) != 0) {
+        qemu_mutex_unlock(&pe->management_lock);
+        goto fail;
+    }
+    activation->state_transaction = NULL;
+    commit_activation_resources(pe, record, activation);
+    publish_subscriptions_locked(pe, record, slot, activation);
+    record->vm = vm;
+    vm = NULL;
+    record->state = PE_RUNTIME_ACTIVE;
+    qemu_mutex_unlock(&pe->management_lock);
+    activation_transaction_destroy(activation, false);
+    g_free(error);
+    return 0;
+
+fail:
+    g_free(error);
+    pe_wamr_vm_destroy(vm);
+    activation_transaction_destroy(activation, true);
+    return -1;
+}
+
+int pe_activate_firmware_policy(struct policy_engine *pe, struct ssd *ssd,
+                                uint32_t policy_id, uint32_t policy_version,
+                                const uint8_t *artifact, size_t artifact_size,
+                                enum pe_policy_privilege privilege)
+{
+    struct runtime_policy_record *record;
+    int slot;
+    int rc;
+
+    if (!pe || pe->ssd != ssd || !artifact || artifact_size == 0 ||
+        policy_id < PE_FIRMWARE_POLICY_ID_BASE || policy_version == 0 ||
+        (privilege != PE_PRIVILEGE_NORMAL &&
+         privilege != PE_PRIVILEGE_PRIVILEGED)) {
+        return -1;
+    }
+
+    qemu_mutex_lock(&pe->management_lock);
+    if (runtime_policy_slot_by_id(pe, policy_id) >= 0 ||
+        (slot = runtime_policy_free_slot(pe)) < 0) {
+        qemu_mutex_unlock(&pe->management_lock);
+        return -1;
+    }
+    record = &pe->runtime_policies[slot];
+    record->policy_id = policy_id;
+    record->policy_version = policy_version;
+    record->generation = 1;
+    record->privilege = privilege;
+    record->origin = PE_ORIGIN_FIRMWARE;
+    record->state = PE_RUNTIME_ACTIVATING;
+    qemu_mutex_unlock(&pe->management_lock);
+
+    rc = activate_policy_artifact(pe, record, (uint16_t)slot, artifact,
+                                  artifact_size, false);
+    if (rc != 0) {
+        qemu_mutex_lock(&pe->management_lock);
+        runtime_policy_clear_identity(record);
+        qemu_mutex_unlock(&pe->management_lock);
+        return -1;
+    }
+    info_report("bootstrapped firmware policy id=%u version=%u privilege=%s",
+                policy_id, policy_version,
+                privilege == PE_PRIVILEGE_PRIVILEGED ? "privileged" : "normal");
+    return 0;
+}
+
+int pe_bootstrap_meta_interface_policy(struct policy_engine *pe,
+                                       struct ssd *ssd)
+{
+    return pe_activate_firmware_policy(
+        pe, ssd, SXS_META_INTERFACE_POLICY_ID,
+        SXS_META_INTERFACE_POLICY_VERSION,
+        pe_meta_interface_policy_wasm, pe_meta_interface_policy_wasm_size,
+        PE_PRIVILEGE_PRIVILEGED);
+}
+
 int pe_activate_stored_policy(struct policy_engine *pe, struct ssd *ssd,
                               const struct policy_storage_desc *desc)
 {
     struct runtime_policy_record *record;
-    struct pe_activation_transaction *activation = NULL;
-    struct pe_bpf_execution execution = {0};
-    struct pe_bpf_vm *candidate_vm = NULL;
     uint8_t *payload = NULL;
-    uint64_t result = SXS_BPF_ACTION_ERROR;
-    char *error = NULL;
     int slot;
     bool new_record = false;
     bool restored;
     int rc = -1;
 
-    if (!pe || !ssd || !desc || !desc->blocks || desc->policy_id == 0 ||
+    if (!pe || pe->ssd != ssd || !desc || !desc->blocks ||
+        desc->policy_id == 0 ||
+        desc->policy_id >= PE_FIRMWARE_POLICY_ID_BASE ||
         desc->policy_version == 0 || desc->generation == 0) {
         return -1;
     }
-    pe->ssd = ssd;
     qemu_mutex_lock(&pe->management_lock);
     slot = runtime_policy_slot_by_id(pe, desc->policy_id);
     if (slot >= 0) {
@@ -1034,6 +1279,8 @@ int pe_activate_stored_policy(struct policy_engine *pe, struct ssd *ssd,
         new_record = true;
         record->policy_id = desc->policy_id;
         record->generation = desc->generation;
+        record->privilege = PE_PRIVILEGE_NORMAL;
+        record->origin = PE_ORIGIN_STORED;
     }
     record->policy_version = desc->policy_version;
     record->state = PE_RUNTIME_ACTIVATING;
@@ -1043,73 +1290,18 @@ int pe_activate_stored_policy(struct policy_engine *pe, struct ssd *ssd,
     if (pe_read_policy_payload(ssd, desc, &payload) != 0) {
         goto fail;
     }
-    candidate_vm = pe_bpf_vm_create(payload, desc->policy_size_bytes, &error);
+    if (activate_policy_artifact(pe, record, (uint16_t)slot, payload,
+                                 desc->policy_size_bytes, restored) != 0) {
+        goto fail;
+    }
     g_free(payload);
-    payload = NULL;
-    if (!candidate_vm) {
-        warn_report("failed to load policy id=%u: %s", desc->policy_id,
-                    error ? error : "unknown uBPF error");
-        goto fail;
-    }
-
-    activation = g_new0(struct pe_activation_transaction, 1);
-    activation->state_transaction = pe_policy_state_transaction_begin(
-        record->state_store, &pe->state_bytes, &pe->state_lock);
-    if (!activation->state_transaction) {
-        goto fail;
-    }
-    execution.engine = pe;
-    execution.owner = record;
-    execution.activation = activation;
-    initialize_public_context(&execution, SXS_BPF_PHASE_INIT,
-                              SXS_BPF_EVENT_NONE, 0);
-    if (restored) {
-        execution.public_context.flags |= SXS_BPF_FLAG_STATE_RESTORED;
-    }
-    if (pe_bpf_vm_execute(candidate_vm, &execution.public_context,
-                          sizeof(execution.public_context), &result) != 0 ||
-        result != 0) {
-        OPENSSL_cleanse(&execution, sizeof(execution));
-        warn_report("policy id=%u INIT failed (result=%" PRIu64 ")",
-                    desc->policy_id, result);
-        goto fail;
-    }
-    OPENSSL_cleanse(&execution, sizeof(execution));
-
-    qemu_mutex_lock(&pe->management_lock);
-    if (record->state != PE_RUNTIME_ACTIVATING ||
-        record->policy_id != desc->policy_id ||
-        record->generation != desc->generation ||
-        count_free_subscriptions(pe) < activation->subscription_count ||
-        validate_activation_transaction(pe, record, activation) != 0) {
-        qemu_mutex_unlock(&pe->management_lock);
-        goto fail;
-    }
-    if (pe_policy_state_transaction_commit(
-            activation->state_transaction, &record->state_store) != 0) {
-        qemu_mutex_unlock(&pe->management_lock);
-        goto fail;
-    }
-    activation->state_transaction = NULL;
-    /* Everything below is a no-fail publication of prevalidated resources. */
-    commit_activation_resources(pe, record, activation);
-    publish_subscriptions_locked(pe, record, slot, activation);
-    record->vm = candidate_vm;
-    candidate_vm = NULL;
-    record->state = PE_RUNTIME_ACTIVE;
-    qemu_mutex_unlock(&pe->management_lock);
-    activation_transaction_destroy(activation, false);
-    g_free(error);
-    info_report("activated safe uBPF policy id=%u version=%u generation=%u",
+    info_report("activated safe WAMR policy id=%u version=%u generation=%u",
                 record->policy_id, record->policy_version,
                 record->generation);
     return 0;
 
 fail:
     g_free(payload);
-    g_free(error);
-    pe_bpf_vm_destroy(candidate_vm);
-    activation_transaction_destroy(activation, true);
     qemu_mutex_lock(&pe->management_lock);
     record->state = PE_RUNTIME_INACTIVE;
     if (new_record && !record->state_store) {
@@ -1122,7 +1314,7 @@ fail:
 int pe_deactivate_policy(struct policy_engine *pe, uint32_t policy_id)
 {
     struct runtime_policy_record *record;
-    struct pe_bpf_vm *vm;
+    struct pe_wamr_vm *vm;
     int slot;
 
     if (!pe || policy_id == 0) {
@@ -1135,6 +1327,10 @@ int pe_deactivate_policy(struct policy_engine *pe, uint32_t policy_id)
         return -1;
     }
     record = &pe->runtime_policies[slot];
+    if (record->origin != PE_ORIGIN_STORED) {
+        qemu_mutex_unlock(&pe->management_lock);
+        return -1;
+    }
     if (record->state == PE_RUNTIME_INACTIVE) {
         qemu_mutex_unlock(&pe->management_lock);
         return 0;
@@ -1152,7 +1348,7 @@ int pe_deactivate_policy(struct policy_engine *pe, uint32_t policy_id)
     vm = record->vm;
     record->vm = NULL;
     record->gc_active = false;
-    pe_bpf_vm_destroy(vm);
+    pe_wamr_vm_destroy(vm);
     qemu_mutex_unlock(&record->execution_lock);
 
     qemu_mutex_lock(&pe->management_lock);
@@ -1177,7 +1373,8 @@ static int can_remove_policy_state_locked(struct policy_engine *pe,
         return 0;
     }
     record = &pe->runtime_policies[slot];
-    if (record->state != PE_RUNTIME_INACTIVE ||
+    if (record->origin != PE_ORIGIN_STORED ||
+        record->state != PE_RUNTIME_INACTIVE ||
         record->generation != generation) {
         return -1;
     }
@@ -1228,6 +1425,10 @@ int pe_remove_policy_state(struct policy_engine *pe, uint32_t policy_id,
         return 0;
     }
     record = &pe->runtime_policies[slot];
+    if (record->origin != PE_ORIGIN_STORED) {
+        qemu_mutex_unlock(&pe->management_lock);
+        return -1;
+    }
     for (uint32_t i = 0; i < record->owned_oob_count; i++) {
         if (ftl_backend_unregister_oob_policy(
                 pe->ssd->fb, record->owned_oob[i].backend_handle) != 0) {

@@ -3,9 +3,6 @@
 #include <dlfcn.h>
 #include <stdint.h>
 
-struct ssd;
-struct FtlPolicyAPI;
-
 #define FORBIDDEN_HOST_SYMBOL "pe_test_forbidden_host_function"
 #define FORBIDDEN_HOST_RESULT 0x53585353484f5354ULL
 
@@ -13,14 +10,14 @@ typedef uint64_t (*forbidden_host_fn)(void);
 
 /*
  * Insecure control: native policy code can resolve symbols in FEMU's process
- * even when those symbols are absent from FtlPolicyAPI.
+ * irrespective of any callback API presented to it.
  */
-int init_policy(struct ssd *ssd, struct FtlPolicyAPI *api)
+int init_policy(void *ssd, void *legacy_api)
 {
     forbidden_host_fn forbidden_host_function;
 
     (void)ssd;
-    (void)api;
+    (void)legacy_api;
 
     forbidden_host_function =
         (forbidden_host_fn)dlsym(RTLD_DEFAULT, FORBIDDEN_HOST_SYMBOL);

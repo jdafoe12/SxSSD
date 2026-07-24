@@ -1,7 +1,7 @@
-#ifndef SXS_FLASHGUARD_BPF_CORE_H
-#define SXS_FLASHGUARD_BPF_CORE_H
+#ifndef SXS_FLASHGUARD_WASM_CORE_H
+#define SXS_FLASHGUARD_WASM_CORE_H
 
-#include "policy-bpf-abi.h"
+#include "policy-wasm-abi.h"
 
 #define FLASHGUARD_READ_BITMAP_OBJECT 10U
 #define FLASHGUARD_RETAINED_BITMAP_OBJECT 11U
@@ -20,12 +20,6 @@
 #define FLASHGUARD_RETAINED_FLAG 1U
 #define FLASHGUARD_RETENTION_NS \
     (20ULL * 24ULL * 60ULL * 60ULL * 1000000000ULL)
-
-enum flashguard_scratch_offset {
-    FLASHGUARD_OOB_OFFSET = 4512,
-    FLASHGUARD_TEMP_OFFSET = 4544,
-    FLASHGUARD_RESPONSE_OFFSET = 4608,
-};
 
 struct flashguard_oob {
     sxs_u64 lpn;
@@ -73,28 +67,28 @@ struct __attribute__((packed)) flashguard_read_response {
     sxs_u32 reserved;
 };
 
-struct block_bpf_metadata;
+struct block_wasm_metadata;
 
-static sxs_s64 flashguard_init(struct sxs_bpf_context *,
-                               const struct sxs_bpf_geometry *,
-                               const struct block_bpf_metadata *);
-static sxs_u64 flashguard_condition(struct sxs_bpf_context *);
-static sxs_u64 flashguard_action(struct sxs_bpf_context *);
+static sxs_s64 flashguard_init(struct sxs_policy_context *,
+                               const struct sxs_geometry *,
+                               const struct block_wasm_metadata *);
+static sxs_u64 flashguard_condition(struct sxs_policy_context *);
+static sxs_u64 flashguard_action(struct sxs_policy_context *);
 static sxs_s64 flashguard_prepare_append(
-    struct sxs_bpf_context *, sxs_u64, sxs_u64,
-    struct sxs_bpf_page_append_request *);
-static sxs_s64 flashguard_handle_old_page(struct sxs_bpf_context *,
+    struct sxs_policy_context *, sxs_u64, sxs_u64,
+    struct sxs_page_append_request *, sxs_u8 *, sxs_u32 *);
+static sxs_s64 flashguard_handle_old_page(struct sxs_policy_context *,
                                            sxs_u64, sxs_u64);
-static sxs_s64 flashguard_after_new_page(struct sxs_bpf_context *,
+static sxs_s64 flashguard_after_new_page(struct sxs_policy_context *,
                                           sxs_u64, sxs_u64, sxs_u64);
-static sxs_s64 flashguard_on_page_read(struct sxs_bpf_context *,
+static sxs_s64 flashguard_on_page_read(struct sxs_policy_context *,
                                         sxs_u64, sxs_u64);
-static sxs_u32 flashguard_gc_should_migrate(struct sxs_bpf_context *,
+static sxs_u32 flashguard_gc_should_migrate(struct sxs_policy_context *,
                                              sxs_u64);
-static sxs_s64 flashguard_gc_after_migrate(struct sxs_bpf_context *,
+static sxs_s64 flashguard_gc_after_migrate(struct sxs_policy_context *,
                                             sxs_u64, sxs_u64, sxs_u64);
 static sxs_s64 flashguard_gc_before_erase(
-    struct sxs_bpf_context *, sxs_u32, const struct block_bpf_metadata *);
+    struct sxs_policy_context *, sxs_u32, const struct block_wasm_metadata *);
 
 #define BLOCK_EXTRA_INIT flashguard_init
 #define BLOCK_EXTRA_CONDITION flashguard_condition
@@ -107,52 +101,36 @@ static sxs_s64 flashguard_gc_before_erase(
 #define BLOCK_GC_AFTER_MIGRATE flashguard_gc_after_migrate
 #define BLOCK_GC_BEFORE_ERASE flashguard_gc_before_erase
 
-#include "block-policy-bpf-core.h"
+#include "block-policy-wasm-core.h"
 
-static sxs_s64 flashguard_state_read(struct sxs_bpf_context *context,
+static sxs_s64 flashguard_state_read(struct sxs_policy_context *context,
                                      sxs_u32 object_id, sxs_u64 index,
                                      void *value, sxs_u32 length)
 {
-    sxs_s64 result = sxs_state_read(object_id, index, 0,
-                                    FLASHGUARD_TEMP_OFFSET, length);
-
-    if (result == 0) {
-        sxs_u8 *source = context->scratch + FLASHGUARD_TEMP_OFFSET;
-        sxs_u8 *destination = value;
-
-        for (sxs_u32 i = 0; i < length; i++) {
-            destination[i] = source[i];
-        }
-    }
-    return result;
+    (void)context;
+    return sxs_state_read(object_id, index, 0, value, length);
 }
 
-static sxs_s64 flashguard_state_write(struct sxs_bpf_context *context,
+static sxs_s64 flashguard_state_write(struct sxs_policy_context *context,
                                       sxs_u32 object_id, sxs_u64 index,
                                       const void *value, sxs_u32 length)
 {
-    const sxs_u8 *source = value;
-    sxs_u8 *destination = context->scratch + FLASHGUARD_TEMP_OFFSET;
-
-    for (sxs_u32 i = 0; i < length; i++) {
-        destination[i] = source[i];
-    }
-    return sxs_state_write(object_id, index, 0,
-                           FLASHGUARD_TEMP_OFFSET, length);
+    (void)context;
+    return sxs_state_write(object_id, index, 0, value, length);
 }
 
 static sxs_s64 flashguard_page_index(sxs_u64 ppa, sxs_u64 *index_out)
 {
-    sxs_u64 index = sxs_ppa_to_page_index(ppa, 0, 0, 0, 0);
+    sxs_u64 index = sxs_ppa_to_page_index(ppa);
 
     if ((sxs_s64)index < 0) {
-        return -SXS_BPF_EINVAL;
+        return -SXS_WASM_EINVAL;
     }
     *index_out = index;
     return 0;
 }
 
-static sxs_s64 flashguard_bitmap_get(struct sxs_bpf_context *context,
+static sxs_s64 flashguard_bitmap_get(struct sxs_policy_context *context,
                                      sxs_u32 object_id, sxs_u64 page_index,
                                      sxs_u32 *set_out)
 {
@@ -166,7 +144,7 @@ static sxs_s64 flashguard_bitmap_get(struct sxs_bpf_context *context,
     return result;
 }
 
-static sxs_s64 flashguard_bitmap_set(struct sxs_bpf_context *context,
+static sxs_s64 flashguard_bitmap_set(struct sxs_policy_context *context,
                                      sxs_u32 object_id, sxs_u64 page_index,
                                      sxs_u32 set)
 {
@@ -186,7 +164,7 @@ static sxs_s64 flashguard_bitmap_set(struct sxs_bpf_context *context,
                                   &value, 1);
 }
 
-static sxs_s64 flashguard_retained_add(struct sxs_bpf_context *context,
+static sxs_s64 flashguard_retained_add(struct sxs_policy_context *context,
                                        sxs_u64 ppa, sxs_u64 page_index)
 {
     struct flashguard_settings settings;
@@ -195,7 +173,7 @@ static sxs_s64 flashguard_retained_add(struct sxs_bpf_context *context,
 
     if (flashguard_bitmap_get(context, FLASHGUARD_RETAINED_BITMAP_OBJECT,
                               page_index, &retained) != 0) {
-        return -SXS_BPF_EIO;
+        return -SXS_WASM_EIO;
     }
     if (retained) {
         return 0;
@@ -203,10 +181,10 @@ static sxs_s64 flashguard_retained_add(struct sxs_bpf_context *context,
     if (flashguard_state_read(context, FLASHGUARD_SETTINGS_OBJECT, 0,
                               &settings, sizeof(settings)) != 0 ||
         settings.retained_count >= settings.physical_pages) {
-        return -SXS_BPF_ENOSPC;
+        return -SXS_WASM_ENOSPC;
     }
     if (settings.retained_count >= 0xffffffffULL) {
-        return -SXS_BPF_ENOSPC;
+        return -SXS_WASM_ENOSPC;
     }
     position = (sxs_u32)settings.retained_count + 1;
     if (flashguard_state_write(context, FLASHGUARD_RETAINED_LIST_OBJECT,
@@ -217,14 +195,14 @@ static sxs_s64 flashguard_retained_add(struct sxs_bpf_context *context,
                                sizeof(position)) != 0 ||
         flashguard_bitmap_set(context, FLASHGUARD_RETAINED_BITMAP_OBJECT,
                               page_index, 1) != 0) {
-        return -SXS_BPF_EIO;
+        return -SXS_WASM_EIO;
     }
     settings.retained_count++;
     return flashguard_state_write(context, FLASHGUARD_SETTINGS_OBJECT, 0,
                                   &settings, sizeof(settings));
 }
 
-static sxs_s64 flashguard_retained_remove(struct sxs_bpf_context *context,
+static sxs_s64 flashguard_retained_remove(struct sxs_policy_context *context,
                                           sxs_u64 page_index)
 {
     struct flashguard_settings settings;
@@ -237,7 +215,7 @@ static sxs_s64 flashguard_retained_remove(struct sxs_bpf_context *context,
 
     if (flashguard_bitmap_get(context, FLASHGUARD_RETAINED_BITMAP_OBJECT,
                               page_index, &retained) != 0) {
-        return -SXS_BPF_EIO;
+        return -SXS_WASM_EIO;
     }
     if (!retained) {
         return 0;
@@ -249,7 +227,7 @@ static sxs_s64 flashguard_retained_remove(struct sxs_bpf_context *context,
                               page_index, &position, sizeof(position)) != 0 ||
         position == 0 || position > settings.retained_count ||
         settings.retained_count == 0) {
-        return -SXS_BPF_EIO;
+        return -SXS_WASM_EIO;
     }
     position--;
     settings.retained_count--;
@@ -267,7 +245,7 @@ static sxs_s64 flashguard_retained_remove(struct sxs_bpf_context *context,
                 context, FLASHGUARD_RETAINED_POSITION_OBJECT,
                 last_page_index, &moved_position,
                 sizeof(moved_position)) != 0) {
-            return -SXS_BPF_EIO;
+            return -SXS_WASM_EIO;
         }
     }
     if (flashguard_state_write(context, FLASHGUARD_RETAINED_LIST_OBJECT,
@@ -281,12 +259,12 @@ static sxs_s64 flashguard_retained_remove(struct sxs_bpf_context *context,
                               page_index, 0) != 0 ||
         flashguard_state_write(context, FLASHGUARD_SETTINGS_OBJECT, 0,
                                &settings, sizeof(settings)) != 0) {
-        return -SXS_BPF_EIO;
+        return -SXS_WASM_EIO;
     }
     return 0;
 }
 
-static sxs_s64 flashguard_clear_tracking(struct sxs_bpf_context *context,
+static sxs_s64 flashguard_clear_tracking(struct sxs_policy_context *context,
                                          sxs_u64 page_index)
 {
     sxs_u64 zero = 0;
@@ -296,14 +274,14 @@ static sxs_s64 flashguard_clear_tracking(struct sxs_bpf_context *context,
         flashguard_retained_remove(context, page_index) != 0 ||
         flashguard_state_write(context, FLASHGUARD_TIMESTAMP_OBJECT,
                                page_index, &zero, sizeof(zero)) != 0) {
-        return -SXS_BPF_EIO;
+        return -SXS_WASM_EIO;
     }
     return 0;
 }
 
-static sxs_s64 flashguard_init(struct sxs_bpf_context *context,
-                               const struct sxs_bpf_geometry *geometry,
-                               const struct block_bpf_metadata *metadata)
+static sxs_s64 flashguard_init(struct sxs_policy_context *context,
+                               const struct sxs_geometry *geometry,
+                               const struct block_wasm_metadata *metadata)
 {
     struct flashguard_settings settings = {
         .physical_pages = geometry->total_pages_log,
@@ -329,42 +307,42 @@ static sxs_s64 flashguard_init(struct sxs_bpf_context *context,
                          0, 0) != 0 ||
         sxs_state_create(FLASHGUARD_SETTINGS_OBJECT, sizeof(settings),
                          1, 0, 0) != 0) {
-        return -SXS_BPF_ENOSPC;
+        return -SXS_WASM_ENOSPC;
     }
-    if (!(context->flags & SXS_BPF_FLAG_STATE_RESTORED) &&
+    if (!(context->flags & SXS_FLAG_STATE_RESTORED) &&
         flashguard_state_write(context, FLASHGUARD_SETTINGS_OBJECT,
                                0, &settings, sizeof(settings)) != 0) {
-        return -SXS_BPF_EIO;
+        return -SXS_WASM_EIO;
     }
     if (sxs_oob_register_stage(FLASHGUARD_OOB_OBJECT,
-                               sizeof(struct flashguard_oob), 0, 0, 0) != 0 ||
-        sxs_subscribe(SXS_BPF_EVENT_NVME_ADMIN, FLASHGUARD_ADMIN_LIST,
-                      FLASHGUARD_PAIR_LIST, 0, 0) != 0 ||
-        sxs_subscribe(SXS_BPF_EVENT_NVME_ADMIN, FLASHGUARD_ADMIN_READ,
-                      FLASHGUARD_PAIR_READ, 0, 0) != 0) {
-        return -SXS_BPF_EPERM;
+                               sizeof(struct flashguard_oob)) != 0 ||
+        sxs_subscribe(SXS_EVENT_NVME_ADMIN, FLASHGUARD_ADMIN_LIST,
+                      FLASHGUARD_PAIR_LIST, 0) != 0 ||
+        sxs_subscribe(SXS_EVENT_NVME_ADMIN, FLASHGUARD_ADMIN_READ,
+                      FLASHGUARD_PAIR_READ, 0) != 0) {
+        return -SXS_WASM_EPERM;
     }
     return 0;
 }
 
 static sxs_s64 flashguard_prepare_append(
-    struct sxs_bpf_context *context, sxs_u64 lpn, sxs_u64 old_ppa,
-    struct sxs_bpf_page_append_request *request)
+    struct sxs_policy_context *context, sxs_u64 lpn, sxs_u64 old_ppa,
+    struct sxs_page_append_request *request, sxs_u8 *oob_bytes,
+    sxs_u32 *oob_length)
 {
-    struct flashguard_oob *oob =
-        (struct flashguard_oob *)(context->scratch + FLASHGUARD_OOB_OFFSET);
+    struct flashguard_oob *oob = (struct flashguard_oob *)oob_bytes;
 
+    (void)context;
     *oob = (struct flashguard_oob) {
         .lpn = lpn,
         .previous_ppa = old_ppa,
     };
     request->oob_object_id = FLASHGUARD_OOB_OBJECT;
-    request->oob_offset = FLASHGUARD_OOB_OFFSET;
-    request->oob_length = sizeof(*oob);
+    *oob_length = sizeof(*oob);
     return 0;
 }
 
-static sxs_s64 flashguard_handle_old_page(struct sxs_bpf_context *context,
+static sxs_s64 flashguard_handle_old_page(struct sxs_policy_context *context,
                                           sxs_u64 lpn, sxs_u64 old_ppa)
 {
     sxs_u64 page_index;
@@ -375,17 +353,17 @@ static sxs_s64 flashguard_handle_old_page(struct sxs_bpf_context *context,
     if (flashguard_page_index(old_ppa, &page_index) != 0 ||
         flashguard_bitmap_get(context, FLASHGUARD_READ_BITMAP_OBJECT,
                               page_index, &was_read) != 0) {
-        return -SXS_BPF_EIO;
+        return -SXS_WASM_EIO;
     }
     if (was_read) {
         if (flashguard_retained_add(context, old_ppa, page_index) != 0 ||
             flashguard_state_read(context, FLASHGUARD_TIMESTAMP_OBJECT,
                                   page_index, &timestamp,
                                   sizeof(timestamp)) != 0) {
-            return -SXS_BPF_EIO;
+            return -SXS_WASM_EIO;
         }
         if (timestamp == 0) {
-            timestamp = sxs_time_now_ns(0, 0, 0, 0, 0);
+            timestamp = sxs_time_now_ns();
             return flashguard_state_write(context,
                                           FLASHGUARD_TIMESTAMP_OBJECT,
                                           page_index, &timestamp,
@@ -393,13 +371,13 @@ static sxs_s64 flashguard_handle_old_page(struct sxs_bpf_context *context,
         }
         return 0;
     }
-    if (sxs_page_invalidate(old_ppa, 0, 0, 0, 0) != 0) {
-        return -SXS_BPF_EIO;
+    if (sxs_page_invalidate(old_ppa) != 0) {
+        return -SXS_WASM_EIO;
     }
     return flashguard_clear_tracking(context, page_index);
 }
 
-static sxs_s64 flashguard_after_new_page(struct sxs_bpf_context *context,
+static sxs_s64 flashguard_after_new_page(struct sxs_policy_context *context,
                                          sxs_u64 lpn, sxs_u64 old_ppa,
                                          sxs_u64 new_ppa)
 {
@@ -411,26 +389,26 @@ static sxs_s64 flashguard_after_new_page(struct sxs_bpf_context *context,
 
     if (flashguard_page_index(new_ppa, &page_index) != 0 ||
         flashguard_clear_tracking(context, page_index) != 0) {
-        return -SXS_BPF_EIO;
+        return -SXS_WASM_EIO;
     }
     return flashguard_state_write(context, FLASHGUARD_OOB_SHADOW_OBJECT,
                                   page_index, &shadow, sizeof(shadow));
 }
 
-static sxs_s64 flashguard_on_page_read(struct sxs_bpf_context *context,
+static sxs_s64 flashguard_on_page_read(struct sxs_policy_context *context,
                                        sxs_u64 lpn, sxs_u64 ppa)
 {
     sxs_u64 page_index;
 
     (void)lpn;
     if (flashguard_page_index(ppa, &page_index) != 0) {
-        return -SXS_BPF_EIO;
+        return -SXS_WASM_EIO;
     }
     return flashguard_bitmap_set(context, FLASHGUARD_READ_BITMAP_OBJECT,
                                  page_index, 1);
 }
 
-static sxs_u32 flashguard_gc_should_migrate(struct sxs_bpf_context *context,
+static sxs_u32 flashguard_gc_should_migrate(struct sxs_policy_context *context,
                                             sxs_u64 ppa)
 {
     struct flashguard_settings settings;
@@ -451,7 +429,7 @@ static sxs_u32 flashguard_gc_should_migrate(struct sxs_bpf_context *context,
         timestamp == 0 || settings.retention_window_ns == 0) {
         return 1;
     }
-    now = sxs_time_now_ns(0, 0, 0, 0, 0);
+    now = sxs_time_now_ns();
     if (now >= timestamp && now - timestamp >= settings.retention_window_ns) {
         flashguard_clear_tracking(context, page_index);
         return 0;
@@ -459,7 +437,7 @@ static sxs_u32 flashguard_gc_should_migrate(struct sxs_bpf_context *context,
     return 1;
 }
 
-static sxs_s64 flashguard_gc_after_migrate(struct sxs_bpf_context *context,
+static sxs_s64 flashguard_gc_after_migrate(struct sxs_policy_context *context,
                                            sxs_u64 old_ppa, sxs_u64 new_ppa,
                                            sxs_u64 lpn)
 {
@@ -489,37 +467,36 @@ static sxs_s64 flashguard_gc_after_migrate(struct sxs_bpf_context *context,
                                new_index, &timestamp, sizeof(timestamp)) != 0 ||
         flashguard_state_write(context, FLASHGUARD_OOB_SHADOW_OBJECT,
                                new_index, &shadow, sizeof(shadow)) != 0) {
-        return -SXS_BPF_EIO;
+        return -SXS_WASM_EIO;
     }
     if (retained && flashguard_retained_add(context, new_ppa, new_index) != 0) {
-        return -SXS_BPF_EIO;
+        return -SXS_WASM_EIO;
     }
     return 0;
 }
 
 static sxs_s64 flashguard_gc_before_erase(
-    struct sxs_bpf_context *context, sxs_u32 victim,
-    const struct block_bpf_metadata *metadata)
+    struct sxs_policy_context *context, sxs_u32 victim,
+    const struct block_wasm_metadata *metadata)
 {
     for (sxs_u32 page = 0; page < metadata->pages_per_eswd; page++) {
         sxs_u64 ppa;
         sxs_u64 page_index;
 
-        if (sxs_eswd_to_ppa(victim, page,
-                            FLASHGUARD_TEMP_OFFSET, 0, 0) != 0) {
+        ppa = sxs_eswd_to_ppa(victim, page);
+        if ((sxs_s64)ppa < 0) {
             continue;
         }
-        ppa = *(sxs_u64 *)(context->scratch + FLASHGUARD_TEMP_OFFSET);
         if (flashguard_page_index(ppa, &page_index) == 0 &&
             flashguard_clear_tracking(context, page_index) != 0) {
-            return -SXS_BPF_EIO;
+            return -SXS_WASM_EIO;
         }
     }
     return 0;
 }
 
 static sxs_s64 flashguard_get_page_record(
-    struct sxs_bpf_context *context, sxs_u64 ppa, sxs_u32 *retained_out,
+    struct sxs_policy_context *context, sxs_u64 ppa, sxs_u32 *retained_out,
     sxs_u64 *timestamp_out, struct flashguard_shadow *shadow_out)
 {
     sxs_u64 page_index;
@@ -527,7 +504,7 @@ static sxs_s64 flashguard_get_page_record(
     if (flashguard_page_index(ppa, &page_index) != 0 ||
         flashguard_bitmap_get(context, FLASHGUARD_RETAINED_BITMAP_OBJECT,
                               page_index, retained_out) != 0) {
-        return -SXS_BPF_EIO;
+        return -SXS_WASM_EIO;
     }
     if (!*retained_out) {
         *timestamp_out = 0;
@@ -540,12 +517,12 @@ static sxs_s64 flashguard_get_page_record(
         flashguard_state_read(context, FLASHGUARD_OOB_SHADOW_OBJECT,
                               page_index, shadow_out,
                               sizeof(*shadow_out)) != 0) {
-        return -SXS_BPF_EIO;
+        return -SXS_WASM_EIO;
     }
     return 0;
 }
 
-static sxs_u64 flashguard_list(struct sxs_bpf_context *context)
+static sxs_u64 flashguard_list(struct sxs_policy_context *context)
 {
     struct flashguard_settings settings;
     struct flashguard_list_header header = { .version = 1 };
@@ -559,7 +536,7 @@ static sxs_u64 flashguard_list(struct sxs_bpf_context *context)
     if (flashguard_state_read(context, FLASHGUARD_SETTINGS_OBJECT, 0,
                               &settings, sizeof(settings)) != 0 ||
         settings.retained_count > 0xffffffffULL) {
-        sxs_completion_status_set(BLOCK_NVME_INTERNAL_ERROR, 0, 0, 0, 0);
+        sxs_completion_status_set(BLOCK_NVME_INTERNAL_ERROR);
         return 0;
     }
     header.total_retained = (sxs_u32)settings.retained_count;
@@ -579,8 +556,7 @@ static sxs_u64 flashguard_list(struct sxs_bpf_context *context)
             flashguard_get_page_record(context, ppa, &retained,
                                        &timestamp, &shadow) != 0 ||
             !retained) {
-            sxs_completion_status_set(BLOCK_NVME_INTERNAL_ERROR,
-                                      0, 0, 0, 0);
+            sxs_completion_status_set(BLOCK_NVME_INTERNAL_ERROR);
             return 0;
         }
         entry = (struct flashguard_list_entry) {
@@ -590,97 +566,78 @@ static sxs_u64 flashguard_list(struct sxs_bpf_context *context)
             .retention_timestamp_ns = timestamp,
             .flags = FLASHGUARD_RETAINED_FLAG,
         };
-        *(struct flashguard_list_entry *)(context->scratch +
-                                           FLASHGUARD_RESPONSE_OFFSET) = entry;
         if (sxs_command_write(sizeof(header) +
                                   (sxs_u64)header.returned_entries *
                                       sizeof(entry),
-                              FLASHGUARD_RESPONSE_OFFSET,
-                              sizeof(entry), 0, 0) != 0) {
-            sxs_completion_status_set(BLOCK_NVME_INTERNAL_ERROR,
-                                      0, 0, 0, 0);
+                              &entry, sizeof(entry)) != 0) {
+            sxs_completion_status_set(BLOCK_NVME_INTERNAL_ERROR);
             return 0;
         }
         header.returned_entries++;
     }
     header.next_index = start + header.returned_entries;
-    *(struct flashguard_list_header *)(context->scratch +
-                                       FLASHGUARD_RESPONSE_OFFSET) = header;
-    if (sxs_command_write(0, FLASHGUARD_RESPONSE_OFFSET,
-                          sizeof(header), 0, 0) != 0) {
-        sxs_completion_status_set(BLOCK_NVME_INTERNAL_ERROR, 0, 0, 0, 0);
+    if (sxs_command_write(0, &header, sizeof(header)) != 0) {
+        sxs_completion_status_set(BLOCK_NVME_INTERNAL_ERROR);
         return 0;
     }
     sxs_completion_result_set(((sxs_u64)header.returned_entries << 32) |
-                                  header.total_retained,
-                              0, 0, 0, 0);
-    sxs_completion_status_set(BLOCK_NVME_SUCCESS, 0, 0, 0, 0);
+                              header.total_retained);
+    sxs_completion_status_set(BLOCK_NVME_SUCCESS);
     return 0;
 }
 
-static sxs_u64 flashguard_read_retained(struct sxs_bpf_context *context)
+static sxs_u64 flashguard_read_retained(struct sxs_policy_context *context)
 {
-    struct block_bpf_metadata *metadata;
-    struct sxs_bpf_page_read_request *request =
-        (struct sxs_bpf_page_read_request *)(context->scratch +
-                                              BLOCK_PAGE_REQUEST_OFFSET);
-    struct sxs_bpf_page_result *result =
-        (struct sxs_bpf_page_result *)(context->scratch +
-                                       BLOCK_PAGE_RESULT_OFFSET);
+    struct block_wasm_metadata metadata;
+    struct sxs_page_read_request request;
+    struct sxs_page_result result;
     struct flashguard_read_response response = { .version = 1 };
     struct flashguard_shadow shadow;
-    struct flashguard_oob *live_oob =
-        (struct flashguard_oob *)(context->scratch + FLASHGUARD_OOB_OFFSET);
+    struct flashguard_oob live_oob;
+    sxs_u8 page[SXS_WASM_MAX_PAGE_BYTES];
     sxs_u64 ppa;
     sxs_u64 timestamp;
     sxs_u32 retained;
 
     if (block_read_metadata(context, &metadata) != 0 ||
-        sxs_command_read(0, FLASHGUARD_TEMP_OFFSET,
-                         sizeof(ppa), 0, 0) != 0) {
-        sxs_completion_status_set(BLOCK_NVME_INVALID_FIELD, 0, 0, 0, 0);
+        sxs_command_read(0, &ppa, sizeof(ppa)) != 0) {
+        sxs_completion_status_set(BLOCK_NVME_INVALID_FIELD);
         return 0;
     }
-    ppa = *(sxs_u64 *)(context->scratch + FLASHGUARD_TEMP_OFFSET);
     if (flashguard_get_page_record(context, ppa, &retained,
                                    &timestamp, &shadow) != 0 || !retained) {
-        sxs_completion_status_set(BLOCK_NVME_INVALID_FIELD, 0, 0, 0, 0);
+        sxs_completion_status_set(BLOCK_NVME_INVALID_FIELD);
         return 0;
     }
-    request->ppa = ppa;
-    request->page_offset = 0;
-    request->length = metadata->page_size;
-    request->data_offset = BLOCK_PAGE_OFFSET;
-    request->result_offset = BLOCK_PAGE_RESULT_OFFSET;
-    request->oob_object_id = FLASHGUARD_OOB_OBJECT;
-    request->oob_offset = FLASHGUARD_OOB_OFFSET;
-    request->oob_length = sizeof(*live_oob);
-    if (sxs_page_read(BLOCK_PAGE_REQUEST_OFFSET, 0, 0, 0, 0) != 0 ||
-        result->status != 0) {
-        sxs_completion_status_set(BLOCK_NVME_INTERNAL_ERROR, 0, 0, 0, 0);
+    request = (struct sxs_page_read_request) {
+        .ppa = ppa,
+        .page_offset = 0,
+        .length = metadata.page_size,
+        .oob_object_id = FLASHGUARD_OOB_OBJECT,
+    };
+    if (sxs_page_read(&request, page, metadata.page_size, &live_oob,
+                      sizeof(live_oob), &result) != 0 || result.status != 0) {
+        sxs_completion_status_set(BLOCK_NVME_INTERNAL_ERROR);
         return 0;
     }
-    response.data_length = metadata->page_size;
+    response.data_length = metadata.page_size;
     response.ppa = ppa;
-    response.lpn = live_oob->lpn;
-    response.previous_ppa = live_oob->previous_ppa;
+    response.lpn = live_oob.lpn;
+    response.previous_ppa = live_oob.previous_ppa;
     response.retention_timestamp_ns = timestamp;
     response.flags = FLASHGUARD_RETAINED_FLAG;
-    *(struct flashguard_read_response *)(context->scratch +
-                                         FLASHGUARD_RESPONSE_OFFSET) = response;
-    if (sxs_command_write(0, FLASHGUARD_RESPONSE_OFFSET,
-                          sizeof(response), 0, 0) != 0 ||
-        sxs_command_write(sizeof(response), BLOCK_PAGE_OFFSET,
-                          response.data_length, 0, 0) != 0) {
-        sxs_completion_status_set(BLOCK_NVME_INTERNAL_ERROR, 0, 0, 0, 0);
+    if (sxs_command_write(0, &response, sizeof(response)) != 0 ||
+        sxs_command_write(sizeof(response), page,
+                          response.data_length) != 0) {
+        sxs_completion_status_set(BLOCK_NVME_INTERNAL_ERROR);
         return 0;
     }
-    sxs_completion_result_set(response.data_length, 0, 0, 0, 0);
-    sxs_completion_status_set(BLOCK_NVME_SUCCESS, 0, 0, 0, 0);
-    return result->latency_ns;
+    sxs_completion_result_set(response.data_length);
+    sxs_completion_status_set(BLOCK_NVME_SUCCESS);
+    return result.latency_ns;
 }
 
-static sxs_u64 flashguard_condition(struct sxs_bpf_context *context)
+static sxs_u64 flashguard_condition(struct sxs_policy_context *context)
 {
     switch (context->pair_id) {
     case FLASHGUARD_PAIR_LIST:
@@ -692,7 +649,7 @@ static sxs_u64 flashguard_condition(struct sxs_bpf_context *context)
     }
 }
 
-static sxs_u64 flashguard_action(struct sxs_bpf_context *context)
+static sxs_u64 flashguard_action(struct sxs_policy_context *context)
 {
     switch (context->pair_id) {
     case FLASHGUARD_PAIR_LIST:
@@ -700,8 +657,8 @@ static sxs_u64 flashguard_action(struct sxs_bpf_context *context)
     case FLASHGUARD_PAIR_READ:
         return flashguard_read_retained(context);
     default:
-        return SXS_BPF_ACTION_ERROR;
+        return SXS_WASM_ACTION_ERROR;
     }
 }
 
-#endif /* SXS_FLASHGUARD_BPF_CORE_H */
+#endif /* SXS_FLASHGUARD_WASM_CORE_H */

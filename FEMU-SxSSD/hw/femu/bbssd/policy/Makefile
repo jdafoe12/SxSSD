@@ -1,85 +1,168 @@
-BPF_CC ?= clang
-BPF_READELF ?= $(shell command -v llvm-readelf 2>/dev/null || command -v readelf 2>/dev/null)
-BPF_OBJDUMP ?= $(shell command -v llvm-objdump 2>/dev/null || command -v objdump 2>/dev/null)
-BPF_CFLAGS = -target bpfel -O2 -g0 -Wall -Wextra -ffreestanding \
-	-fno-stack-protector -I.
+# Prefer the unversioned compiler when it has the WebAssembly backend.  Older
+# Ubuntu guests may ship an unversioned clang without that backend alongside a
+# usable versioned compiler (for example clang-12).
+WASM_CC ?= $(shell \
+	for cc in clang clang-22 clang-21 clang-20 clang-19 clang-18 clang-17 \
+		clang-16 clang-15 clang-14 clang-13 clang-12 clang-11 clang-10; do \
+		if command -v $$cc >/dev/null 2>&1 && \
+			$$cc --print-targets 2>/dev/null | grep -q 'wasm32'; then \
+			printf '%s\n' $$cc; exit 0; \
+		fi; \
+	done; \
+	printf '%s\n' clang)
+WASM_CFLAGS = --target=wasm32-unknown-unknown -O2 -g0 -Wall -Wextra \
+	-ffreestanding -fno-builtin -fno-stack-protector -nostdlib \
+	-mno-atomics -mno-bulk-memory -mno-reference-types -mno-simd128 \
+	-mllvm -disable-loop-idiom-all -I.
+
+# wasm-ld learned --export-memory after LLVM 12.  LLVM 12 can still produce
+# the required exported fixed memory with --export-all; it also needs feature
+# checking disabled to export the mutable __stack_pointer global.
+WASM_HAS_EXPORT_MEMORY := $(shell \
+	ld_path="$$($(WASM_CC) --target=wasm32-unknown-unknown \
+		-print-prog-name=wasm-ld 2>/dev/null)"; \
+	"$$ld_path" --help 2>/dev/null | grep -q -- '--export-memory' && \
+		printf '%s\n' yes)
+ifeq ($(WASM_HAS_EXPORT_MEMORY),yes)
+WASM_MEMORY_EXPORT_FLAGS = -Wl,--export-memory
+else
+WASM_MEMORY_EXPORT_FLAGS = -Wl,--export-all,--no-check-features
+endif
+
+WASM_LDFLAGS = -Wl,--no-entry,--strip-all $(WASM_MEMORY_EXPORT_FLAGS) \
+	-Wl,--export=__stack_pointer \
+	-Wl,--initial-memory=65536,--max-memory=65536 \
+	-Wl,-z,stack-size=16384
+WASM_IMPORT_ALLOWLIST = wasm-imports.allow
+PRIVILEGED_WASM_IMPORT_ALLOWLIST = privileged-wasm-imports.allow
+WASM_IMPORT_CATALOG = policy-imports.def
+WASM_IMPORT_GENERATOR = generate-policy-import-allowlists.sh
+META_INTERFACE_POLICY = meta-interface-policy.wasm
+META_INTERFACE_LDFLAGS = \
+	-Wl,--no-entry,--strip-all $(WASM_MEMORY_EXPORT_FLAGS) \
+	-Wl,--export=__stack_pointer \
+	-Wl,--initial-memory=2097152,--max-memory=2097152 \
+	-Wl,-z,stack-size=65536
 
 PRODUCTION_POLICIES = \
-	block-interface-policy-eval.bpf.o \
-	block-interface-policy-baseline.bpf.o \
-	block-interface-policy-flashguard.bpf.o \
-	block-interface-flashguard-policy.bpf.o \
-	zns-policy.bpf.o \
-	signing-test-policy.bpf.o \
-	key-sharing-policy.bpf.o \
-	ubpf-smoke-policy.bpf.o
-NEGATIVE_FIXTURES = ubpf-forbidden-policy.bpf.o
+	block-interface-policy-eval.wasm \
+	block-interface-policy-baseline.wasm \
+	block-interface-policy-flashguard.wasm \
+	block-interface-flashguard-policy.wasm \
+	zns-policy.wasm \
+	signing-test-policy.wasm \
+	key-sharing-policy.wasm \
+	wasm-smoke-policy.wasm
 TEST_POLICIES = \
-	ubpf-isolation-policy.bpf.o \
-	ubpf-state-policy.bpf.o \
-	ubpf-transaction-fail-policy.bpf.o \
-	ubpf-order-policy.bpf.o \
-	ubpf-limit-policy.bpf.o \
-	ubpf-runtime-fault-policy.bpf.o
-GENERATED = $(PRODUCTION_POLICIES) $(NEGATIVE_FIXTURES) $(TEST_POLICIES) \
-	native-forbidden-policy.so
-LEGACY_NATIVE_ARTIFACTS = \
+	wasm-isolation-policy.wasm \
+	wasm-state-policy.wasm \
+	wasm-transaction-fail-policy.wasm \
+	wasm-order-policy.wasm \
+	wasm-limit-policy.wasm \
+	wasm-runtime-fault-policy.wasm
+NEGATIVE_FIXTURES = wasm-forbidden-policy.wasm \
+		wasm-privileged-forbidden-policy.wasm native-forbidden-policy.so
+GENERATED = $(PRODUCTION_POLICIES) $(TEST_POLICIES) $(NEGATIVE_FIXTURES) \
+		$(META_INTERFACE_POLICY)
+LEGACY_ARTIFACTS = \
 	block-interface-policy-eval.so \
 	block-interface-policy-baseline.so \
 	block-interface-policy-flashguard.so \
 	block-interface-flashguard-policy.so \
 	zns-policy.so signing-test-policy.so key-sharing-policy.so
 
-.PHONY: all tool bpf fixtures isolation-test check-toolchain clean
+.PHONY: all tool wasm fixtures isolation-test reproducible check-toolchain \
+	check-imports clean
 
-all: check-toolchain $(PRODUCTION_POLICIES) $(NEGATIVE_FIXTURES) \
-	$(TEST_POLICIES) native-forbidden-policy.so
+all: check-toolchain check-imports $(PRODUCTION_POLICIES) $(TEST_POLICIES) \
+		$(NEGATIVE_FIXTURES) $(META_INTERFACE_POLICY)
 
-tool bpf: all
+tool wasm: all
 
-fixtures: check-toolchain $(NEGATIVE_FIXTURES) $(TEST_POLICIES) \
-	native-forbidden-policy.so
+fixtures: check-toolchain check-imports $(TEST_POLICIES) $(NEGATIVE_FIXTURES)
 
 isolation-test: all
 
 check-toolchain:
-	@command -v $(BPF_CC) >/dev/null 2>&1 || { \
-		echo "error: clang is required to build uBPF policies" >&2; exit 1; }
-	@printf 'int x;\n' | $(BPF_CC) -target bpfel -x c -c -o /dev/null - \
-		>/dev/null 2>&1 || { \
-		echo "error: $(BPF_CC) has no BPF target; install clang/llvm" >&2; exit 1; }
-	@test -n "$(BPF_READELF)" || { \
-		echo "error: llvm-readelf or readelf is required" >&2; exit 1; }
-	@test -n "$(BPF_OBJDUMP)" || { \
-		echo "error: llvm-objdump or objdump is required" >&2; exit 1; }
+	@command -v $(WASM_CC) >/dev/null 2>&1 || { \
+		echo "error: clang is required to build WebAssembly policies" >&2; exit 1; }
+	@printf 'int f(void) { return 0; }\n' | $(WASM_CC) \
+		--target=wasm32-unknown-unknown -nostdlib -Wl,--no-entry \
+		-Wl,--export=f -x c -o /dev/null - >/dev/null 2>&1 || { \
+		echo "error: $(WASM_CC) has no wasm32 target or wasm-ld; install clang/lld" >&2; exit 1; }
 
-BLOCK_DEPS = block-policy-bpf-core.h policy-bpf-abi.h
-FLASHGUARD_DEPS = flashguard-bpf-core.h $(BLOCK_DEPS)
+check-imports:
+	@./$(WASM_IMPORT_GENERATOR) --check $(WASM_IMPORT_CATALOG) \
+		$(WASM_IMPORT_ALLOWLIST) $(PRIVILEGED_WASM_IMPORT_ALLOWLIST)
 
-block-interface-policy-eval.bpf.o: block-interface-policy-eval.c $(BLOCK_DEPS)
-block-interface-policy-baseline.bpf.o: block-interface-policy-baseline.c $(BLOCK_DEPS)
-block-interface-policy-flashguard.bpf.o: block-interface-policy-flashguard.c $(FLASHGUARD_DEPS)
-block-interface-flashguard-policy.bpf.o: block-interface-flashguard-policy.c $(FLASHGUARD_DEPS)
-zns-policy.bpf.o: zns-policy.c zns-policy.h policy-bpf-abi.h
-signing-test-policy.bpf.o: signing-test-policy.c policy-bpf-abi.h
-key-sharing-policy.bpf.o: key-sharing-policy.c key-sharing.h policy-bpf-abi.h
-ubpf-smoke-policy.bpf.o: ubpf-smoke-policy.c policy-bpf-abi.h
-ubpf-forbidden-policy.bpf.o: ubpf-forbidden-policy.c policy-bpf-abi.h
-ubpf-isolation-policy.bpf.o: ubpf-isolation-policy.c policy-bpf-abi.h
-ubpf-state-policy.bpf.o: ubpf-state-policy.c policy-bpf-abi.h
-ubpf-transaction-fail-policy.bpf.o: ubpf-transaction-fail-policy.c policy-bpf-abi.h
-ubpf-order-policy.bpf.o: ubpf-order-policy.c policy-bpf-abi.h
-ubpf-limit-policy.bpf.o: ubpf-limit-policy.c policy-bpf-abi.h
-ubpf-runtime-fault-policy.bpf.o: ubpf-runtime-fault-policy.c policy-bpf-abi.h
+BLOCK_DEPS = block-policy-wasm-core.h policy-wasm-abi.h
+FLASHGUARD_DEPS = flashguard-wasm-core.h $(BLOCK_DEPS)
 
-%.bpf.o:
-	$(BPF_CC) $(BPF_CFLAGS) -c -o $@ $<
-	@./check-bpf-policy.sh "$@" "$(BPF_READELF)" "$(BPF_OBJDUMP)" \
-		"$(@:ubpf-forbidden-policy.bpf.o=negative)"
+block-interface-policy-eval.wasm: block-interface-policy-eval.c $(BLOCK_DEPS)
+block-interface-policy-baseline.wasm: block-interface-policy-baseline.c $(BLOCK_DEPS)
+block-interface-policy-flashguard.wasm: block-interface-policy-flashguard.c $(FLASHGUARD_DEPS)
+block-interface-flashguard-policy.wasm: block-interface-flashguard-policy.c $(FLASHGUARD_DEPS)
+zns-policy.wasm: zns-policy.c zns-policy.h policy-wasm-abi.h
+signing-test-policy.wasm: signing-test-policy.c policy-wasm-abi.h
+key-sharing-policy.wasm: key-sharing-policy.c key-sharing.h policy-wasm-abi.h
+meta-interface-policy.wasm: ../meta-interface-policy.c \
+		../meta-interface-policy.h ../policy-attestation-format.h \
+		policy-wasm-abi.h policy-privileged-wasm-abi.h \
+		check-wasm-policy.sh \
+		$(PRIVILEGED_WASM_IMPORT_ALLOWLIST) $(WASM_IMPORT_CATALOG) \
+		$(WASM_IMPORT_GENERATOR)
+	@./$(WASM_IMPORT_GENERATOR) --check $(WASM_IMPORT_CATALOG) \
+		$(WASM_IMPORT_ALLOWLIST) $(PRIVILEGED_WASM_IMPORT_ALLOWLIST)
+	$(WASM_CC) $(WASM_CFLAGS) -I.. $(META_INTERFACE_LDFLAGS) \
+		-Wl,--allow-undefined-file=$(PRIVILEGED_WASM_IMPORT_ALLOWLIST) -o $@ $<
+	@./check-wasm-policy.sh "$@"
 
-# Source-only native fixture: it is never a production policy target.
+%.wasm: %.c policy-wasm-abi.h check-wasm-policy.sh $(WASM_IMPORT_ALLOWLIST) \
+		$(PRIVILEGED_WASM_IMPORT_ALLOWLIST) $(WASM_IMPORT_CATALOG) \
+		$(WASM_IMPORT_GENERATOR)
+	@./$(WASM_IMPORT_GENERATOR) --check $(WASM_IMPORT_CATALOG) \
+		$(WASM_IMPORT_ALLOWLIST) $(PRIVILEGED_WASM_IMPORT_ALLOWLIST)
+	$(WASM_CC) $(WASM_CFLAGS) $(WASM_LDFLAGS) \
+		-Wl,--allow-undefined-file=$(WASM_IMPORT_ALLOWLIST) -o $@ $<
+	@./check-wasm-policy.sh "$@"
+
+# This fixture intentionally names one symbol outside the capability ABI.
+wasm-forbidden-policy.wasm: wasm-forbidden-policy.c policy-wasm-abi.h \
+		check-wasm-policy.sh $(WASM_IMPORT_CATALOG)
+	$(WASM_CC) $(WASM_CFLAGS) $(WASM_LDFLAGS) -Wl,--allow-undefined -o $@ $<
+	@./check-wasm-policy.sh "$@"
+
+# Valid Wasm that deliberately requests the privileged namespace.
+wasm-privileged-forbidden-policy.wasm: wasm-privileged-forbidden-policy.c \
+		policy-wasm-abi.h policy-privileged-wasm-abi.h \
+		check-wasm-policy.sh \
+		$(PRIVILEGED_WASM_IMPORT_ALLOWLIST) $(WASM_IMPORT_CATALOG) \
+		$(WASM_IMPORT_GENERATOR)
+	@./$(WASM_IMPORT_GENERATOR) --check $(WASM_IMPORT_CATALOG) \
+		$(WASM_IMPORT_ALLOWLIST) $(PRIVILEGED_WASM_IMPORT_ALLOWLIST)
+	$(WASM_CC) $(WASM_CFLAGS) $(WASM_LDFLAGS) \
+		-Wl,--allow-undefined-file=$(PRIVILEGED_WASM_IMPORT_ALLOWLIST) -o $@ $<
+	@./check-wasm-policy.sh "$@"
+
+reproducible: all
+	@tmp_dir=$$(mktemp -d); trap 'rm -rf "$$tmp_dir"' EXIT; \
+	for artifact in $(PRODUCTION_POLICIES) $(TEST_POLICIES); do \
+		source=$${artifact%.wasm}.c; \
+		$(WASM_CC) $(WASM_CFLAGS) $(WASM_LDFLAGS) \
+			-Wl,--allow-undefined-file=$(WASM_IMPORT_ALLOWLIST) \
+			-o "$$tmp_dir/$$artifact" "$$source" || exit 1; \
+		cmp -s "$$artifact" "$$tmp_dir/$$artifact" || { \
+			echo "error: non-reproducible artifact $$artifact" >&2; exit 1; }; \
+	done; \
+	$(WASM_CC) $(WASM_CFLAGS) -I.. $(META_INTERFACE_LDFLAGS) \
+		-Wl,--allow-undefined-file=$(PRIVILEGED_WASM_IMPORT_ALLOWLIST) \
+		-o "$$tmp_dir/$(META_INTERFACE_POLICY)" ../meta-interface-policy.c; \
+	cmp -s "$(META_INTERFACE_POLICY)" "$$tmp_dir/$(META_INTERFACE_POLICY)" || { \
+		echo "error: non-reproducible artifact $(META_INTERFACE_POLICY)" >&2; exit 1; }
+
+# Source-only native fixture: it must be rejected by the policy loader.
 native-forbidden-policy.so: native-forbidden-policy.c
 	$(CC) -Wall -Wextra -O2 -fPIC -I. -Iinc -shared -o $@ $< -ldl
 
 clean:
-	rm -f $(GENERATED) $(LEGACY_NATIVE_ARTIFACTS)
+	rm -f $(GENERATED) $(LEGACY_ARTIFACTS)

@@ -1,62 +1,33 @@
 #ifndef META_INTERFACE_POLICY_H
 #define META_INTERFACE_POLICY_H
 
-#include "ftl.h"
-#include "policy-attestation-format.h"
+/* Host-visible vendor commands owned by the built-in meta-interface policy. */
+#define SXS_NVME_ADMIN_INIT_SESSION_SUBMIT 0x93U
+#define SXS_NVME_ADMIN_INIT_SESSION_FETCH 0x94U
+#define SXS_NVME_ADMIN_INSTALL_POLICY 0x95U
+#define SXS_NVME_ADMIN_DEACTIVATE_POLICY 0x97U
+#define SXS_NVME_ADMIN_REMOVE_POLICY 0x99U
+#define SXS_NVME_ADMIN_ATTESTATION_FETCH 0x9aU
+#define SXS_NVME_ADMIN_ACTIVATE_POLICY 0x9bU
+#define SXS_NVME_ADMIN_UPDATE_POLICY 0x9dU
+#define SXS_NVME_ADMIN_ATTESTATION_SUBMIT 0x9fU
 
-// Note that we use -algorithm Ed25519 
-/* Custom NVMe vendor I/O opcodes for INIT_SESSION. */
-#define NVME_CMD_INIT_SESSION_SUBMIT  0x93
-#define NVME_CMD_INIT_SESSION_FETCH   0x94
-#define NVME_CMD_INSTALL_POLICY       0x95
-#define NVME_CMD_ACTIVATE_POLICY      0x9b
-#define NVME_CMD_DEACTIVATE_POLICY    0x97
-#define NVME_CMD_UPDATE_POLICY        0x9d
-#define NVME_CMD_REMOVE_POLICY        0x99
-#define NVME_CMD_POLICY_ATTESTATION_FETCH   0x9a
-#define NVME_CMD_POLICY_ATTESTATION_SUBMIT  0x9f
+#define SXS_SESSION_MODE_NORMAL 0U
+#define SXS_SESSION_MODE_CONFIDENTIAL 1U
 
-#define SESSION_MODE_NORMAL        0
-#define SESSION_MODE_CONFIDENTIAL  1
+#define SXS_INIT_SESSION_REQUEST_SIZE 105U
+#define SXS_INIT_SESSION_RESPONSE_SIZE 104U
 
-#define INIT_SESSION_REQUEST_SIZE   105
-#define INIT_SESSION_RESPONSE_SIZE  104
+#define SXS_META_INTERFACE_POLICY_ID 0xffff0001U
+#define SXS_META_INTERFACE_POLICY_VERSION 1U
 
-/* Meta interface policy init; implemented in meta-interface-policy.c */
-int m_interface_policy_init(struct ssd *ssd);
+#if !defined(__wasm__)
+#include <stddef.h>
+#include <stdint.h>
 
-/* Note that we use -algorithm Ed25519 */ 
-
-// The  manufacturer public key is embedded into the SSD by the manufacurer.
-static const uint8_t MANUFACTURER_PUBLIC_KEY[] = {
-    0x68, 0x48, 0xc3, 0x3d, 0xbe, 0xd2, 0x25, 0x0b, 0xe4, 0x22, 0xa4, 0x65,
-    0x99, 0xa4, 0x3f, 0x0d, 0x6a, 0x4a, 0x27, 0x64, 0xdd, 0xf9, 0xaf, 0x18,
-    0x94, 0x80, 0x54, 0xc5, 0xf2, 0x06, 0x78, 0xb7
-};
-
-// The admin public key is embedded into the firmware by the manufacturer. 
-// The manufacturer obtains it through a secure channel from the admin.
-static const uint8_t ADMIN_PUBLIC_KEY[] = {
-    0xb8, 0xde, 0xd4, 0x25, 0xfe, 0xf9, 0x63, 0x1f, 0x3f, 0xa1, 0x1c, 0x1c,
-    0xf2, 0xe1, 0x57, 0x94, 0xab, 0xae, 0xf9, 0xd5, 0xe0, 0x83, 0x75, 0xcb,
-    0x65, 0x71, 0xd9, 0x4e, 0xc4, 0xc3, 0x7e, 0xbc
-};
-
-// The admin certificate is a signature of the admin public key, signed by the manufacturer.
-// We use the manufacturer public key to verify the signature.
-static const uint8_t admin_cert_sig_bin[] = {
-    0x7e, 0xf9, 0xd0, 0xb6, 0x25, 0x3d, 0x37, 0x50, 0xad, 0xcb, 0xf9, 0x63,
-    0xff, 0xc8, 0x01, 0x0e, 0x6b, 0x1b, 0x8c, 0x88, 0x5b, 0x46, 0x61, 0x67,
-    0x0a, 0x9a, 0xe1, 0xc3, 0x38, 0x1c, 0xce, 0x38, 0x11, 0x56, 0xaa, 0xbb,
-    0xbf, 0x84, 0x7d, 0x45, 0xcb, 0x4b, 0xda, 0x04, 0x7b, 0x60, 0xfc, 0xb0,
-    0xb9, 0x13, 0xd7, 0x45, 0xce, 0xdb, 0x29, 0xf9, 0x10, 0x46, 0xc0, 0x71,
-    0xab, 0x3e, 0x2a, 0x0c
-  };
-
-struct admin_cert_t {
-    uint8_t public_key[32];
-    uint8_t signature[64];
-};
-
-
+/* Generated in the build directory from meta-interface-policy.wasm. */
+extern const uint8_t pe_meta_interface_policy_wasm[];
+extern const size_t pe_meta_interface_policy_wasm_size;
 #endif
+
+#endif /* META_INTERFACE_POLICY_H */

@@ -1,7 +1,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
-#include "policy-bpf-state.h"
-#include "policy/policy-bpf-abi.h"
+#include "policy-state.h"
+#include "policy/policy-wasm-abi.h"
 
 #include <openssl/crypto.h>
 
@@ -15,14 +15,14 @@ struct pe_policy_state_object {
 };
 
 struct pe_policy_state_store {
-    struct pe_policy_state_object objects[SXS_BPF_MAX_STATE_OBJECTS];
+    struct pe_policy_state_object objects[SXS_WASM_MAX_STATE_OBJECTS];
     uint32_t object_count;
     uint64_t bytes;
 };
 
 struct pe_policy_state_transaction {
     struct pe_policy_state_store *base;
-    struct pe_policy_state_object staged[SXS_BPF_MAX_STATE_OBJECTS];
+    struct pe_policy_state_object staged[SXS_WASM_MAX_STATE_OBJECTS];
     uint32_t staged_count;
     uint64_t staged_bytes;
     uint64_t *global_bytes;
@@ -34,7 +34,7 @@ static void state_object_release(struct pe_policy_state_object *object)
     if (!object || !object->data) {
         return;
     }
-    if (object->flags & SXS_BPF_STATE_SECRET) {
+    if (object->flags & SXS_STATE_SECRET) {
         OPENSSL_cleanse(object->data, object->bytes);
     }
     g_free(object->data);
@@ -105,16 +105,16 @@ static int state_access_offset(const struct pe_policy_state_object *object,
     if (!object || !offset_out || index >= object->element_count ||
         element_offset > object->element_size ||
         length > object->element_size - element_offset) {
-        return -SXS_BPF_EINVAL;
+        return -SXS_WASM_EINVAL;
     }
     if (index > UINT64_MAX / object->element_size) {
-        return -SXS_BPF_EOVERFLOW;
+        return -SXS_WASM_EOVERFLOW;
     }
     element_base = index * object->element_size;
     if (element_base > object->bytes ||
         element_offset > object->bytes - element_base ||
         length > object->bytes - element_base - element_offset) {
-        return -SXS_BPF_EOVERFLOW;
+        return -SXS_WASM_EOVERFLOW;
     }
     *offset_out = element_base + element_offset;
     return 0;
@@ -126,7 +126,7 @@ static int state_fill(struct pe_policy_state_object *object, uint64_t value)
     uint64_t offset;
 
     if (!object || object->element_size % sizeof(value) != 0) {
-        return -SXS_BPF_EINVAL;
+        return -SXS_WASM_EINVAL;
     }
     for (offset = 0; offset < object->bytes; offset += sizeof(value)) {
         memcpy(object->data + offset, &encoded, sizeof(encoded));
@@ -228,7 +228,7 @@ int pe_policy_state_transaction_commit(
         }
     }
     if (store->object_count + transaction->staged_count >
-        SXS_BPF_MAX_STATE_OBJECTS) {
+        SXS_WASM_MAX_STATE_OBJECTS) {
         if (!transaction->base) {
             g_free(store);
         }
@@ -259,9 +259,9 @@ int64_t pe_policy_state_create(struct pe_policy_state_transaction *transaction,
     int64_t rc;
 
     if (!transaction || object_id == 0 || element_size == 0 ||
-        element_size > SXS_BPF_MAX_STATE_ELEMENT_BYTES || element_count == 0 ||
-        (flags & ~(SXS_BPF_STATE_INIT_U64 | SXS_BPF_STATE_SECRET)) != 0) {
-        return -SXS_BPF_EINVAL;
+        element_size > SXS_WASM_MAX_STATE_ELEMENT_BYTES || element_count == 0 ||
+        (flags & ~(SXS_STATE_INIT_U64 | SXS_STATE_SECRET)) != 0) {
+        return -SXS_WASM_EINVAL;
     }
     if (transaction->global_lock) {
         qemu_mutex_lock(transaction->global_lock);
@@ -274,40 +274,40 @@ int64_t pe_policy_state_create(struct pe_policy_state_transaction *transaction,
         if (existing->element_size != element_size ||
             existing->element_count != element_count ||
             existing->flags != flags) {
-            rc = -SXS_BPF_EINVAL;
+            rc = -SXS_WASM_EINVAL;
         } else {
             rc = 0;
         }
         goto out;
     }
     if (element_count > UINT64_MAX / element_size) {
-        rc = -SXS_BPF_EOVERFLOW;
+        rc = -SXS_WASM_EOVERFLOW;
         goto out;
     }
     bytes = element_count * element_size;
     base_bytes = pe_policy_state_store_bytes(transaction->base);
-    if (bytes > SXS_BPF_MAX_STATE_BYTES_PER_POLICY ||
-        base_bytes > SXS_BPF_MAX_STATE_BYTES_PER_POLICY - bytes ||
+    if (bytes > SXS_WASM_MAX_STATE_BYTES_PER_POLICY ||
+        base_bytes > SXS_WASM_MAX_STATE_BYTES_PER_POLICY - bytes ||
         transaction->staged_bytes >
-            SXS_BPF_MAX_STATE_BYTES_PER_POLICY - base_bytes - bytes) {
-        rc = -SXS_BPF_ENOSPC;
+            SXS_WASM_MAX_STATE_BYTES_PER_POLICY - base_bytes - bytes) {
+        rc = -SXS_WASM_ENOSPC;
         goto out;
     }
 
     if ((transaction->base ? transaction->base->object_count : 0) +
-            transaction->staged_count >= SXS_BPF_MAX_STATE_OBJECTS) {
-        rc = -SXS_BPF_ENOSPC;
+            transaction->staged_count >= SXS_WASM_MAX_STATE_OBJECTS) {
+        rc = -SXS_WASM_ENOSPC;
         goto out;
     }
-    if (*transaction->global_bytes > SXS_BPF_MAX_STATE_BYTES_GLOBAL - bytes) {
-        rc = -SXS_BPF_ENOSPC;
+    if (*transaction->global_bytes > SXS_WASM_MAX_STATE_BYTES_GLOBAL - bytes) {
+        rc = -SXS_WASM_ENOSPC;
         goto out;
     }
 
     object = &transaction->staged[transaction->staged_count];
     object->data = g_try_malloc0(bytes);
     if (!object->data) {
-        rc = -SXS_BPF_ENOMEM;
+        rc = -SXS_WASM_ENOMEM;
         goto out;
     }
     object->object_id = object_id;
@@ -315,9 +315,9 @@ int64_t pe_policy_state_create(struct pe_policy_state_transaction *transaction,
     object->element_count = element_count;
     object->flags = flags;
     object->bytes = bytes;
-    if ((flags & SXS_BPF_STATE_INIT_U64) && state_fill(object, initial_u64) != 0) {
+    if ((flags & SXS_STATE_INIT_U64) && state_fill(object, initial_u64) != 0) {
         state_object_release(object);
-        rc = -SXS_BPF_EINVAL;
+        rc = -SXS_WASM_EINVAL;
         goto out;
     }
 
@@ -344,11 +344,11 @@ int64_t pe_policy_state_read(const struct pe_policy_state_store *store,
     int rc;
 
     if (!destination && length != 0) {
-        return -SXS_BPF_EINVAL;
+        return -SXS_WASM_EINVAL;
     }
     object = state_find_const(store, transaction, object_id);
     if (!object) {
-        return -SXS_BPF_ENOENT;
+        return -SXS_WASM_ENOENT;
     }
     rc = state_access_offset(object, index, element_offset, length, &offset);
     if (rc != 0) {
@@ -369,7 +369,7 @@ int64_t pe_policy_state_write(struct pe_policy_state_store *store,
     int rc;
 
     if (!source && length != 0) {
-        return -SXS_BPF_EINVAL;
+        return -SXS_WASM_EINVAL;
     }
     if (init_phase) {
         object = state_transaction_find_staged(transaction, object_id);
@@ -377,7 +377,7 @@ int64_t pe_policy_state_write(struct pe_policy_state_store *store,
         object = state_store_find(store, object_id);
     }
     if (!object) {
-        return init_phase ? -SXS_BPF_EPERM : -SXS_BPF_ENOENT;
+        return init_phase ? -SXS_WASM_EPERM : -SXS_WASM_ENOENT;
     }
     rc = state_access_offset(object, index, element_offset, length, &offset);
     if (rc != 0) {
@@ -400,7 +400,7 @@ int64_t pe_policy_state_fill_u64(
         object = state_store_find(store, object_id);
     }
     if (!object) {
-        return init_phase ? -SXS_BPF_EPERM : -SXS_BPF_ENOENT;
+        return init_phase ? -SXS_WASM_EPERM : -SXS_WASM_ENOENT;
     }
     return state_fill(object, value);
 }

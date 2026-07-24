@@ -7,9 +7,9 @@ POLICY_DIR="$BBSSD_DIR/policy"
 DEVICE="${1:-/dev/nvme0}"
 BASE_POLICY_ID="${2:-100}"
 BASE_POLICY_VERSION="${3:-1}"
-POLICY_PATH="${4:-$POLICY_DIR/signing-test-policy.bpf.o}"
-SIGNING_POLICY_PATH="$POLICY_DIR/signing-test-policy.bpf.o"
-KEY_SHARING_POLICY_PATH="$POLICY_DIR/key-sharing-policy.bpf.o"
+POLICY_PATH="${4:-$POLICY_DIR/signing-test-policy.wasm}"
+SIGNING_POLICY_PATH="$POLICY_DIR/signing-test-policy.wasm"
+KEY_SHARING_POLICY_PATH="$POLICY_DIR/key-sharing-policy.wasm"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 

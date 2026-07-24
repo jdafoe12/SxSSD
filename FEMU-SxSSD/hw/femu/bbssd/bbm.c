@@ -1,9 +1,8 @@
-// Bad block manager mapping (simple OP-aware placeholder)
+/* Bad-block mapping and controller-owned physical-storage mechanisms. */
 #include "./bbm.h"
 #include "./policy-engine.h"
 #include <assert.h>
-
-// TODO: Implement the BBM API!
+#include <openssl/crypto.h>
 
 static uint32_t bbm_phys_blks_per_plane(const struct bbm *ctx)
 {
@@ -27,7 +26,8 @@ static bool bbm_valid_phys_pba(const struct bbm *ctx, const struct pba *pba)
            pba->g.blk < bbm_phys_blks_per_plane(ctx);
 }
 
-int bbm_init(struct bbm *ctx, const BbCtrlParams *bbp, const struct ssdparams *phys)
+int bbm_init(struct bbm *ctx, const BbCtrlParams *bbp,
+             const struct ssdparams *phys)
 {
     uint32_t blks_per_pl_log;
     uint32_t blks_per_pl_phys;
@@ -67,18 +67,27 @@ int bbm_init(struct bbm *ctx, const BbCtrlParams *bbp, const struct ssdparams *p
     g->pgs_per_line = g->blks_per_line * g->pgs_per_blk;
     g->tt_lines = g->blks_per_lun_log;
 
-    g->secs_per_pg = bbp->secs_per_pg; /* TODO: I think the bbm_geom should mosly have pointers to the backend geometry? */
+    /*
+     * TODO(bbm-geometry): replace copied geometry with a shared read-only
+     * geometry view when the backend/BBM ownership boundary is finalized.
+     */
+    g->secs_per_pg = bbp->secs_per_pg;
     g->secsz = bbp->secsz;
 
     /* Allocate mapping table */
-    uint64_t total_entries = (uint64_t)g->nchs * g->luns_per_ch * g->blks_per_lun_log;
+    uint64_t total_entries =
+        (uint64_t)g->nchs * g->luns_per_ch * g->blks_per_lun_log;
     ctx->maptbl = g_malloc0(sizeof(struct pba) * total_entries);
 
-    /* Direct mapping for now: logical blk -> same physical blk within the lun */
-    /* TODO: check this logic. Intuitively it should be more simple*/ 
+    /*
+     * Initial identity mapping: logical blocks map to the same physical block
+     * in their LUN.  Bad-block handling will update these entries.
+     */
     for (uint32_t ch = 0; ch < g->nchs; ++ch) {
         for (uint32_t lun = 0; lun < g->luns_per_ch; ++lun) {
-            uint64_t base = ((uint64_t)ch * g->luns_per_ch + lun) * g->blks_per_lun_log;
+            uint64_t base =
+                ((uint64_t)ch * g->luns_per_ch + lun) *
+                g->blks_per_lun_log;
             for (uint32_t blk = 0; blk < g->blks_per_lun_log; ++blk) {
                 struct pba *p = &ctx->maptbl[base + blk];
                 p->g.ch = ch;
@@ -93,28 +102,6 @@ int bbm_init(struct bbm *ctx, const BbCtrlParams *bbp, const struct ssdparams *p
     ctx->total_phys_blks = (uint64_t)bbp->nchs * bbp->luns_per_ch *
                            bbp->pls_per_lun * bbm_phys_blks_per_plane(ctx);
     ctx->excluded_phys_blks = g_malloc0(ctx->total_phys_blks);
-
-    /* Initialize BBM Policy API */
-#if 0
-    ctx->policy_api = g_malloc0(sizeof(struct BbmPolicyAPI));
-    ctx->policy_api->version = 1;
-    ctx->policy_api->get_maptbl_entry = bbm_get_maptbl_entry;
-    ctx->policy_api->is_reserved_blk = bbm_is_reserved_blk;
-    ctx->policy_api->read = bbm_read;
-    ctx->policy_api->write = bbm_write;
-    ctx->policy_api->raw_read = bbm_raw_read;
-    ctx->policy_api->raw_write = bbm_raw_write;
-    ctx->policy_api->raw_erase = bbm_raw_erase;
-    ctx->policy_api->get_erase_cnt = bbm_get_erase_cnt;
-    ctx->policy_api->mark_block_bad = bbm_mark_block_bad;
-    ctx->policy_api->sanitize_block = bbm_sanitize_block;
-    ctx->policy_api->remap_block = bbm_remap_block;
-    ctx->policy_api->mark_page_valid = bbm_mark_page_valid;
-    ctx->policy_api->mark_page_invalid = bbm_mark_page_invalid;
-    ctx->policy_api->mark_block_free = bbm_mark_block_free;
-    ctx->policy_api->get_page_status = bbm_get_page_status;
-    ctx->policy_api->get_block_vpc_ipc = bbm_get_block_vpc_ipc;
-#endif
 
     return 0;
 }
@@ -158,6 +145,191 @@ int bbm_include_phys_blk_in_mapping(struct bbm *ctx, const struct pba *pba)
 
     ctx->excluded_phys_blks[bbm_phys_blk_slot_index(ctx, pba)] = 0;
     return 0;
+}
+
+int bbm_policy_storage_geometry(
+    const struct FtlBackend *fb, const struct bbm *ctx,
+    struct bbm_policy_storage_geometry *geometry)
+{
+    uint64_t page_size;
+
+    if (!fb || !ctx || !ctx->geom || !geometry) {
+        return -1;
+    }
+    page_size = (uint64_t)fb->sp.secs_per_pg * fb->sp.secsz;
+    if (page_size == 0 || page_size > UINT32_MAX) {
+        return -1;
+    }
+    *geometry = (struct bbm_policy_storage_geometry) {
+        .channels = fb->sp.nchs,
+        .luns_per_channel = fb->sp.luns_per_ch,
+        .planes_per_lun = fb->sp.pls_per_lun,
+        .logical_blocks_per_plane = ctx->geom->blks_per_pl_log,
+        .physical_blocks_per_plane = fb->sp.blks_per_pl,
+        .reserved_blocks_per_lun = ctx->reserved_per_lun,
+        .pages_per_block = fb->sp.pgs_per_blk,
+        .page_size = page_size,
+    };
+    return 0;
+}
+
+bool bbm_policy_storage_block_valid(const struct bbm *ctx,
+                                    const struct pba *block)
+{
+    return bbm_valid_phys_pba(ctx, block) &&
+           block->g.blk >= ctx->geom->blks_per_pl_log;
+}
+
+int bbm_policy_storage_claim(struct bbm *ctx, const struct pba *block)
+{
+    if (!bbm_policy_storage_block_valid(ctx, block) ||
+        bbm_is_excluded_phys_blk(ctx, block)) {
+        return -1;
+    }
+    return bbm_exclude_phys_blk_from_mapping(ctx, block);
+}
+
+int bbm_policy_storage_release(struct bbm *ctx, const struct pba *block)
+{
+    if (!bbm_policy_storage_block_valid(ctx, block)) {
+        return -1;
+    }
+    return bbm_include_phys_blk_in_mapping(ctx, block);
+}
+
+static int bbm_policy_storage_pages(
+    const struct FtlBackend *fb, const struct bbm *ctx,
+    const struct pba *blocks, uint32_t block_count, uint32_t length,
+    struct ppa **pages_out, uint32_t *page_count_out, uint32_t *page_size_out)
+{
+    struct ppa *pages;
+    uint64_t page_size_64;
+    uint64_t page_count_64;
+    uint32_t pages_per_block;
+    uint32_t page_count;
+    uint32_t page_size;
+    uint32_t i;
+
+    if (!fb || !ctx || !blocks || block_count == 0 || length == 0 ||
+        !pages_out || !page_count_out || !page_size_out) {
+        return -1;
+    }
+    for (i = 0; i < block_count; i++) {
+        if (!bbm_policy_storage_block_valid(ctx, &blocks[i])) {
+            return -1;
+        }
+    }
+    page_size_64 = (uint64_t)fb->sp.secs_per_pg * fb->sp.secsz;
+    pages_per_block = fb->sp.pgs_per_blk;
+    if (page_size_64 == 0 || page_size_64 > UINT32_MAX ||
+        pages_per_block == 0) {
+        return -1;
+    }
+    page_size = page_size_64;
+    page_count_64 = ((uint64_t)length + page_size - 1) / page_size;
+    if (page_count_64 == 0 || page_count_64 > UINT32_MAX ||
+        page_count_64 > (uint64_t)block_count * pages_per_block) {
+        return -1;
+    }
+    page_count = page_count_64;
+    pages = g_try_new0(struct ppa, page_count);
+    if (!pages) {
+        return -1;
+    }
+    for (i = 0; i < page_count; i++) {
+        const struct pba *block = &blocks[i / pages_per_block];
+
+        pages[i].g.ch = block->g.ch;
+        pages[i].g.lun = block->g.lun;
+        pages[i].g.pl = block->g.pl;
+        pages[i].g.blk = block->g.blk;
+        pages[i].g.pg = i % pages_per_block;
+    }
+    *pages_out = pages;
+    *page_count_out = page_count;
+    *page_size_out = page_size;
+    return 0;
+}
+
+int bbm_policy_storage_read(struct FtlBackend *fb, const struct bbm *ctx,
+                            const struct pba *blocks, uint32_t block_count,
+                            void *data, uint32_t length)
+{
+    struct ppa *pages = NULL;
+    uint8_t *padded = NULL;
+    uint32_t page_count;
+    uint32_t page_size;
+    size_t padded_length;
+    int rc = -1;
+
+    if (!data ||
+        bbm_policy_storage_pages(fb, ctx, blocks, block_count, length, &pages,
+                                 &page_count, &page_size) != 0 ||
+        (size_t)page_count > SIZE_MAX / page_size) {
+        return -1;
+    }
+    padded_length = (size_t)page_count * page_size;
+    padded = g_try_malloc0(padded_length);
+    if (padded &&
+        ftl_backend_raw_read(fb, padded, pages, page_count, page_size,
+                             NULL, 0, 0, NULL) == 0) {
+        memcpy(data, padded, length);
+        rc = 0;
+    }
+    if (padded) {
+        OPENSSL_cleanse(padded, padded_length);
+    }
+    g_free(padded);
+    g_free(pages);
+    return rc;
+}
+
+int bbm_policy_storage_write(struct FtlBackend *fb, const struct bbm *ctx,
+                             const struct pba *blocks, uint32_t block_count,
+                             const void *data, uint32_t length)
+{
+    struct ppa *pages = NULL;
+    uint8_t *padded = NULL;
+    uint32_t page_count;
+    uint32_t page_size;
+    size_t padded_length;
+    int rc = -1;
+
+    if (!data ||
+        bbm_policy_storage_pages(fb, ctx, blocks, block_count, length, &pages,
+                                 &page_count, &page_size) != 0 ||
+        (size_t)page_count > SIZE_MAX / page_size) {
+        return -1;
+    }
+    padded_length = (size_t)page_count * page_size;
+    padded = g_try_malloc0(padded_length);
+    if (padded) {
+        memcpy(padded, data, length);
+        if (ftl_backend_raw_write(fb, padded, pages, page_count, page_size,
+                                  NULL, 0, 0, NULL) == 0) {
+            rc = 0;
+        }
+        OPENSSL_cleanse(padded, padded_length);
+    }
+    g_free(padded);
+    g_free(pages);
+    return rc;
+}
+
+int bbm_policy_storage_erase(struct FtlBackend *fb, const struct bbm *ctx,
+                             const struct pba *blocks, uint32_t block_count)
+{
+    uint32_t i;
+
+    if (!fb || !ctx || !blocks || block_count == 0) {
+        return -1;
+    }
+    for (i = 0; i < block_count; i++) {
+        if (!bbm_policy_storage_block_valid(ctx, &blocks[i])) {
+            return -1;
+        }
+    }
+    return ftl_backend_raw_erase(fb, (struct pba *)blocks, block_count, NULL);
 }
 
 struct pba bbm_get_maptbl_entry(const struct bbm *ctx,
@@ -231,48 +403,99 @@ static inline enum FtlBackendEventType bbm_type_to_backend(enum BbmEventType typ
     return (type == BBM_EVENT_USER_IO) ? USER_IO : POLICY_IO;
 }
 
-/* Data path wrappers: translate pseudophysical -> physical and invoke backend */
+static struct ppa *bbm_translate_pages(const struct bbm *ctx,
+                                       const PseudoPpa *pages,
+                                       uint64_t page_count)
+{
+    struct ppa *physical = g_try_new0(struct ppa, page_count);
+    uint64_t i;
+
+    if (!physical) {
+        return NULL;
+    }
+    for (i = 0; i < page_count; i++) {
+        physical[i] = bbm_translate_pseudo_ppa(ctx, &pages[i]);
+    }
+    return physical;
+}
+
+static struct pba *bbm_translate_blocks(const struct bbm *ctx,
+                                        const PseudoPba *blocks,
+                                        uint64_t block_count)
+{
+    struct pba *physical = g_try_new0(struct pba, block_count);
+    uint64_t i;
+
+    if (!physical) {
+        return NULL;
+    }
+    for (i = 0; i < block_count; i++) {
+        physical[i] = bbm_get_maptbl_entry(ctx, &blocks[i]);
+    }
+    return physical;
+}
+
+static struct FtlBackendEvent *
+bbm_prepare_backend_event(const struct BbmEvent *event, uint64_t count,
+                          struct FtlBackendEvent *backend_event)
+{
+    if (!event) {
+        return NULL;
+    }
+    backend_event->cmd = bbm_cmd_to_backend(event->cmd);
+    backend_event->type = bbm_type_to_backend(event->type);
+    backend_event->stime = event->stime;
+    backend_event->status_list = g_new0(int, count);
+    return backend_event;
+}
+
+static void bbm_finish_backend_event(const struct bbm *ctx,
+                                     struct FtlBackend *fb,
+                                     struct BbmEvent *event,
+                                     struct FtlBackendEvent *backend_event)
+{
+    if (!event) {
+        return;
+    }
+    if (ctx->policy_engine) {
+        pe_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx,
+                                  backend_event);
+    }
+
+    /*
+     * TODO(error-event): inspect non-zero status entries here and publish the
+     * dedicated error event once its payload and ordering semantics are set.
+     * The operation event must remain synchronous because status_list is
+     * released immediately after dispatch.
+     */
+    event->lat = backend_event->lat;
+    event->count = backend_event->count;
+    g_free(backend_event->status_list);
+    backend_event->status_list = NULL;
+}
+
+/* Data path wrappers: translate pseudo-physical addresses and invoke backend. */
 
 int bbm_read(struct FtlBackend *fb, const struct bbm *ctx,
              struct NvmeRequest *req, PseudoPpa *ppas,
              uint64_t ppa_count, uint64_t page_size, struct BbmEvent *event)
 {
+    struct FtlBackendEvent backend_event = {0};
+    struct ppa *physical;
+    int rc;
+
     if (!fb || !ctx || !req || !ppas || !ppa_count || !page_size) {
         return -1;
     }
-
-    struct ppa *phys = g_malloc0(sizeof(struct ppa) * ppa_count);
-    int *bev_status = NULL;
-
-    if (!phys) {
+    physical = bbm_translate_pages(ctx, ppas, ppa_count);
+    if (!physical) {
         return -1;
     }
-    for (uint64_t i = 0; i < ppa_count; ++i) {
-        phys[i] = bbm_translate_pseudo_ppa(ctx, &ppas[i]);
-    }
-
-    struct FtlBackendEvent bev = {0};
-    if (event) {
-        bev.cmd = bbm_cmd_to_backend(event->cmd);
-        bev.type = bbm_type_to_backend(event->type);
-        bev.stime = event->stime;
-        /* Backend status semantics differ from BBM status. Allocate separately. */
-        if (ppa_count > 0) {
-            bev_status = g_malloc0(sizeof(int) * ppa_count);
-            bev.status_list = bev_status;
-        }
-    }
-
-    int rc = ftl_backend_read(fb, req, phys, ppa_count, page_size, event ? &bev : NULL);
-    if (event) {
-        if (ctx->policy_engine) {
-            pe_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
-        }
-        event->lat = bev.lat;
-        event->count = bev.count;
-    }
-    g_free(bev_status);
-    g_free(phys);
+    rc = ftl_backend_read(
+        fb, req, physical, ppa_count, page_size,
+        bbm_prepare_backend_event(event, ppa_count, &backend_event));
+    bbm_finish_backend_event(ctx, fb, event, &backend_event);
+    g_free(physical);
     return rc;
 }
 
@@ -280,41 +503,22 @@ int bbm_write(struct FtlBackend *fb, const struct bbm *ctx,
               struct NvmeRequest *req, PseudoPpa *ppas,
               uint64_t ppa_count, uint64_t page_size, struct BbmEvent *event)
 {
+    struct FtlBackendEvent backend_event = {0};
+    struct ppa *physical;
+    int rc;
+
     if (!fb || !ctx || !req || !ppas || !ppa_count || !page_size) {
         return -1;
     }
-
-    struct ppa *phys = g_malloc0(sizeof(struct ppa) * ppa_count);
-    int *bev_status = NULL;
-
-    if (!phys) {
+    physical = bbm_translate_pages(ctx, ppas, ppa_count);
+    if (!physical) {
         return -1;
     }
-    for (uint64_t i = 0; i < ppa_count; ++i) {
-        phys[i] = bbm_translate_pseudo_ppa(ctx, &ppas[i]);
-    }
-
-    struct FtlBackendEvent bev = {0};
-    if (event) {
-        bev.cmd = bbm_cmd_to_backend(event->cmd);
-        bev.type = bbm_type_to_backend(event->type);
-        bev.stime = event->stime;
-        if (ppa_count > 0) {
-            bev_status = g_malloc0(sizeof(int) * ppa_count);
-            bev.status_list = bev_status;
-        }
-    }
-
-    int rc = ftl_backend_write(fb, req, phys, ppa_count, page_size, event ? &bev : NULL);
-    if (event) {
-        if (ctx->policy_engine) {
-            pe_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
-        }
-        event->lat = bev.lat;
-        event->count = bev.count;
-    }
-    g_free(bev_status);
-    g_free(phys);
+    rc = ftl_backend_write(
+        fb, req, physical, ppa_count, page_size,
+        bbm_prepare_backend_event(event, ppa_count, &backend_event));
+    bbm_finish_backend_event(ctx, fb, event, &backend_event);
+    g_free(physical);
     return rc;
 }
 
@@ -324,42 +528,23 @@ int bbm_raw_read(struct FtlBackend *fb, const struct bbm *ctx,
              void *oob_buf, size_t oob_offset, size_t oob_len,
              struct BbmEvent *event)
 {
-    /* Note: buffer can be NULL for timing-only simulation (e.g., GC operations) */
+    struct FtlBackendEvent backend_event = {0};
+    struct ppa *physical;
+    int rc;
+
+    /* buffer may be NULL for timing-only simulation such as GC. */
     if (!fb || !ctx || !ppas || !ppa_count || !page_size) {
         return -1;
     }
-    struct ppa *phys = g_malloc0(sizeof(struct ppa) * ppa_count);
-    int *bev_status = NULL;
-
-    if (!phys) {
+    physical = bbm_translate_pages(ctx, ppas, ppa_count);
+    if (!physical) {
         return -1;
     }
-    for (uint64_t i = 0; i < ppa_count; ++i) {
-        phys[i] = bbm_translate_pseudo_ppa(ctx, &ppas[i]);
-    }
-    struct FtlBackendEvent bev = {0};
-    if (event) {
-        bev.cmd = bbm_cmd_to_backend(event->cmd);
-        bev.type = bbm_type_to_backend(event->type);
-        bev.stime = event->stime;
-        if (ppa_count > 0) {
-            bev_status = g_malloc0(sizeof(int) * ppa_count);
-            bev.status_list = bev_status;
-        }
-    }
-
-    int rc = ftl_backend_raw_read(fb, buffer, phys, ppa_count, page_size,
-                                  oob_buf, oob_offset, oob_len,
-                                  event ? &bev : NULL);
-    if (event) {
-        if (ctx->policy_engine) {
-            pe_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
-        }
-        event->lat = bev.lat;
-        event->count = bev.count;
-    }
-    g_free(bev_status);
-    g_free(phys);
+    rc = ftl_backend_raw_read(
+        fb, buffer, physical, ppa_count, page_size, oob_buf, oob_offset,
+        oob_len, bbm_prepare_backend_event(event, ppa_count, &backend_event));
+    bbm_finish_backend_event(ctx, fb, event, &backend_event);
+    g_free(physical);
     return rc;
 }
 
@@ -369,42 +554,23 @@ int bbm_raw_write(struct FtlBackend *fb, const struct bbm *ctx,
              const void *oob_buf, size_t oob_offset, size_t oob_len,
              struct BbmEvent *event)
 {
-    /* Note: buffer can be NULL for timing-only simulation (e.g., GC operations) */
+    struct FtlBackendEvent backend_event = {0};
+    struct ppa *physical;
+    int rc;
+
+    /* buffer may be NULL for timing-only simulation such as GC. */
     if (!fb || !ctx || !ppas || !ppa_count || !page_size) {
         return -1;
     }
-    struct ppa *phys = g_malloc0(sizeof(struct ppa) * ppa_count);
-    int *bev_status = NULL;
-
-    if (!phys) {
+    physical = bbm_translate_pages(ctx, ppas, ppa_count);
+    if (!physical) {
         return -1;
     }
-    for (uint64_t i = 0; i < ppa_count; ++i) {
-        phys[i] = bbm_translate_pseudo_ppa(ctx, &ppas[i]);
-    }
-    struct FtlBackendEvent bev = {0};
-    if (event) {
-        bev.cmd = bbm_cmd_to_backend(event->cmd);
-        bev.type = bbm_type_to_backend(event->type);
-        bev.stime = event->stime;
-        if (ppa_count > 0) {
-            bev_status = g_malloc0(sizeof(int) * ppa_count);
-            bev.status_list = bev_status;
-        }
-    }
-
-    int rc = ftl_backend_raw_write(fb, buffer, phys, ppa_count, page_size,
-                                   oob_buf, oob_offset, oob_len,
-                                   event ? &bev : NULL);
-    if (event) {
-        if (ctx->policy_engine) {
-            pe_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
-        }
-        event->lat = bev.lat;
-        event->count = bev.count;
-    }
-    g_free(bev_status);
-    g_free(phys);
+    rc = ftl_backend_raw_write(
+        fb, buffer, physical, ppa_count, page_size, oob_buf, oob_offset,
+        oob_len, bbm_prepare_backend_event(event, ppa_count, &backend_event));
+    bbm_finish_backend_event(ctx, fb, event, &backend_event);
+    g_free(physical);
     return rc;
 }
 
@@ -412,39 +578,22 @@ int bbm_raw_erase(struct FtlBackend *fb, const struct bbm *ctx,
               PseudoPba *pbns, uint64_t blk_count,
               struct BbmEvent *event)
 {
+    struct FtlBackendEvent backend_event = {0};
+    struct pba *physical;
+    int rc;
+
     if (!fb || !ctx || !pbns || !blk_count) {
         return -1;
     }
-    struct pba *phys = g_malloc0(sizeof(struct pba) * blk_count);
-    int *bev_status = NULL;
-
-    if (!phys) {
+    physical = bbm_translate_blocks(ctx, pbns, blk_count);
+    if (!physical) {
         return -1;
     }
-    for (uint64_t i = 0; i < blk_count; ++i) {
-        phys[i] = bbm_get_maptbl_entry(ctx, &pbns[i]);
-    }
-    struct FtlBackendEvent bev = {0};
-    if (event) {
-        bev.cmd = bbm_cmd_to_backend(event->cmd);
-        bev.type = bbm_type_to_backend(event->type);
-        bev.stime = event->stime;
-        if (blk_count > 0) {
-            bev_status = g_malloc0(sizeof(int) * blk_count);
-            bev.status_list = bev_status;
-        }
-    }
-
-    int rc = ftl_backend_raw_erase(fb, phys, blk_count, event ? &bev : NULL);
-    if (event) {
-        if (ctx->policy_engine) {
-            pe_dispatch_backend_event(ctx->policy_engine, fb, (struct bbm *)ctx, &bev);
-        }
-        event->lat = bev.lat;
-        event->count = bev.count;
-    }
-    g_free(bev_status);
-    g_free(phys);
+    rc = ftl_backend_raw_erase(
+        fb, physical, blk_count,
+        bbm_prepare_backend_event(event, blk_count, &backend_event));
+    bbm_finish_backend_event(ctx, fb, event, &backend_event);
+    g_free(physical);
     return rc;
 }
 
@@ -515,40 +664,14 @@ void bbm_set_policy_engine(struct bbm *ctx, struct policy_engine *pe)
     }
 }
 
-// TODO: Add bad block checking before performing requests from the backend.
-
-//--------------------------------------------------------------------------
-// -------------------------- BBM policy interface -------------------------
-//--------------------------------------------------------------------------
-
-// various functions that will be useful to handle failures reported by the ftl backend.
-
-// 1. Mark block bad /* note we do need to simulate a persistant bad block table. */
-// 2. Attempt erasure "sanitize" the bad block. (this is good for secure deletion. See redflash by Niusen Chen, Bo Chen)
-        // Note, redflash does not do the sanitization as part of bad block management. 
-        // it is performed later, and attached to the "ftl_write" event. 
-// 3. Remap the relevant pseudo physical address to a new physical address.
-// 4. Something to shrink the SSD, effectively remapping everything else.
-// 5. Read retry
-// 6. Move valid data to a new physical block address. 
-       // Note that this is distinct from the counterpart at a higher level, beacuse
-       // This performs the operation on the physical block space,
-       // while the higher level performs the operation on the pseudophysical space. 
-// 7. Move all data
-       // including invalid data.
-
-// Note that failure thresholds are implemented as policy. The policy determines which 
-// "events" are paid attention to. Each "status" is a unique event.
-//  - that is indeed a big part of policy
-
-// WE ALSO NEED RPC. In the secure deletion paper, an RPC is attached to the bad block management
-// This RPC backlinks to the duplicate data.
-// and, the backlink is inside the OOB.
-
-// Do we need to consider read disturb management? 
-
-/* Stub implementations for bad block management functions */
-/* TODO: These need proper implementations when bad block policy is developed */
+/*
+ * TODO(error-event): add bad-block checking and a dedicated error event before
+ * implementing policy-controlled thresholds.  The eventual mechanism set
+ * includes persistent bad-block marking, sanitization, remapping, capacity
+ * shrink, read retry, and physical valid/all-data movement.  Secure-deletion
+ * policies may also need OOB reverse pointers; read-disturb handling remains a
+ * separate decision.
+ */
 
 int bbm_mark_block_bad(struct FtlBackend *fb, const struct bbm *ctx,
                        const struct ppa *ppa)
@@ -576,5 +699,3 @@ int bbm_remap_block(struct FtlBackend *fb, const struct bbm *ctx,
     fprintf(stderr, "[BBM] bbm_remap_block() not yet implemented\n");
     return 0;
 }
-
-//--------------------------------------------------------------------------

@@ -5,48 +5,19 @@
 #include "../backend/ftl-backend.h"
 #include "policy-engine-types.h"
 
-// The essense of this layer is to 
-// provide a pseudophysical block address layer
-
-// Essentially, this layer is completely built on top of layer 0
-// which is the FTL-backend.
-
-// the complete FUNCTIONAL implementation of this layer is
-// that it will respond to events from the backend. 
-// These events are failure reports from the backend.
-
-// The events are completely defined in the backend,
-// and the pseudophysical block INTERFACE is standard.
-// The extensibility, to support different policies,
-// is achieved by providing specific functions that can be used to handle events.
-// The policy calls this api to handle events.
-
-// I think TABLES are key to the extensibility. 
-
-
-// Should provide a lightweight read/write/erase interface which wraps the raw interface.
-// The only difference is that the BBM is invoked.. This means that the operations are performed
-// over the pseudophysical blocks.
-
-// This is for the bbm backend. i.e. the "mapping engine".
-// It should map from pseudophysical address to ppa. 
-
-
-// IMPORTANT NOTE: we want to maintain parallelism. Thus, the "replaced" blocks should be in same (lun/channel?) as previous? 
-// Something like this. double think/check.
-
-
-
-
 /*
- * Pseudo-physical address types are aliases of the backend physical address
- * structs. BBM is responsible for translating between pseudo and physical.
+ * BBM provides the pseudo-physical address layer above the raw FTL backend.
+ * It translates host/FTL addresses, maintains overprovisioned-block mappings,
+ * and synchronously reports backend operations to the policy engine.
+ *
+ * Future remapping must preserve media parallelism by choosing a replacement
+ * in an appropriate channel/LUN/plane locality.  The exact constraint remains
+ * a bad-block-policy decision.
  */
 typedef struct ppa PseudoPpa;
 typedef struct pba PseudoPba;
 
 struct bbm;
-struct BbmPolicyAPI;
 struct policy_engine;
 
 /* Logical geometry (after OP/bad-block) maintained by BBM. */
@@ -79,59 +50,20 @@ struct bbm_geom {
     uint32_t secsz;
 };
 
-/* Forward declarations */
-struct BbmEvent;
-
 /*
- * BBM Policy API - Function pointer table for BBM operations
- * 
- * This structure provides a stable interface for policies to interact with
- * the BBM layer without requiring access to internal implementation details.
- * Plugins receive this API at runtime and use it to perform BBM operations.
- * This limits the internal details that Policies need to be exposed to.
+ * Geometry of the physical blocks reserved from the host-visible pseudo
+ * address space.  Privileged policies use this storage for controller-owned
+ * artifacts such as installed policy images.
  */
-
- /* TODO: I need to more carefully define what is exposed via this API. 
-          Some of these functions should be internal! (i.e. only exposed to bbm.c and ftl.c) */
-struct BbmPolicyAPI {
-    uint32_t version;  /* API version for compatibility checking */
-
-    /*
-     * Policy-visible BBM operations are intentionally commented out for now.
-     * BBM remains a mechanism-owned layer; FTL and BBM code should call bbm_*()
-     * directly rather than exposing raw/media-management entry points to policy.
-     */
-#if 0
-    struct pba (*get_maptbl_entry)(const struct bbm *ctx, const PseudoPba *ppba);
-    bool (*is_reserved_blk)(const struct bbm *ctx, uint32_t blk);
-    int (*read)(struct FtlBackend *fb, const struct bbm *ctx,
-                struct NvmeRequest *req, PseudoPpa *ppas,
-                uint64_t ppa_count, uint64_t page_size, struct BbmEvent *event);
-    int (*write)(struct FtlBackend *fb, const struct bbm *ctx,
-                 struct NvmeRequest *req, PseudoPpa *ppas,
-                 uint64_t ppa_count, uint64_t page_size, struct BbmEvent *event);
-    int (*raw_read)(struct FtlBackend *fb, const struct bbm *ctx,
-                    uint8_t *buffer, PseudoPpa *ppas,
-                    uint64_t ppa_count, uint64_t page_size, struct BbmEvent *event);
-    int (*raw_write)(struct FtlBackend *fb, const struct bbm *ctx,
-                     uint8_t *buffer, PseudoPpa *ppas,
-                     uint64_t ppa_count, uint64_t page_size, struct BbmEvent *event);
-    int (*raw_erase)(struct FtlBackend *fb, const struct bbm *ctx,
-                     PseudoPba *pbns, uint64_t blk_count, struct BbmEvent *event);
-    int (*get_erase_cnt)(const struct FtlBackend *fb, const struct bbm *ctx,
-                         const PseudoPba *ppba);
-    int (*mark_block_bad)(struct FtlBackend *fb, const struct bbm *ctx,
-                          const struct ppa *ppa);
-    int (*sanitize_block)(struct FtlBackend *fb, const struct bbm *ctx,
-                          const struct ppa *ppa);
-    int (*remap_block)(struct FtlBackend *fb, const struct bbm *ctx,
-                       const struct ppa *ppa);
-    void (*mark_page_valid)(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
-    void (*mark_page_invalid)(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
-    void (*mark_block_free)(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
-    int (*get_page_status)(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
-    void (*get_block_vpc_ipc)(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa, int *vpc, int *ipc);
-#endif
+struct bbm_policy_storage_geometry {
+    uint32_t channels;
+    uint32_t luns_per_channel;
+    uint32_t planes_per_lun;
+    uint32_t logical_blocks_per_plane;
+    uint32_t physical_blocks_per_plane;
+    uint32_t reserved_blocks_per_lun;
+    uint32_t pages_per_block;
+    uint32_t page_size;
 };
 
 /* Simple BBM context tracking reserved (OP) blocks per LUN. */
@@ -139,10 +71,10 @@ struct bbm {
     /* Reserved blocks per LUN for overprovisioning */
     uint32_t reserved_per_lun;
 
-    /* Flattened map: index = ((ch * luns_per_ch + lun) * blks_per_lun_log) + blk */
-    /* Since the mapping level is blocks, a pseudoppa can be mapped by a ppa by 
-     * changing only the block number. Since we keep overprovisioned blocks in each plane, 
-     * this is all that needs to change. */
+    /*
+     * Block-level map indexed by (channel, LUN, logical block).  The caller's
+     * plane and page coordinates remain unchanged during translation.
+     */
     struct pba *maptbl;
 
     /* Logical geometry (after overprovisioning) */
@@ -154,15 +86,10 @@ struct bbm {
     /* Generic bookkeeping for physical blocks excluded from pseudo allocation. */
     uint64_t total_phys_blks;
     uint8_t *excluded_phys_blks;
-    
-    /*
-     * BBM policy-visible API storage is intentionally disabled for now.
-     * Mechanism code should call bbm_*() directly.
-     */
-    /* struct BbmPolicyAPI *policy_api; */
 };
 
-int bbm_init(struct bbm *ctx, const BbCtrlParams *bbp, const struct ssdparams *phys);
+int bbm_init(struct bbm *ctx, const BbCtrlParams *bbp,
+             const struct ssdparams *phys);
 uint32_t bbm_blks_per_pl_log(const struct bbm *ctx);
 struct pba bbm_get_maptbl_entry(const struct bbm *ctx,
                                 const PseudoPba *ppba);
@@ -178,7 +105,28 @@ int bbm_exclude_phys_blk_from_mapping(struct bbm *ctx, const struct pba *pba);
 int bbm_include_phys_blk_in_mapping(struct bbm *ctx, const struct pba *pba);
 int bbm_translate_ppa(const struct bbm *ctx, const PseudoPpa *pppa, struct ppa *out);
 
-// Need raw functions and non-raw functions, like in the backend. (raw serve policies, while non-raw serve the host.)
+/*
+ * Controller-owned storage uses physical blocks outside the logical BBM
+ * address space.  Claims are currently global reservations, matching the
+ * single trusted meta-interface policy.  If privileged policies later require
+ * isolation from one another, this is the point at which owner identity must
+ * be added.
+ */
+int bbm_policy_storage_geometry(
+    const struct FtlBackend *fb, const struct bbm *ctx,
+    struct bbm_policy_storage_geometry *geometry);
+bool bbm_policy_storage_block_valid(const struct bbm *ctx,
+                                    const struct pba *block);
+int bbm_policy_storage_claim(struct bbm *ctx, const struct pba *block);
+int bbm_policy_storage_release(struct bbm *ctx, const struct pba *block);
+int bbm_policy_storage_read(struct FtlBackend *fb, const struct bbm *ctx,
+                            const struct pba *blocks, uint32_t block_count,
+                            void *data, uint32_t length);
+int bbm_policy_storage_write(struct FtlBackend *fb, const struct bbm *ctx,
+                             const struct pba *blocks, uint32_t block_count,
+                             const void *data, uint32_t length);
+int bbm_policy_storage_erase(struct FtlBackend *fb, const struct bbm *ctx,
+                             const struct pba *blocks, uint32_t block_count);
 
 enum BbmEventCmd {
     BBM_EVENT_READ,
@@ -191,15 +139,21 @@ enum BbmEventType {
     BBM_EVENT_USER_IO   = 1,
 };
 
-/* Event visible to FTL; BBM internally maps to backend events. */
-/* TODO: Right now this is unused. I.e. there is no policy attachment to bbm events! */
+/*
+ * FTL-facing operation metadata.  BBM maps this to FtlBackendEvent and
+ * synchronously dispatches the resulting backend event to policies.
+ *
+ * TODO(error-event): define a dedicated policy error event that carries the
+ * relevant non-zero status entries without conflating them with the operation
+ * notification itself.
+ */
 struct BbmEvent {
     enum BbmEventCmd cmd;
     enum BbmEventType type;
     uint32_t count;
-    int *status_list;    /* optional per-op status; allocated by caller if wanted */
-    int64_t stime;       /* request start time */
-    int64_t lat;         /* end-to-end latency as seen by BBM/FTL */
+    int *status_list; /* optional per-operation status storage */
+    int64_t stime;    /* request start time */
+    int64_t lat;      /* end-to-end latency as seen by BBM/FTL */
 };
 
 /* These are for serving NVMe requests directly. */
@@ -210,7 +164,7 @@ int bbm_write(struct FtlBackend *fb, const struct bbm *ctx,
               struct NvmeRequest *req, PseudoPpa *ppas,
               uint64_t ppa_count, uint64_t page_size, struct BbmEvent *event);
 
-/* These are for direct operations on the FTL backend, without involving the host. */
+/* Direct operations on the FTL backend, without involving the host. */
 int bbm_raw_read(struct FtlBackend *fb, const struct bbm *ctx,
                  uint8_t *buffer, PseudoPpa *ppas,
                  uint64_t ppa_count, uint64_t page_size,
@@ -234,43 +188,42 @@ int bbm_get_erase_cnt(const struct FtlBackend *fb, const struct bbm *ctx,
                       const PseudoPba *ppba);
 
 /* Page validity: BBM translates PseudoPpa -> ppa/pba and calls backend. */
-void bbm_mark_page_valid(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
-void bbm_mark_page_invalid(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
-void bbm_mark_block_free(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
-int bbm_get_page_status(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa);
-void bbm_get_block_vpc_ipc(struct FtlBackend *fb, const struct bbm *ctx, const PseudoPpa *ppa, int *vpc, int *ipc);
-
-/* Josh: Now, need to present an interface to the upper layer in order
- * to implement the bbm policy layer. This interface needs to be general enouph 
- * to support any concievable bbm policy.*/
-
+void bbm_mark_page_valid(struct FtlBackend *fb, const struct bbm *ctx,
+                         const PseudoPpa *ppa);
+void bbm_mark_page_invalid(struct FtlBackend *fb, const struct bbm *ctx,
+                           const PseudoPpa *ppa);
+void bbm_mark_block_free(struct FtlBackend *fb, const struct bbm *ctx,
+                         const PseudoPpa *ppa);
+int bbm_get_page_status(struct FtlBackend *fb, const struct bbm *ctx,
+                        const PseudoPpa *ppa);
+void bbm_get_block_vpc_ipc(struct FtlBackend *fb, const struct bbm *ctx,
+                           const PseudoPpa *ppa, int *vpc, int *ipc);
 
 void bbm_set_policy_engine(struct bbm *ctx, struct policy_engine *pe);
 
+/*
+ * Future bad-block/error-handling mechanisms.  These are intentionally kept
+ * as explicit design points even where implementation is incomplete:
+ * mark/sanitize/remap, capacity shrink, read retry, and physical data moves.
+ */
 int bbm_mark_block_bad(struct FtlBackend *fb, const struct bbm *ctx,
-                   const struct ppa *ppa);
+                       const struct ppa *ppa);
 
 int bbm_sanitize_block(struct FtlBackend *fb, const struct bbm *ctx,
-                   const struct ppa *ppa);
+                       const struct ppa *ppa);
 
 int bbm_remap_block(struct FtlBackend *fb, const struct bbm *ctx,
-                   const struct ppa *ppa);
+                    const struct ppa *ppa);
 
 int bbm_shrink_ssd(struct FtlBackend *fb, const struct bbm *ctx);
-// Need to see what is the ZNS / OCSSD strategy for BBM?
 
 int bbm_read_retry(struct FtlBackend *fb, const struct bbm *ctx,
                    const struct ppa *ppa);
 
 int bbm_move_valid_data(struct FtlBackend *fb, const struct bbm *ctx,
-                   const struct ppa *ppa);
+                        const struct ppa *ppa);
 
 int bbm_move_all_data(struct FtlBackend *fb, const struct bbm *ctx,
-                   const struct ppa *ppa);
-
-
-// I should actually have some "compiler" type thing.
-// It will take conditions on function calls and translate to 
-// events - so that all relevant events have the relevant functions called.
+                      const struct ppa *ppa);
 
 #endif

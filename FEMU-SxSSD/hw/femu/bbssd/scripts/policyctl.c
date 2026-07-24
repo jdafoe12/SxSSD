@@ -1637,8 +1637,8 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "Usage:\n"
                 "  %s [--mode normal|confidential] session <device>\n"
-                "  %s [--mode normal|confidential] install <device> <policy.bpf.o> <policy_id> <version>\n"
-                "  %s [--mode normal|confidential] update <device> <policy.bpf.o> <policy_id> <version>\n"
+                "  %s [--mode normal|confidential] install <device> <policy.wasm> <policy_id> <version>\n"
+                "  %s [--mode normal|confidential] update <device> <policy.wasm> <policy_id> <version>\n"
                 "  %s [--mode normal|confidential] activate <device> <policy_id>\n"
                 "  %s [--mode normal|confidential] deactivate <device> <policy_id>\n"
                 "  %s [--mode normal|confidential] remove <device> <policy_id>\n"

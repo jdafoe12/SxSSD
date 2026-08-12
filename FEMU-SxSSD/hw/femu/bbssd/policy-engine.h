@@ -53,7 +53,6 @@ struct runtime_policy_record {
     struct pe_wamr_vm *vm;
     struct pe_policy_state_store *state_store;
     QemuMutex execution_lock;
-    bool gc_active;
     uint64_t fault_count;
     struct pe_owned_oob owned_oob[MAX_POLICY_OWNED_OOB];
     uint32_t owned_oob_count;

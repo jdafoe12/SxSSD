@@ -71,8 +71,6 @@ int pe_activation_stage_oob(struct pe_policy_execution *execution,
 int pe_activation_stage_namespace_blob(
     struct pe_policy_execution *execution, uint32_t kind,
     uint32_t destination_offset, const void *source, uint32_t length);
-int pe_runtime_set_gc_active(struct pe_policy_execution *execution,
-                             uint32_t active);
 int pe_runtime_owned_oob_handle(const struct runtime_policy_record *owner,
                                 uint32_t object_id, uint32_t *bytes_out);
 

@@ -9,7 +9,7 @@ typedef __UINT64_TYPE__ sxs_u64;
 typedef __INT32_TYPE__ sxs_s32;
 typedef __INT64_TYPE__ sxs_s64;
 
-#define SXS_WASM_ABI_VERSION 1U
+#define SXS_WASM_ABI_VERSION 2U
 #define SXS_WASM_MAX_PAGE_BYTES 4096U
 #define SXS_WASM_MAX_ARTIFACT_BYTES (1024U * 1024U)
 #define SXS_WASM_MAX_SUBSCRIPTIONS_PER_POLICY 64U
@@ -53,15 +53,6 @@ enum sxs_policy_context_flags {
 enum sxs_state_flags {
     SXS_STATE_INIT_U64 = 1U << 0,
     SXS_STATE_SECRET = 1U << 1,
-};
-
-enum sxs_stats_counter {
-    SXS_STATS_GC_INVOCATIONS = 1,
-    SXS_STATS_GC_PAGES_MIGRATED = 2,
-    SXS_STATS_FOREGROUND_GC = 3,
-    SXS_STATS_BACKGROUND_GC = 4,
-    SXS_STATS_GC_TIME_NS = 5,
-    SXS_STATS_BLOCK_ERASES = 6,
 };
 
 enum sxs_eswd_range_operation {
@@ -137,16 +128,6 @@ struct sxs_eswd {
     sxs_u64 write_lba;
 };
 
-struct sxs_stats {
-    sxs_u64 host_read_commands, host_write_commands, host_trim_commands;
-    sxs_u64 host_read_sectors, host_write_sectors, host_trim_sectors;
-    sxs_u64 physical_page_reads, physical_page_programs, block_erases;
-    sxs_u64 gc_invocations, gc_pages_migrated;
-    sxs_u64 foreground_gc_count, background_gc_count, gc_time_ns;
-    sxs_u64 policy_dispatch_time_ns, bytes_copied;
-    sxs_u32 gc_active, reserved;
-};
-
 struct sxs_dsm_range {
     sxs_u32 attributes, lba_count;
     sxs_u64 start_lba;
@@ -198,7 +179,6 @@ _Static_assert(sizeof(struct sxs_pswd_event) == 24, "sxs_pswd_event ABI");
 _Static_assert(sizeof(struct sxs_geometry) == 80, "sxs_geometry ABI");
 _Static_assert(sizeof(struct sxs_layout) == 32, "sxs_layout ABI");
 _Static_assert(sizeof(struct sxs_eswd) == 24, "sxs_eswd ABI");
-_Static_assert(sizeof(struct sxs_stats) == 136, "sxs_stats ABI");
 _Static_assert(sizeof(struct sxs_dsm_range) == 16, "sxs_dsm_range ABI");
 _Static_assert(sizeof(struct sxs_namespace_config) == 40,
                "sxs_namespace_config ABI");
@@ -241,11 +221,6 @@ SXS_IMPORT("sxs_state_fill_u64")
 extern sxs_s32 sxs_state_fill_u64(sxs_u32, sxs_u64);
 SXS_IMPORT("sxs_backend_status_get")
 extern sxs_s32 sxs_backend_status_get(sxs_u64, sxs_s32 *, sxs_u32);
-SXS_IMPORT("sxs_stats_add")
-extern sxs_s32 sxs_stats_add(sxs_u32, sxs_u64);
-SXS_IMPORT("sxs_stats_gc_active_set")
-extern sxs_s32 sxs_stats_gc_active_set(sxs_u32);
-
 #define SXS_DECLARE_OUTPUT_IMPORT(name, type)                              \
     SXS_IMPORT(#name) extern sxs_s32 __##name(void *, sxs_u32);           \
     static inline sxs_s32 name(type *output)                              \
@@ -253,7 +228,6 @@ extern sxs_s32 sxs_stats_gc_active_set(sxs_u32);
 
 SXS_DECLARE_OUTPUT_IMPORT(sxs_geometry_get, struct sxs_geometry)
 SXS_DECLARE_OUTPUT_IMPORT(sxs_layout_get, struct sxs_layout)
-SXS_DECLARE_OUTPUT_IMPORT(sxs_stats_get, struct sxs_stats)
 #undef SXS_DECLARE_OUTPUT_IMPORT
 
 #define SXS_DECLARE_KEYED_OUTPUT_IMPORT(name, key_type, type)              \

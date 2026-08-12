@@ -16,7 +16,6 @@ QEMU_BUILD_BUG_ON(sizeof(struct sxs_policy_context) != 128);
 QEMU_BUILD_BUG_ON(sizeof(struct sxs_geometry) != 80);
 QEMU_BUILD_BUG_ON(sizeof(struct sxs_layout) != 32);
 QEMU_BUILD_BUG_ON(sizeof(struct sxs_eswd) != 24);
-QEMU_BUILD_BUG_ON(sizeof(struct sxs_stats) != 136);
 QEMU_BUILD_BUG_ON(sizeof(struct sxs_dsm_range) != 16);
 QEMU_BUILD_BUG_ON(sizeof(struct sxs_eswd_location) != 8);
 QEMU_BUILD_BUG_ON(sizeof(struct sxs_eswd_config) != 8);
@@ -178,55 +177,6 @@ int32_t pe_api_backend_status_get(struct pe_policy_execution *execution,
     return 0;
 }
 
-static uint64_t saturating_add_u64(uint64_t value, uint64_t increment)
-{
-    return increment > UINT64_MAX - value ? UINT64_MAX : value + increment;
-}
-
-int32_t pe_api_stats_add(struct pe_policy_execution *execution,
-                         uint32_t counter, uint64_t value)
-{
-    struct ssd_stats *stats;
-    uint64_t *destination;
-
-    execution = validated_execution(execution);
-    if (!phase_is(execution, SXS_PHASE_ACTION)) {
-        return -SXS_WASM_EPERM;
-    }
-    stats = &execution->engine->ssd->stats;
-    switch (counter) {
-    case SXS_STATS_GC_INVOCATIONS:
-        destination = &stats->gc_invocations;
-        break;
-    case SXS_STATS_GC_PAGES_MIGRATED:
-        destination = &stats->gc_pages_migrated;
-        break;
-    case SXS_STATS_FOREGROUND_GC:
-        destination = &stats->foreground_gc_count;
-        break;
-    case SXS_STATS_BACKGROUND_GC:
-        destination = &stats->background_gc_count;
-        break;
-    case SXS_STATS_GC_TIME_NS:
-        destination = &stats->gc_time_ns;
-        break;
-    case SXS_STATS_BLOCK_ERASES:
-        destination = &stats->block_erases;
-        break;
-    default:
-        return -SXS_WASM_EINVAL;
-    }
-    *destination = saturating_add_u64(*destination, value);
-    return 0;
-}
-
-int32_t pe_api_stats_gc_active_set(struct pe_policy_execution *execution,
-                                   uint32_t active)
-{
-    execution = validated_execution(execution);
-    return pe_runtime_set_gc_active(execution, active);
-}
-
 int32_t pe_api_geometry_get(struct pe_policy_execution *execution,
                             struct sxs_geometry *destination)
 {
@@ -362,38 +312,6 @@ int32_t pe_api_page_status_get(struct pe_policy_execution *execution,
     return status;
 }
 
-int32_t pe_api_stats_get(struct pe_policy_execution *execution,
-                         struct sxs_stats *destination)
-{
-    const struct ssd_stats *source;
-
-    execution = validated_execution(execution);
-    if (!execution || !destination) {
-        return -SXS_WASM_EINVAL;
-    }
-    source = &execution->engine->ssd->stats;
-    *destination = (struct sxs_stats){
-        .host_read_commands = source->host_read_cmds,
-        .host_write_commands = source->host_write_cmds,
-        .host_trim_commands = source->host_trim_cmds,
-        .host_read_sectors = source->host_read_sectors,
-        .host_write_sectors = source->host_write_sectors,
-        .host_trim_sectors = source->host_trim_sectors,
-        .physical_page_reads = source->phys_page_reads,
-        .physical_page_programs = source->phys_page_programs,
-        .block_erases = source->block_erases,
-        .gc_invocations = source->gc_invocations,
-        .gc_pages_migrated = source->gc_pages_migrated,
-        .foreground_gc_count = source->foreground_gc_count,
-        .background_gc_count = source->background_gc_count,
-        .gc_time_ns = source->gc_time_ns,
-        .policy_dispatch_time_ns = source->policy_dispatch_time_ns,
-        .bytes_copied = source->bytes_copied,
-        .gc_active = source->gc_active,
-    };
-    return 0;
-}
-
 static struct NvmeCommandEvent *
 nvme_execution_event(struct pe_policy_execution *execution)
 {
@@ -427,9 +345,6 @@ int32_t pe_api_request_read(struct pe_policy_execution *execution,
     if (length) {
         memcpy(destination, copy, length);
     }
-    if (phase_is(execution, SXS_PHASE_ACTION)) {
-        execution->engine->ssd->stats.bytes_copied += length;
-    }
     g_free(copy);
     return 0;
 }
@@ -449,9 +364,6 @@ int32_t pe_api_request_write(struct pe_policy_execution *execution,
         ftl_write_request_data(event->req, source, request_offset, length) !=
             length) {
         return -SXS_WASM_EIO;
-    }
-    if (phase_is(execution, SXS_PHASE_ACTION)) {
-        execution->engine->ssd->stats.bytes_copied += length;
     }
     return 0;
 }
@@ -484,9 +396,6 @@ int32_t pe_api_command_read(struct pe_policy_execution *execution,
     event = nvme_execution_event(execution);
     result = command_transfer_result(
         ftl_command_data_read(event, command_offset, destination, length));
-    if (result == 0 && phase_is(execution, SXS_PHASE_ACTION)) {
-        execution->engine->ssd->stats.bytes_copied += length;
-    }
     return result;
 }
 
@@ -504,9 +413,6 @@ int32_t pe_api_command_write(struct pe_policy_execution *execution,
     event = nvme_execution_event(execution);
     result = command_transfer_result(
         ftl_command_data_write(event, command_offset, source, length));
-    if (result == 0) {
-        execution->engine->ssd->stats.bytes_copied += length;
-    }
     return result;
 }
 
@@ -895,8 +801,6 @@ pe_api_eswd_stage_write(struct pe_policy_execution *execution,
         ppa = last_ppa.ppa;
     }
     g_free(buffer);
-    execution->engine->ssd->stats.bytes_copied = saturating_add_u64(
-        execution->engine->ssd->stats.bytes_copied, buffer_length);
     return write_page_result(
         result, 0, ppa == UINT64_MAX ? 0 : request->lba_count, ppa, latency);
 }

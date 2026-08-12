@@ -310,16 +310,12 @@ static sxs_s64 block_gc(struct sxs_policy_context *context,
 {
     struct sxs_page_result result;
     sxs_u32 victim;
-    sxs_u64 migrated = 0;
-    sxs_u64 gc_start;
 
     if (block_select_victim(context, metadata, force, &victim) != 0 ||
         block_state_write_class(context, victim,
                                 BLOCK_ESWD_RECLAIMING) != 0) {
         return -SXS_WASM_ENOENT;
     }
-    gc_start = sxs_time_now_ns();
-    sxs_stats_gc_active_set(1);
     for (sxs_u32 page_index = 0;
          page_index < metadata->pages_per_eswd; page_index++) {
         sxs_u64 source_ppa;
@@ -337,12 +333,10 @@ static sxs_s64 block_gc(struct sxs_policy_context *context,
             continue;
         }
         if (block_rotate_if_full(context, metadata) != 0) {
-            sxs_stats_gc_active_set(0);
             return -SXS_WASM_ENOSPC;
         }
         if (sxs_page_migrate(source_ppa, metadata->current_eswd,
                              &result) != 0 || result.status != 0) {
-            sxs_stats_gc_active_set(0);
             return -SXS_WASM_EIO;
         }
         source_dense_index = sxs_ppa_to_page_index(source_ppa);
@@ -352,40 +346,26 @@ static sxs_s64 block_gc(struct sxs_policy_context *context,
             lpn != BLOCK_UNMAPPED && lpn < metadata->total_logical_pages) {
             if (block_update_mapping(context, lpn, source_ppa,
                                      result.ppa) != 0) {
-                sxs_stats_gc_active_set(0);
                 return -SXS_WASM_EIO;
             }
         }
         if (BLOCK_GC_AFTER_MIGRATE(context, source_ppa, result.ppa,
                                    lpn) != 0) {
-            sxs_stats_gc_active_set(0);
             return -SXS_WASM_EIO;
         }
-        migrated++;
     }
     if (BLOCK_GC_BEFORE_ERASE(context, victim, metadata) != 0) {
-        sxs_stats_gc_active_set(0);
         return -SXS_WASM_EIO;
     }
     sxs_eswd_erase(victim);
     if (sxs_eswd_reset(victim) != 0 ||
         block_state_write_class(context, victim, BLOCK_ESWD_FREE) != 0) {
-        sxs_stats_gc_active_set(0);
         return -SXS_WASM_EIO;
     }
     metadata->free_eswds++;
     if (block_write_metadata(metadata) != 0) {
-        sxs_stats_gc_active_set(0);
         return -SXS_WASM_EIO;
     }
-    sxs_stats_add(SXS_STATS_GC_INVOCATIONS, 1);
-    sxs_stats_add(SXS_STATS_GC_PAGES_MIGRATED, migrated);
-    sxs_stats_add(force ? SXS_STATS_FOREGROUND_GC :
-                          SXS_STATS_BACKGROUND_GC,
-                  1);
-    sxs_stats_add(SXS_STATS_GC_TIME_NS,
-                  sxs_time_now_ns() - gc_start);
-    sxs_stats_gc_active_set(0);
     return 0;
 }
 

@@ -45,7 +45,6 @@ META_INTERFACE_LDFLAGS = \
 	-Wl,-z,stack-size=65536
 
 PRODUCTION_POLICIES = \
-	block-interface-policy-eval.wasm \
 	block-interface-policy-baseline.wasm \
 	block-interface-policy-flashguard.wasm \
 	block-interface-flashguard-policy.wasm \
@@ -65,7 +64,6 @@ NEGATIVE_FIXTURES = wasm-forbidden-policy.wasm \
 GENERATED = $(PRODUCTION_POLICIES) $(TEST_POLICIES) $(NEGATIVE_FIXTURES) \
 		$(META_INTERFACE_POLICY)
 LEGACY_ARTIFACTS = \
-	block-interface-policy-eval.so \
 	block-interface-policy-baseline.so \
 	block-interface-policy-flashguard.so \
 	block-interface-flashguard-policy.so \
@@ -98,7 +96,6 @@ check-imports:
 BLOCK_DEPS = block-policy-wasm-core.h policy-wasm-abi.h
 FLASHGUARD_DEPS = flashguard-wasm-core.h $(BLOCK_DEPS)
 
-block-interface-policy-eval.wasm: block-interface-policy-eval.c $(BLOCK_DEPS)
 block-interface-policy-baseline.wasm: block-interface-policy-baseline.c $(BLOCK_DEPS)
 block-interface-policy-flashguard.wasm: block-interface-policy-flashguard.c $(FLASHGUARD_DEPS)
 block-interface-flashguard-policy.wasm: block-interface-flashguard-policy.c $(FLASHGUARD_DEPS)

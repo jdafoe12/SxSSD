@@ -61,14 +61,6 @@ mkdir -p "$FEMU_HOST_RESULTS_DIR"
 FEMU_HOST_RESULTS_DIR="$(realpath "$FEMU_HOST_RESULTS_DIR")"
 echo "FEMU host results dir: $FEMU_HOST_RESULTS_DIR"
 
-# Stats output directory: FEMU writes stats_<run_id>.json here directly (host-side path).
-# Override by setting FEMU_STATS_DIR in the environment before running this script.
-if [[ -z "${FEMU_STATS_DIR:-}" ]]; then
-    FEMU_STATS_DIR="${FEMU_HOST_RESULTS_DIR}/stats"
-fi
-mkdir -p "$FEMU_STATS_DIR"
-echo "FEMU stats dir: $FEMU_STATS_DIR"
-
 if [[ ! -e "$OSIMGF" ]]; then
 	echo ""
 	echo "VM disk image couldn't be found ..."
@@ -78,7 +70,7 @@ if [[ ! -e "$OSIMGF" ]]; then
 	exit
 fi
 
-sudo env FEMU_STATS_DIR="${FEMU_STATS_DIR}" ./qemu-system-x86_64 \
+sudo ./qemu-system-x86_64 \
     -name "FEMU-BBSSD-VM" \
     -enable-kvm \
     -cpu host \

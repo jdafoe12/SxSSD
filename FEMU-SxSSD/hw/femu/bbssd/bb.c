@@ -1,7 +1,6 @@
 #include "../nvme.h"
 #include "./ftl.h"
 #include "./policy-engine.h"
-#include "qemu/timer.h"
 
 static void bb_init_ctrl_str(FemuCtrl *n)
 {
@@ -78,16 +77,6 @@ static void bb_flip(FemuCtrl *n, NvmeCmd *cmd)
         n->print_log = false;
         femu_log("%s,Log print [Disabled]!\n", n->devname);
         break;
-    case FEMU_STATS_RESET:
-        ssd_stats_reset(ssd);
-        femu_log("%s,Stats reset\n", n->devname);
-        break;
-    case FEMU_STATS_DUMP: {
-        uint32_t run_id = (uint32_t)le64_to_cpu(cmd->cdw11);
-        ssd_stats_dump_json(ssd, run_id);
-        femu_log("%s,Stats dumped run_id=%u\n", n->devname, run_id);
-        break;
-    }
     default:
         printf("FEMU:%s,Not implemented flip cmd (%lu)\n", n->devname, cdw10);
     }
@@ -178,22 +167,7 @@ static uint16_t bb_admin_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
                 .status = NVME_SUCCESS,
             };
 
-            {
-                uint64_t cpu_t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-                uint64_t cpu_t1;
-
-                pe_dispatch_admin_cmd(ssd->policy_engine, ssd, &event);
-                cpu_t1 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-                if (ssd->cpu_scale_factor > 1.0) {
-                    uint64_t extra_ns = (uint64_t)((cpu_t1 - cpu_t0) *
-                                                   (ssd->cpu_scale_factor - 1.0));
-                    uint64_t deadline = cpu_t1 + extra_ns;
-
-                    while (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) < deadline) {
-                        /* spin */
-                    }
-                }
-            }
+            pe_dispatch_admin_cmd(ssd->policy_engine, ssd, &event);
             return event.status;
         }
         return NVME_INVALID_OPCODE | NVME_DNR;

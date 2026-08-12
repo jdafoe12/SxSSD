@@ -63,38 +63,6 @@ enum {
     FEMU_RESET_ACCT = 5,
     FEMU_ENABLE_LOG = 6,
     FEMU_DISABLE_LOG = 7,
-
-    FEMU_STATS_RESET = 8,
-    FEMU_STATS_DUMP  = 9,
-};
-
-#define FEMU_STATS_DIR_ENV "FEMU_STATS_DIR"
-
-/* Per-run statistics counters; reset/dumped via bb_flip FEMU_STATS_RESET/DUMP. */
-struct ssd_stats {
-    /* Host I/O command counts */
-    uint64_t host_read_cmds;
-    uint64_t host_write_cmds;
-    uint64_t host_trim_cmds;
-    /* Host I/O sector counts */
-    uint64_t host_read_sectors;
-    uint64_t host_write_sectors;
-    uint64_t host_trim_sectors;
-    /* Physical page / block operations */
-    uint64_t phys_page_reads;
-    uint64_t phys_page_programs;
-    uint64_t block_erases;
-    /* GC activity */
-    uint64_t gc_invocations;
-    uint64_t gc_pages_migrated;
-    uint64_t foreground_gc_count;
-    uint64_t background_gc_count;
-    uint64_t gc_time_ns;
-    bool     gc_active;
-    /* Policy-engine overhead */
-    uint64_t policy_dispatch_time_ns;
-    /* Data copy volume */
-    uint64_t bytes_copied;
 };
 
 
@@ -232,21 +200,9 @@ struct ssd { // This needs to be dissected and probably renamed
     /* Common runtime and dispatcher for installed and built-in policies. */
     struct policy_engine *policy_engine;
 
-    /*
-     * CPU frequency scaling factor: host_mhz / ctrl_mhz.
-     * Applied to policy dispatch wall-clock time to model a slower SSD
-     * controller CPU.
-     */
-    /* Evaluation-time controller/host CPU frequency ratio. */
-    double cpu_scale_factor;
-
-    /* Per-run statistics counters; reset/dumped via FEMU_STATS_RESET/DUMP flip */
-    struct ssd_stats stats;
 };
 
 void ssd_init(FemuCtrl *n);
-void ssd_stats_reset(struct ssd *ssd);
-void ssd_stats_dump_json(struct ssd *ssd, uint32_t run_id);
 
 /* Trusted boot-time FTL configuration, committed during policy activation. */
 void set_eswd_config(struct ssd *ssd, const struct eswd_config *config);

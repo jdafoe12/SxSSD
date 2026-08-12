@@ -147,17 +147,6 @@ static int32_t import_backend_status_get(wasm_exec_env_t env, uint64_t index,
     return result;
 }
 
-static int32_t import_stats_add(wasm_exec_env_t env, uint32_t counter,
-                                uint64_t value)
-{
-    return pe_api_stats_add(execution_from_env(env), counter, value);
-}
-
-static int32_t import_stats_gc_active_set(wasm_exec_env_t env, uint32_t active)
-{
-    return pe_api_stats_gc_active_set(execution_from_env(env), active);
-}
-
 #define DEFINE_OUTPUT_IMPORT(name, type)                                       \
     static int32_t import_##name(wasm_exec_env_t env, void *output,            \
                                  uint32_t output_size)                         \
@@ -176,7 +165,6 @@ static int32_t import_stats_gc_active_set(wasm_exec_env_t env, uint32_t active)
 
 DEFINE_OUTPUT_IMPORT(geometry_get, struct sxs_geometry)
 DEFINE_OUTPUT_IMPORT(layout_get, struct sxs_layout)
-DEFINE_OUTPUT_IMPORT(stats_get, struct sxs_stats)
 #undef DEFINE_OUTPUT_IMPORT
 
 #define DEFINE_KEYED_OUTPUT_IMPORT(name, key_type, type)                       \

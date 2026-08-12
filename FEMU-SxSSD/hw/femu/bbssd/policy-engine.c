@@ -51,7 +51,6 @@ static void runtime_policy_clear_identity(struct runtime_policy_record *record)
     record->state = PE_RUNTIME_INACTIVE;
     record->vm = NULL;
     record->state_store = NULL;
-    record->gc_active = false;
     record->fault_count = 0;
     record->owned_oob_count = 0;
     memset(record->owned_oob, 0, sizeof(record->owned_oob));
@@ -295,26 +294,6 @@ int pe_activation_stage_namespace_blob(
         memcpy(destination + destination_offset, source, length);
         memset(written + destination_offset, 1, length);
     }
-    return 0;
-}
-
-int pe_runtime_set_gc_active(struct pe_policy_execution *execution,
-                             uint32_t active)
-{
-    bool any_active = false;
-    int i;
-
-    if (!execution || !execution->engine || !execution->owner ||
-        execution->authoritative_phase != SXS_PHASE_ACTION || active > 1) {
-        return -SXS_WASM_EPERM;
-    }
-    qemu_mutex_lock(&execution->engine->management_lock);
-    execution->owner->gc_active = active;
-    for (i = 0; i < MAX_RUNTIME_POLICIES; i++) {
-        any_active |= execution->engine->runtime_policies[i].gc_active;
-    }
-    execution->engine->ssd->stats.gc_active = any_active;
-    qemu_mutex_unlock(&execution->engine->management_lock);
     return 0;
 }
 
@@ -1347,16 +1326,11 @@ int pe_deactivate_policy(struct policy_engine *pe, uint32_t policy_id)
     qemu_mutex_lock(&record->execution_lock);
     vm = record->vm;
     record->vm = NULL;
-    record->gc_active = false;
     pe_wamr_vm_destroy(vm);
     qemu_mutex_unlock(&record->execution_lock);
 
     qemu_mutex_lock(&pe->management_lock);
     record->state = PE_RUNTIME_INACTIVE;
-    pe->ssd->stats.gc_active = false;
-    for (slot = 0; slot < MAX_RUNTIME_POLICIES; slot++) {
-        pe->ssd->stats.gc_active |= pe->runtime_policies[slot].gc_active;
-    }
     qemu_mutex_unlock(&pe->management_lock);
     return 0;
 }

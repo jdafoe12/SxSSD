@@ -119,7 +119,6 @@ static uint64_t ftl_write_pages_raw(struct ssd *ssd, const uint8_t *buffer,
     for (uint32_t i = 0; i < page_count; i++) {
         mark_page_valid(ssd, &ppas[i]);
     }
-    ssd->stats.phys_page_programs += page_count;
     return (uint64_t)event.lat;
 }
 
@@ -244,7 +243,6 @@ int ftl_policy_page_read(struct ssd *ssd, const PseudoPpa *ppa,
     }
     *latency_out = read_page_buffer(ssd, ppa, page_data, oob_handle, oob_data,
                                     stime_ns);
-    ssd->stats.phys_page_reads++;
     return 0;
 }
 
@@ -400,7 +398,6 @@ uint64_t ftl_read_eswd_page(struct ssd *ssd, uint32_t eswd_id,
     if (eswd_id_to_ppa_wrapper(ssd, eswd_id, page_index, &ppa) != 0) {
         return 0;
     }
-    ssd->stats.phys_page_reads++;
     return read_page_buffer(ssd, &ppa, buf_out, -1, NULL, stime_ns);
 }
 
@@ -1153,12 +1150,6 @@ uint64_t ftl_eswd_erase_physical(struct ssd *ssd, uint32_t eswd_id, int64_t stim
     }
 
     g_free(bbm_ev.status_list);
-    if (layout->blks_per_eswd >
-        UINT64_MAX - ssd->stats.block_erases) {
-        ssd->stats.block_erases = UINT64_MAX;
-    } else {
-        ssd->stats.block_erases += layout->blks_per_eswd;
-    }
     return maxlat;
 }
 
@@ -1230,8 +1221,6 @@ int ftl_policy_page_migrate(struct ssd *ssd, const PseudoPpa *source,
     source_eswd->ipc++;
     destination_eswd->vpc++;
     eswd_increment_wp(ssd, destination_eswd_id);
-    ssd->stats.phys_page_reads++;
-    ssd->stats.phys_page_programs++;
     *latency_out = MAX((uint64_t)read_event.lat,
                        (uint64_t)write_event.lat);
     rc = 0;
@@ -1387,11 +1376,6 @@ void ssd_init(FemuCtrl *n)
         abort();
     }
 
-    ftl_assert(n->bb_params.host_mhz > 0);
-    ftl_assert(n->bb_params.ctrl_mhz > 0);
-    ssd->cpu_scale_factor =
-        (double)n->bb_params.host_mhz / n->bb_params.ctrl_mhz;
-
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
                        QEMU_THREAD_JOINABLE);
 }
@@ -1443,55 +1427,6 @@ void mark_block_free(struct ssd *ssd, PseudoPpa *ppa)
     bbm_mark_block_free(ssd->fb, ssd->bbm, ppa);
 }
 
-void ssd_stats_reset(struct ssd *ssd)
-{
-    memset(&ssd->stats, 0, sizeof(ssd->stats));
-}
-
-void ssd_stats_dump_json(struct ssd *ssd, uint32_t run_id)
-{
-    const char *dir = getenv(FEMU_STATS_DIR_ENV);
-    char path[512];
-    FILE *f;
-
-    if (!dir || !*dir) {
-        printf("FEMU: ssd_stats_dump_json: %s not set, skipping dump\n",
-               FEMU_STATS_DIR_ENV);
-        return;
-    }
-
-    snprintf(path, sizeof(path), "%s/stats_%u.json", dir, run_id);
-    f = fopen(path, "w");
-    if (!f) {
-        printf("FEMU: ssd_stats_dump_json: failed to open %s: %s\n",
-               path, strerror(errno));
-        return;
-    }
-
-    fprintf(f, "{\n");
-    fprintf(f, "  \"run_id\": %u,\n", run_id);
-    fprintf(f, "  \"host_read_cmds\": %lu,\n",      ssd->stats.host_read_cmds);
-    fprintf(f, "  \"host_write_cmds\": %lu,\n",     ssd->stats.host_write_cmds);
-    fprintf(f, "  \"host_trim_cmds\": %lu,\n",      ssd->stats.host_trim_cmds);
-    fprintf(f, "  \"host_read_sectors\": %lu,\n",   ssd->stats.host_read_sectors);
-    fprintf(f, "  \"host_write_sectors\": %lu,\n",  ssd->stats.host_write_sectors);
-    fprintf(f, "  \"host_trim_sectors\": %lu,\n",   ssd->stats.host_trim_sectors);
-    fprintf(f, "  \"phys_page_reads\": %lu,\n",     ssd->stats.phys_page_reads);
-    fprintf(f, "  \"phys_page_programs\": %lu,\n",  ssd->stats.phys_page_programs);
-    fprintf(f, "  \"block_erases\": %lu,\n",         ssd->stats.block_erases);
-    fprintf(f, "  \"gc_invocations\": %lu,\n",       ssd->stats.gc_invocations);
-    fprintf(f, "  \"gc_pages_migrated\": %lu,\n",    ssd->stats.gc_pages_migrated);
-    fprintf(f, "  \"foreground_gc_count\": %lu,\n",  ssd->stats.foreground_gc_count);
-    fprintf(f, "  \"background_gc_count\": %lu,\n",  ssd->stats.background_gc_count);
-    fprintf(f, "  \"gc_time_ns\": %lu,\n",            ssd->stats.gc_time_ns);
-    fprintf(f, "  \"policy_dispatch_time_ns\": %lu,\n", ssd->stats.policy_dispatch_time_ns);
-    fprintf(f, "  \"bytes_copied\": %lu\n",          ssd->stats.bytes_copied);
-    fprintf(f, "}\n");
-
-    fclose(f);
-    printf("FEMU: stats dumped to %s\n", path);
-}
-
 static void *ftl_thread(void *arg)
 {
     FemuCtrl *n = (FemuCtrl *)arg;
@@ -1519,37 +1454,9 @@ static void *ftl_thread(void *arg)
             ftl_assert(req);
             {
                 struct NvmeCommandEvent nvme_event;
-                uint64_t cpu_t0;
-                uint64_t cpu_t1;
-                uint64_t cpu_overhead_ns;
 
                 ftl_fill_nvme_event(ssd, req, &nvme_event);
-
-                /* Host I/O counters */
-                switch (nvme_event.opcode) {
-                case NVME_CMD_READ:
-                    ssd->stats.host_read_cmds++;
-                    ssd->stats.host_read_sectors += nvme_event.nsecs;
-                    break;
-                case NVME_CMD_WRITE:
-                    ssd->stats.host_write_cmds++;
-                    ssd->stats.host_write_sectors += nvme_event.nsecs;
-                    break;
-                case NVME_CMD_DSM:
-                    ssd->stats.host_trim_cmds++;
-                    ssd->stats.host_trim_sectors += nvme_event.nsecs;
-                    break;
-                default:
-                    break;
-                }
-
-                cpu_t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
                 lat = pe_dispatch_nvme_cmd(ssd->policy_engine, ssd, &nvme_event);
-                cpu_t1 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-                cpu_overhead_ns = (uint64_t)((cpu_t1 - cpu_t0) *
-                                             ssd->cpu_scale_factor);
-                ssd->stats.policy_dispatch_time_ns += (cpu_t1 - cpu_t0);
-                lat += cpu_overhead_ns;
             }
 
             req->reqlat = lat;

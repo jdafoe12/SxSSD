@@ -8,8 +8,6 @@ sxs_state_read
 sxs_state_write
 sxs_state_fill_u64
 sxs_backend_status_get
-sxs_stats_add
-sxs_stats_gc_active_set
 __sxs_geometry_get
 __sxs_layout_get
 __sxs_eswd_get
@@ -17,7 +15,6 @@ __sxs_eswd_from_ppa
 sxs_ppa_validate
 sxs_ppa_to_page_index
 sxs_page_status_get
-__sxs_stats_get
 sxs_request_read
 sxs_request_write
 sxs_command_read

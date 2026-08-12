@@ -27,10 +27,6 @@ int32_t pe_api_state_fill_u64(struct pe_policy_execution *execution,
                               uint32_t object_id, uint64_t value);
 int32_t pe_api_backend_status_get(struct pe_policy_execution *execution,
                                   uint64_t index, int32_t *destination);
-int32_t pe_api_stats_add(struct pe_policy_execution *execution,
-                         uint32_t counter, uint64_t value);
-int32_t pe_api_stats_gc_active_set(struct pe_policy_execution *execution,
-                                   uint32_t active);
 int32_t pe_api_geometry_get(struct pe_policy_execution *execution,
                             struct sxs_geometry *destination);
 int32_t pe_api_layout_get(struct pe_policy_execution *execution,
@@ -46,8 +42,6 @@ int64_t pe_api_ppa_to_page_index(struct pe_policy_execution *execution,
                                  uint64_t ppa);
 int32_t pe_api_page_status_get(struct pe_policy_execution *execution,
                                uint64_t ppa);
-int32_t pe_api_stats_get(struct pe_policy_execution *execution,
-                         struct sxs_stats *destination);
 int32_t pe_api_request_read(struct pe_policy_execution *execution,
                             uint64_t request_offset, void *destination,
                             uint32_t length);

@@ -36,10 +36,6 @@ SXS_COMMON_IMPORT(state_fill_u64, sxs_state_fill_u64,
                   import_state_fill_u64, "(iI)i", NO_META)
 SXS_COMMON_IMPORT(backend_status_get, sxs_backend_status_get,
                   import_backend_status_get, "(I*~)i", NO_META)
-SXS_COMMON_IMPORT(stats_add, sxs_stats_add,
-                  import_stats_add, "(iI)i", NO_META)
-SXS_COMMON_IMPORT(stats_gc_active_set, sxs_stats_gc_active_set,
-                  import_stats_gc_active_set, "(i)i", NO_META)
 SXS_COMMON_IMPORT(geometry_get, __sxs_geometry_get,
                   import_geometry_get, "(*~)i", NO_META)
 SXS_COMMON_IMPORT(layout_get, __sxs_layout_get,
@@ -54,8 +50,6 @@ SXS_COMMON_IMPORT(ppa_to_page_index, sxs_ppa_to_page_index,
                   import_ppa_to_page_index, "(I)I", NO_META)
 SXS_COMMON_IMPORT(page_status_get, sxs_page_status_get,
                   import_page_status_get, "(I)i", NO_META)
-SXS_COMMON_IMPORT(stats_get, __sxs_stats_get,
-                  import_stats_get, "(*~)i", NO_META)
 SXS_COMMON_IMPORT(request_read, sxs_request_read,
                   import_request_read, "(I*~)i", NO_META)
 SXS_COMMON_IMPORT(request_write, sxs_request_write,

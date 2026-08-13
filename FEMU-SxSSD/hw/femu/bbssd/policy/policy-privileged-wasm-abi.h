@@ -42,94 +42,44 @@ _Static_assert(sizeof(struct sxs_policy_storage_geometry) == 32,
     __attribute__((import_module("sxs_privileged_v1"), import_name(symbol)))
 
 SXS_PRIVILEGED_IMPORT("sxs_privileged_storage_geometry_get")
-extern sxs_s32 __sxs_privileged_storage_geometry_get(void *, sxs_u32);
-static inline sxs_s32 sxs_privileged_storage_geometry_get(
-    struct sxs_policy_storage_geometry *geometry)
-{
-    return __sxs_privileged_storage_geometry_get(geometry,
-                                                  sizeof(*geometry));
-}
+extern sxs_s32 sxs_privileged_storage_geometry_get(
+    struct sxs_policy_storage_geometry *geometry);
 
 SXS_PRIVILEGED_IMPORT("sxs_privileged_block_is_claimed")
-extern sxs_s32 __sxs_privileged_block_is_claimed(const void *, sxs_u32);
+extern sxs_s32 sxs_privileged_block_is_claimed(
+    const struct sxs_physical_block *block);
 SXS_PRIVILEGED_IMPORT("sxs_privileged_block_claim")
-extern sxs_s32 __sxs_privileged_block_claim(const void *, sxs_u32);
+extern sxs_s32 sxs_privileged_block_claim(
+    const struct sxs_physical_block *block);
 SXS_PRIVILEGED_IMPORT("sxs_privileged_block_release")
-extern sxs_s32 __sxs_privileged_block_release(const void *, sxs_u32);
-
-static inline sxs_s32 sxs_privileged_block_is_claimed(
-    const struct sxs_physical_block *block)
-{
-    return __sxs_privileged_block_is_claimed(block, sizeof(*block));
-}
-
-static inline sxs_s32 sxs_privileged_block_claim(
-    const struct sxs_physical_block *block)
-{
-    return __sxs_privileged_block_claim(block, sizeof(*block));
-}
-
-static inline sxs_s32 sxs_privileged_block_release(
-    const struct sxs_physical_block *block)
-{
-    return __sxs_privileged_block_release(block, sizeof(*block));
-}
+extern sxs_s32 sxs_privileged_block_release(
+    const struct sxs_physical_block *block);
 
 SXS_PRIVILEGED_IMPORT("sxs_privileged_storage_read")
-extern sxs_s32 __sxs_privileged_storage_read(
-    const void *, sxs_u32, sxs_u32, void *, sxs_u32);
+extern sxs_s32 sxs_privileged_storage_read(
+    const struct sxs_physical_block *blocks, sxs_u32 block_count,
+    void *data, sxs_u32 data_length);
 SXS_PRIVILEGED_IMPORT("sxs_privileged_storage_write")
-extern sxs_s32 __sxs_privileged_storage_write(
-    const void *, sxs_u32, sxs_u32, const void *, sxs_u32);
+extern sxs_s32 sxs_privileged_storage_write(
+    const struct sxs_physical_block *blocks, sxs_u32 block_count,
+    const void *data, sxs_u32 data_length);
 SXS_PRIVILEGED_IMPORT("sxs_privileged_storage_erase")
-extern sxs_s32 __sxs_privileged_storage_erase(
-    const void *, sxs_u32, sxs_u32);
-
-static inline sxs_s32 sxs_privileged_storage_read(
-    const struct sxs_physical_block *blocks, sxs_u32 block_count,
-    void *data, sxs_u32 length)
-{
-    return __sxs_privileged_storage_read(
-        blocks, block_count * sizeof(*blocks), block_count, data, length);
-}
-
-static inline sxs_s32 sxs_privileged_storage_write(
-    const struct sxs_physical_block *blocks, sxs_u32 block_count,
-    const void *data, sxs_u32 length)
-{
-    return __sxs_privileged_storage_write(
-        blocks, block_count * sizeof(*blocks), block_count, data, length);
-}
-
-static inline sxs_s32 sxs_privileged_storage_erase(
-    const struct sxs_physical_block *blocks, sxs_u32 block_count)
-{
-    return __sxs_privileged_storage_erase(
-        blocks, block_count * sizeof(*blocks), block_count);
-}
+extern sxs_s32 sxs_privileged_storage_erase(
+    const struct sxs_physical_block *blocks, sxs_u32 block_count);
 
 SXS_PRIVILEGED_IMPORT("sxs_privileged_policy_validate_image")
 extern sxs_s32 sxs_privileged_policy_validate_image(const void *, sxs_u32);
 SXS_PRIVILEGED_IMPORT("sxs_privileged_policy_activate_stored")
-extern sxs_s32 __sxs_privileged_policy_activate_stored(
-    sxs_u32, sxs_u32, sxs_u32, sxs_u32,
-    const void *, sxs_u32, sxs_u32);
+extern sxs_s32 sxs_privileged_policy_activate_stored(
+    sxs_u32 policy_id, sxs_u32 policy_version, sxs_u32 generation,
+    sxs_u32 policy_size, const struct sxs_physical_block *blocks,
+    sxs_u32 block_count);
 SXS_PRIVILEGED_IMPORT("sxs_privileged_policy_deactivate")
 extern sxs_s32 sxs_privileged_policy_deactivate(sxs_u32);
 SXS_PRIVILEGED_IMPORT("sxs_privileged_policy_state_can_remove")
 extern sxs_s32 sxs_privileged_policy_state_can_remove(sxs_u32, sxs_u32);
 SXS_PRIVILEGED_IMPORT("sxs_privileged_policy_state_remove")
 extern sxs_s32 sxs_privileged_policy_state_remove(sxs_u32, sxs_u32);
-
-static inline sxs_s32 sxs_privileged_policy_activate_stored(
-    sxs_u32 policy_id, sxs_u32 policy_version, sxs_u32 generation,
-    sxs_u32 policy_size,
-    const struct sxs_physical_block *blocks, sxs_u32 block_count)
-{
-    return __sxs_privileged_policy_activate_stored(
-        policy_id, policy_version, generation, policy_size,
-        blocks, block_count * sizeof(*blocks), block_count);
-}
 
 SXS_PRIVILEGED_IMPORT("sxs_privileged_device_attestation_sign")
 extern sxs_s32 sxs_privileged_device_attestation_sign(

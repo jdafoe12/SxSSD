@@ -201,13 +201,13 @@ _Static_assert(__builtin_offsetof(struct sxs_bootstrap_sign_request,
 #define SXS_EXPORT(symbol) __attribute__((export_name(symbol)))
 
 SXS_IMPORT("sxs_execution_get")
-extern sxs_s32 __sxs_execution_get(void *, sxs_u32);
+extern sxs_s32 sxs_execution_get(struct sxs_execution_info *output);
 SXS_IMPORT("sxs_nvme_event_get")
-extern sxs_s32 __sxs_nvme_event_get(void *, sxs_u32);
+extern sxs_s32 sxs_nvme_event_get(struct sxs_nvme_event *output);
 SXS_IMPORT("sxs_backend_event_get")
-extern sxs_s32 __sxs_backend_event_get(void *, sxs_u32);
+extern sxs_s32 sxs_backend_event_get(struct sxs_backend_event *output);
 SXS_IMPORT("sxs_pswd_event_get")
-extern sxs_s32 __sxs_pswd_event_get(void *, sxs_u32);
+extern sxs_s32 sxs_pswd_event_get(struct sxs_pswd_event *output);
 
 SXS_IMPORT("sxs_subscribe")
 extern sxs_s32 sxs_subscribe(sxs_u32, sxs_u32, sxs_u32, sxs_u32);
@@ -220,27 +220,19 @@ extern sxs_s32 sxs_state_write(sxs_u32, sxs_u64, sxs_u32, const void *, sxs_u32)
 SXS_IMPORT("sxs_state_fill_u64")
 extern sxs_s32 sxs_state_fill_u64(sxs_u32, sxs_u64);
 SXS_IMPORT("sxs_backend_status_get")
-extern sxs_s32 sxs_backend_status_get(sxs_u64, sxs_s32 *, sxs_u32);
-#define SXS_DECLARE_OUTPUT_IMPORT(name, type)                              \
-    SXS_IMPORT(#name) extern sxs_s32 __##name(void *, sxs_u32);           \
-    static inline sxs_s32 name(type *output)                              \
-    { return __##name(output, sizeof(*output)); }
-
-SXS_DECLARE_OUTPUT_IMPORT(sxs_geometry_get, struct sxs_geometry)
-SXS_DECLARE_OUTPUT_IMPORT(sxs_layout_get, struct sxs_layout)
-#undef SXS_DECLARE_OUTPUT_IMPORT
-
-#define SXS_DECLARE_KEYED_OUTPUT_IMPORT(name, key_type, type)              \
-    SXS_IMPORT(#name) extern sxs_s32 __##name(key_type, void *, sxs_u32);  \
-    static inline sxs_s32 name(key_type key, type *output)                 \
-    { return __##name(key, output, sizeof(*output)); }
-
-SXS_DECLARE_KEYED_OUTPUT_IMPORT(sxs_eswd_get, sxs_u32, struct sxs_eswd)
-SXS_DECLARE_KEYED_OUTPUT_IMPORT(sxs_eswd_from_ppa, sxs_u64,
-                                struct sxs_eswd_location)
-SXS_DECLARE_KEYED_OUTPUT_IMPORT(sxs_dsm_range_get, sxs_u32,
-                                struct sxs_dsm_range)
-#undef SXS_DECLARE_KEYED_OUTPUT_IMPORT
+extern sxs_s32 sxs_backend_status_get(sxs_u64 index, sxs_s32 *output);
+SXS_IMPORT("sxs_geometry_get")
+extern sxs_s32 sxs_geometry_get(struct sxs_geometry *output);
+SXS_IMPORT("sxs_layout_get")
+extern sxs_s32 sxs_layout_get(struct sxs_layout *output);
+SXS_IMPORT("sxs_eswd_get")
+extern sxs_s32 sxs_eswd_get(sxs_u32 eswd_id, struct sxs_eswd *output);
+SXS_IMPORT("sxs_eswd_from_ppa")
+extern sxs_s32 sxs_eswd_from_ppa(sxs_u64 ppa,
+                                 struct sxs_eswd_location *output);
+SXS_IMPORT("sxs_dsm_range_get")
+extern sxs_s32 sxs_dsm_range_get(sxs_u32 range_index,
+                                 struct sxs_dsm_range *output);
 
 SXS_IMPORT("sxs_ppa_validate") extern sxs_s32 sxs_ppa_validate(sxs_u64);
 SXS_IMPORT("sxs_ppa_to_page_index")
@@ -261,14 +253,10 @@ SXS_IMPORT("sxs_completion_result_set")
 extern sxs_s32 sxs_completion_result_set(sxs_u64);
 SXS_IMPORT("sxs_time_now_ns") extern sxs_u64 sxs_time_now_ns(void);
 SXS_IMPORT("sxs_eswd_config_stage")
-extern sxs_s32 __sxs_eswd_config_stage(const void *, sxs_u32);
+extern sxs_s32 sxs_eswd_config_stage(const struct sxs_eswd_config *value);
 SXS_IMPORT("sxs_namespace_config_stage")
-extern sxs_s32 __sxs_namespace_config_stage(const void *, sxs_u32);
-static inline sxs_s32 sxs_eswd_config_stage(const struct sxs_eswd_config *value)
-{ return __sxs_eswd_config_stage(value, sizeof(*value)); }
-static inline sxs_s32 sxs_namespace_config_stage(
-    const struct sxs_namespace_config *value)
-{ return __sxs_namespace_config_stage(value, sizeof(*value)); }
+extern sxs_s32 sxs_namespace_config_stage(
+    const struct sxs_namespace_config *value);
 SXS_IMPORT("sxs_ftl_finalize_stage")
 extern sxs_s32 sxs_ftl_finalize_stage(void);
 SXS_IMPORT("sxs_oob_register_stage")
@@ -281,10 +269,8 @@ extern sxs_s32 sxs_eswd_range_check(sxs_u32, sxs_u32, sxs_u64, sxs_u32);
 SXS_IMPORT("sxs_eswd_to_ppa")
 extern sxs_s64 sxs_eswd_to_ppa(sxs_u32, sxs_u32);
 SXS_IMPORT("sxs_ppa_to_eswd")
-extern sxs_s32 __sxs_ppa_to_eswd(sxs_u64, void *, sxs_u32);
-static inline sxs_s32 sxs_ppa_to_eswd(sxs_u64 ppa,
-                                      struct sxs_eswd_location *output)
-{ return __sxs_ppa_to_eswd(ppa, output, sizeof(*output)); }
+extern sxs_s32 sxs_ppa_to_eswd(sxs_u64 ppa,
+                               struct sxs_eswd_location *output);
 SXS_IMPORT("sxs_page_invalidate")
 extern sxs_s32 sxs_page_invalidate(sxs_u64);
 SXS_IMPORT("sxs_eswd_reset") extern sxs_s32 sxs_eswd_reset(sxs_u32);
@@ -293,47 +279,26 @@ extern sxs_s32 sxs_eswd_advance_wp(sxs_u32);
 SXS_IMPORT("sxs_eswd_erase") extern sxs_u64 sxs_eswd_erase(sxs_u32);
 
 SXS_IMPORT("sxs_page_read")
-extern sxs_s32 __sxs_page_read(const void *, sxs_u32, void *, sxs_u32,
-                               void *, sxs_u32, void *, sxs_u32);
-static inline sxs_s32 sxs_page_read(const struct sxs_page_read_request *request,
-                                    void *data, sxs_u32 data_length,
-                                    void *oob, sxs_u32 oob_length,
-                                    struct sxs_page_result *result)
-{
-    return __sxs_page_read(request, sizeof(*request), data, data_length,
-                           oob, oob_length, result, sizeof(*result));
-}
+extern sxs_s32 sxs_page_read(const struct sxs_page_read_request *request,
+                             void *data, sxs_u32 data_length,
+                             void *oob, sxs_u32 oob_length,
+                             struct sxs_page_result *result);
 SXS_IMPORT("sxs_page_append")
-extern sxs_s32 __sxs_page_append(const void *, sxs_u32, const void *, sxs_u32,
-                                 const void *, sxs_u32, void *, sxs_u32);
-static inline sxs_s32 sxs_page_append(
-    const struct sxs_page_append_request *request, const void *data,
-    sxs_u32 data_length, const void *oob, sxs_u32 oob_length,
-    struct sxs_page_result *result)
-{
-    return __sxs_page_append(request, sizeof(*request), data, data_length,
-                             oob, oob_length, result, sizeof(*result));
-}
+extern sxs_s32 sxs_page_append(const struct sxs_page_append_request *request,
+                               const void *data, sxs_u32 data_length,
+                               const void *oob, sxs_u32 oob_length,
+                               struct sxs_page_result *result);
 SXS_IMPORT("sxs_page_migrate")
-extern sxs_s32 __sxs_page_migrate(sxs_u64, sxs_u32, void *, sxs_u32);
-static inline sxs_s32 sxs_page_migrate(sxs_u64 source, sxs_u32 destination,
-                                       struct sxs_page_result *result)
-{ return __sxs_page_migrate(source, destination, result, sizeof(*result)); }
+extern sxs_s32 sxs_page_migrate(sxs_u64 source, sxs_u32 destination,
+                                struct sxs_page_result *result);
 SXS_IMPORT("sxs_eswd_stage_write")
-extern sxs_s32 __sxs_eswd_stage_write(const void *, sxs_u32, void *, sxs_u32);
-static inline sxs_s32 sxs_eswd_stage_write(
+extern sxs_s32 sxs_eswd_stage_write(
     const struct sxs_eswd_stage_write_request *request,
-    struct sxs_page_result *result)
-{ return __sxs_eswd_stage_write(request, sizeof(*request), result,
-                                sizeof(*result)); }
+    struct sxs_page_result *result);
 SXS_IMPORT("sxs_eswd_page_read")
-extern sxs_s32 __sxs_eswd_page_read(const void *, sxs_u32, void *, sxs_u32,
-                                    void *, sxs_u32);
-static inline sxs_s32 sxs_eswd_page_read(
-    const struct sxs_eswd_page_read_request *request, void *data,
-    sxs_u32 data_length, struct sxs_page_result *result)
-{ return __sxs_eswd_page_read(request, sizeof(*request), data, data_length,
-                              result, sizeof(*result)); }
+extern sxs_s32 sxs_eswd_page_read(
+    const struct sxs_eswd_page_read_request *request,
+    void *data, sxs_u32 data_length, struct sxs_page_result *result);
 SXS_IMPORT("sxs_namespace_blob_stage")
 extern sxs_s32 sxs_namespace_blob_stage(sxs_u32, sxs_u32,
                                         const void *, sxs_u32);
@@ -366,17 +331,9 @@ extern sxs_s32 sxs_crypto_aes256_gcm_decrypt(
     const void *, sxs_u32, const void *, sxs_u32,
     const void *, sxs_u32, void *, sxs_u32);
 SXS_IMPORT("sxs_sign_key_bootstrap")
-extern sxs_s32 __sxs_sign_key_bootstrap(const sxs_u8 *, sxs_u32,
-                                        const sxs_u8 *, sxs_u32,
-                                        const sxs_u8 *, sxs_u32,
-                                        sxs_u8 *, sxs_u32);
-static inline sxs_s32 sxs_sign_key_bootstrap(
+extern sxs_s32 sxs_sign_key_bootstrap(
     const sxs_u8 owner_nonce[32], const sxs_u8 owner_public[32],
-    const sxs_u8 policy_public[32], sxs_u8 signature[64])
-{
-    return __sxs_sign_key_bootstrap(owner_nonce, 32, owner_public, 32,
-                                    policy_public, 32, signature, 64);
-}
+    const sxs_u8 policy_public[32], sxs_u8 signature[64]);
 
 /*
  * Keep the typed declarations above tied to the canonical import registry.
@@ -410,7 +367,7 @@ static inline sxs_s32 sxs_context_get(struct sxs_policy_context *context)
         return -SXS_WASM_EINVAL;
     }
     sxs_zero_context(context);
-    status = __sxs_execution_get(&info, sizeof(info));
+    status = sxs_execution_get(&info);
     if (status != 0 || info.abi_version != SXS_WASM_ABI_VERSION) {
         return status ? status : -SXS_WASM_EINVAL;
     }
@@ -429,14 +386,11 @@ static inline sxs_s32 sxs_context_get(struct sxs_policy_context *context)
         return 0;
     case SXS_EVENT_NVME_IO:
     case SXS_EVENT_NVME_ADMIN:
-        return __sxs_nvme_event_get(&context->event.nvme,
-                                    sizeof(context->event.nvme));
+        return sxs_nvme_event_get(&context->event.nvme);
     case SXS_EVENT_BACKEND:
-        return __sxs_backend_event_get(&context->event.backend,
-                                       sizeof(context->event.backend));
+        return sxs_backend_event_get(&context->event.backend);
     case SXS_EVENT_PSWD_TRANSITION:
-        return __sxs_pswd_event_get(&context->event.pswd,
-                                    sizeof(context->event.pswd));
+        return sxs_pswd_event_get(&context->event.pswd);
     default:
         return -SXS_WASM_EINVAL;
     }

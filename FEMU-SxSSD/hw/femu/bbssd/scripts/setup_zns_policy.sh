@@ -28,6 +28,9 @@ if [ "${EUID}" -ne 0 ]; then
 fi
 
 require_cmd nvme
+require_cmd blockdev
+require_cmd dd
+require_cmd timeout
 
 [ -e "$CTRL_DEVICE" ] || fail "Missing controller device: $CTRL_DEVICE"
 
@@ -55,6 +58,16 @@ sleep 1
 
 echo "[setup-zns] Ready: $NS_DEVICE"
 cat "/sys/block/$(basename "$NS_DEVICE")/queue/zoned"
+
+namespace_bytes="$(blockdev --getsize64 "$NS_DEVICE")"
+[ "$namespace_bytes" -ge 4096 ] || fail "Namespace is smaller than one 4 KiB block"
+echo "[setup-zns] Checking an unwritten block at the namespace endpoint"
+if ! timeout 10 dd if="$NS_DEVICE" of=/dev/null bs=4096 \
+        skip="$((namespace_bytes / 4096 - 1))" count=1 iflag=direct \
+        status=none; then
+    fail "Endpoint read failed; do not run ZNS workloads"
+fi
+
 nvme ns-descs "$NS_DEVICE"
 if has_nvme_zns; then
     nvme zns id-ns "$NS_DEVICE"

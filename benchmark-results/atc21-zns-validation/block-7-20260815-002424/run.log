@@ -1,0 +1,8 @@
+[atc21-validation] Mode: block-7
+[atc21-validation] Device: /dev/nvme0n1
+[atc21-validation] Results: /home/femu/atc21-zns-validation-results/block-7-20260815-002424
+[atc21-validation] Calibration only: 0
+[atc21-validation] Normalized to ZNS peak: 290.283 MiB/s
+[atc21-validation] Discarding the block working set
+blkdiscard: invalid option -- 'f'
+Try 'blkdiscard --help' for more information.

@@ -3,11 +3,6 @@
 
 #include "policy-wasm-abi.h"
 
-#define BLOCK_MAP_OBJECT 1U
-#define BLOCK_REVERSE_MAP_OBJECT 2U
-#define BLOCK_METADATA_OBJECT 3U
-#define BLOCK_ESWD_CLASS_OBJECT 4U
-
 #define BLOCK_PAIR_READ 1U
 #define BLOCK_PAIR_WRITE 2U
 #define BLOCK_PAIR_DSM 3U
@@ -21,6 +16,8 @@
 #define BLOCK_NVME_INTERNAL_ERROR 0x4006U
 #define BLOCK_MAX_DSM_PAGES 65536ULL
 #define BLOCK_MAX_OOB_BYTES 256U
+#define BLOCK_MAX_LOGICAL_PAGES 4194304U
+#define BLOCK_MAX_ESWDS 256U
 
 #define BLOCK_UNMAPPED (~0ULL)
 
@@ -44,6 +41,16 @@ struct block_wasm_metadata {
     sxs_u32 gc_low_watermark;
     sxs_u32 gc_urgent_watermark;
 };
+
+/* Zero is the unmapped encoding; mapped values are stored as value + 1. */
+static sxs_u64 block_forward_map[BLOCK_MAX_LOGICAL_PAGES];
+static sxs_u64 block_reverse_map[BLOCK_MAX_LOGICAL_PAGES];
+static struct block_wasm_metadata block_metadata;
+static sxs_u8 block_eswd_classes[BLOCK_MAX_ESWDS];
+static sxs_u32 block_victim_heap[BLOCK_MAX_ESWDS];
+static sxs_u32 block_victim_positions[BLOCK_MAX_ESWDS];
+static sxs_s32 block_victim_valid_pages[BLOCK_MAX_ESWDS];
+static sxs_u32 block_victim_count;
 
 /* Compile-time extensions preserve direct condition/action control flow. */
 #ifndef BLOCK_EXTRA_INIT
@@ -85,51 +92,68 @@ static void block_bytes_zero(sxs_u8 *destination, sxs_u32 length)
     }
 }
 
-static sxs_s64 block_state_read_u64(struct sxs_policy_context *context,
-                                    sxs_u32 object_id, sxs_u64 index,
-                                    sxs_u64 *value_out)
+static sxs_s64 block_map_read(const sxs_u64 *map, sxs_u64 index,
+                              sxs_u64 *value_out)
 {
-    (void)context;
-    return sxs_state_read(object_id, index, 0, value_out,
-                          sizeof(*value_out));
+    sxs_u64 encoded;
+
+    if (!value_out || index >= BLOCK_MAX_LOGICAL_PAGES) {
+        return -SXS_WASM_EINVAL;
+    }
+    encoded = map[index];
+    *value_out = encoded == 0 ? BLOCK_UNMAPPED : encoded - 1;
+    return 0;
 }
 
-static sxs_s64 block_state_write_u64(struct sxs_policy_context *context,
-                                     sxs_u32 object_id, sxs_u64 index,
-                                     sxs_u64 value)
+static sxs_s64 block_map_write(sxs_u64 *map, sxs_u64 index, sxs_u64 value)
 {
-    (void)context;
-    return sxs_state_write(object_id, index, 0, &value, sizeof(value));
+    if (index >= BLOCK_MAX_LOGICAL_PAGES) {
+        return -SXS_WASM_EINVAL;
+    }
+    map[index] = value == BLOCK_UNMAPPED ? 0 : value + 1;
+    return 0;
 }
 
 static sxs_s64 block_state_read_class(struct sxs_policy_context *context,
                                       sxs_u32 eswd_id, sxs_u8 *class_out)
 {
     (void)context;
-    return sxs_state_read(BLOCK_ESWD_CLASS_OBJECT, eswd_id, 0,
-                          class_out, sizeof(*class_out));
+    if (!class_out || eswd_id >= BLOCK_MAX_ESWDS) {
+        return -SXS_WASM_EINVAL;
+    }
+    *class_out = block_eswd_classes[eswd_id];
+    return 0;
 }
 
 static sxs_s64 block_state_write_class(struct sxs_policy_context *context,
                                        sxs_u32 eswd_id, sxs_u8 value)
 {
     (void)context;
-    return sxs_state_write(BLOCK_ESWD_CLASS_OBJECT, eswd_id, 0,
-                           &value, sizeof(value));
+    if (eswd_id >= BLOCK_MAX_ESWDS) {
+        return -SXS_WASM_EINVAL;
+    }
+    block_eswd_classes[eswd_id] = value;
+    return 0;
 }
 
 static sxs_s64 block_read_metadata(struct sxs_policy_context *context,
                                    struct block_wasm_metadata *metadata_out)
 {
     (void)context;
-    return sxs_state_read(BLOCK_METADATA_OBJECT, 0, 0, metadata_out,
-                          sizeof(*metadata_out));
+    if (!metadata_out) {
+        return -SXS_WASM_EINVAL;
+    }
+    *metadata_out = block_metadata;
+    return 0;
 }
 
 static sxs_s64 block_write_metadata(const struct block_wasm_metadata *metadata)
 {
-    return sxs_state_write(BLOCK_METADATA_OBJECT, 0, 0, metadata,
-                           sizeof(*metadata));
+    if (!metadata) {
+        return -SXS_WASM_EINVAL;
+    }
+    block_metadata = *metadata;
+    return 0;
 }
 
 static sxs_s64 block_get_eswd(struct sxs_policy_context *context,
@@ -138,6 +162,162 @@ static sxs_s64 block_get_eswd(struct sxs_policy_context *context,
 {
     (void)context;
     return sxs_eswd_get(eswd_id, eswd_out);
+}
+
+static sxs_u32 block_victim_less(sxs_u32 left, sxs_u32 right)
+{
+    if (block_victim_valid_pages[left] != block_victim_valid_pages[right]) {
+        return block_victim_valid_pages[left] <
+               block_victim_valid_pages[right];
+    }
+    return left < right;
+}
+
+static void block_victim_swap(sxs_u32 left, sxs_u32 right)
+{
+    sxs_u32 temporary = block_victim_heap[left];
+
+    block_victim_heap[left] = block_victim_heap[right];
+    block_victim_heap[right] = temporary;
+    block_victim_positions[block_victim_heap[left]] = left + 1;
+    block_victim_positions[block_victim_heap[right]] = right + 1;
+}
+
+static void block_victim_sift_up(sxs_u32 index)
+{
+    while (index > 0) {
+        sxs_u32 parent = (index - 1) / 2;
+
+        if (!block_victim_less(block_victim_heap[index],
+                               block_victim_heap[parent])) {
+            break;
+        }
+        block_victim_swap(index, parent);
+        index = parent;
+    }
+}
+
+static void block_victim_sift_down(sxs_u32 index)
+{
+    for (;;) {
+        sxs_u32 left = index * 2 + 1;
+        sxs_u32 right = left + 1;
+        sxs_u32 smallest = index;
+
+        if (left < block_victim_count &&
+            block_victim_less(block_victim_heap[left],
+                              block_victim_heap[smallest])) {
+            smallest = left;
+        }
+        if (right < block_victim_count &&
+            block_victim_less(block_victim_heap[right],
+                              block_victim_heap[smallest])) {
+            smallest = right;
+        }
+        if (smallest == index) {
+            break;
+        }
+        block_victim_swap(index, smallest);
+        index = smallest;
+    }
+}
+
+static sxs_s64 block_victim_remove(sxs_u32 eswd_id)
+{
+    sxs_u32 position;
+    sxs_u32 index;
+
+    if (eswd_id >= BLOCK_MAX_ESWDS) {
+        return -SXS_WASM_EINVAL;
+    }
+    position = block_victim_positions[eswd_id];
+    if (position == 0) {
+        return 0;
+    }
+    index = position - 1;
+    block_victim_count--;
+    block_victim_positions[eswd_id] = 0;
+    if (index == block_victim_count) {
+        return 0;
+    }
+    block_victim_heap[index] = block_victim_heap[block_victim_count];
+    block_victim_positions[block_victim_heap[index]] = index + 1;
+    if (index > 0 &&
+        block_victim_less(block_victim_heap[index],
+                          block_victim_heap[(index - 1) / 2])) {
+        block_victim_sift_up(index);
+    } else {
+        block_victim_sift_down(index);
+    }
+    return 0;
+}
+
+static sxs_s64 block_victim_update(sxs_u32 eswd_id, sxs_s32 valid_pages)
+{
+    sxs_u32 position;
+    sxs_s32 previous;
+
+    if (eswd_id >= BLOCK_MAX_ESWDS || valid_pages < 0) {
+        return -SXS_WASM_EINVAL;
+    }
+    position = block_victim_positions[eswd_id];
+    previous = block_victim_valid_pages[eswd_id];
+    block_victim_valid_pages[eswd_id] = valid_pages;
+    if (position == 0) {
+        if (block_victim_count >= BLOCK_MAX_ESWDS) {
+            return -SXS_WASM_ENOSPC;
+        }
+        block_victim_heap[block_victim_count] = eswd_id;
+        block_victim_positions[eswd_id] = block_victim_count + 1;
+        block_victim_sift_up(block_victim_count);
+        block_victim_count++;
+        return 0;
+    }
+    if (valid_pages < previous) {
+        block_victim_sift_up(position - 1);
+    } else if (valid_pages > previous) {
+        block_victim_sift_down(position - 1);
+    }
+    return 0;
+}
+
+static sxs_s64 block_victim_refresh_eswd(
+    struct sxs_policy_context *context,
+    const struct block_wasm_metadata *metadata, sxs_u32 eswd_id)
+{
+    struct sxs_eswd eswd;
+    sxs_u8 class_value;
+
+    if (eswd_id >= metadata->total_eswds ||
+        eswd_id == metadata->current_eswd) {
+        return 0;
+    }
+    if (block_state_read_class(context, eswd_id, &class_value) != 0 ||
+        block_get_eswd(context, eswd_id, &eswd) != 0) {
+        return -SXS_WASM_EIO;
+    }
+    if ((class_value == BLOCK_ESWD_FULL ||
+         class_value == BLOCK_ESWD_VICTIM) &&
+        eswd.invalid_page_count > 0) {
+        if (block_state_write_class(context, eswd_id,
+                                    BLOCK_ESWD_VICTIM) != 0) {
+            return -SXS_WASM_EIO;
+        }
+        return block_victim_update(eswd_id, eswd.valid_page_count);
+    }
+    return block_victim_remove(eswd_id);
+}
+
+static sxs_s64 block_victim_refresh_ppa(
+    struct sxs_policy_context *context,
+    const struct block_wasm_metadata *metadata, sxs_u64 ppa)
+{
+    struct sxs_eswd_location location;
+
+    if (sxs_ppa_to_eswd(ppa, &location) != 0) {
+        return -SXS_WASM_EIO;
+    }
+    return block_victim_refresh_eswd(context, metadata, location.eswd_id);
 }
 
 static sxs_s64 block_find_free_eswd(struct sxs_policy_context *context,
@@ -162,6 +342,7 @@ static sxs_s64 block_rotate_if_full(struct sxs_policy_context *context,
                                     struct block_wasm_metadata *metadata)
 {
     struct sxs_eswd current;
+    sxs_u8 completed_class;
     sxs_u32 next;
 
     if (block_get_eswd(context, metadata->current_eswd, &current) != 0) {
@@ -170,12 +351,18 @@ static sxs_s64 block_rotate_if_full(struct sxs_policy_context *context,
     if (current.write_page_index < metadata->pages_per_eswd) {
         return 0;
     }
-    if (block_state_write_class(
-            context, metadata->current_eswd,
-            current.invalid_page_count == 0 ? BLOCK_ESWD_FULL :
-                                                BLOCK_ESWD_VICTIM) != 0 ||
-        block_find_free_eswd(context, metadata, &next) != 0 ||
-        block_state_write_class(context, next, BLOCK_ESWD_CURRENT) != 0) {
+    if (block_find_free_eswd(context, metadata, &next) != 0) {
+        return -SXS_WASM_ENOSPC;
+    }
+    completed_class = current.invalid_page_count == 0 ? BLOCK_ESWD_FULL :
+                                                        BLOCK_ESWD_VICTIM;
+    if (block_state_write_class(context, metadata->current_eswd,
+                                completed_class) != 0 ||
+        (completed_class == BLOCK_ESWD_VICTIM &&
+         block_victim_update(metadata->current_eswd,
+                             current.valid_page_count) != 0) ||
+        block_state_write_class(context, next, BLOCK_ESWD_CURRENT) != 0 ||
+        block_victim_remove(next) != 0) {
         return -SXS_WASM_ENOSPC;
     }
     metadata->current_eswd = next;
@@ -245,22 +432,22 @@ static sxs_s64 block_update_mapping(struct sxs_policy_context *context,
 {
     sxs_u64 page_index;
 
+    (void)context;
     if (old_ppa != BLOCK_UNMAPPED) {
         page_index = sxs_ppa_to_page_index(old_ppa);
         if ((sxs_s64)page_index >= 0 &&
-            block_state_write_u64(context, BLOCK_REVERSE_MAP_OBJECT,
-                                  page_index, BLOCK_UNMAPPED) != 0) {
+            block_map_write(block_reverse_map, page_index,
+                            BLOCK_UNMAPPED) != 0) {
             return -SXS_WASM_EIO;
         }
     }
-    if (block_state_write_u64(context, BLOCK_MAP_OBJECT, lpn, new_ppa) != 0) {
+    if (block_map_write(block_forward_map, lpn, new_ppa) != 0) {
         return -SXS_WASM_EIO;
     }
     if (new_ppa != BLOCK_UNMAPPED) {
         page_index = sxs_ppa_to_page_index(new_ppa);
         if ((sxs_s64)page_index < 0 ||
-            block_state_write_u64(context, BLOCK_REVERSE_MAP_OBJECT,
-                                  page_index, lpn) != 0) {
+            block_map_write(block_reverse_map, page_index, lpn) != 0) {
             return -SXS_WASM_EIO;
         }
     }
@@ -271,37 +458,25 @@ static sxs_s64 block_select_victim(struct sxs_policy_context *context,
                                    const struct block_wasm_metadata *metadata,
                                    sxs_u32 force, sxs_u32 *victim_out)
 {
-    sxs_u32 best = 0;
-    sxs_s32 best_vpc = 0x7fffffff;
-    sxs_u32 found = 0;
+    struct sxs_eswd eswd;
+    sxs_u32 victim;
 
-    for (sxs_u32 id = 0; id < metadata->total_eswds; id++) {
-        struct sxs_eswd eswd;
-        sxs_u8 class_value;
-
-        if (id == metadata->current_eswd ||
-            block_state_read_class(context, id, &class_value) != 0) {
-            continue;
-        }
-        if (class_value != BLOCK_ESWD_FULL &&
-            class_value != BLOCK_ESWD_VICTIM) {
-            continue;
-        }
-        if (block_get_eswd(context, id, &eswd) != 0 ||
-            (!force && eswd.invalid_page_count <
-                           (sxs_s32)(metadata->pages_per_eswd / 8))) {
-            continue;
-        }
-        if (eswd.valid_page_count < best_vpc) {
-            best_vpc = eswd.valid_page_count;
-            best = id;
-            found = 1;
-        }
-    }
-    if (!found) {
+    if (block_victim_count == 0) {
         return -SXS_WASM_ENOENT;
     }
-    *victim_out = best;
+    victim = block_victim_heap[0];
+    if (victim >= metadata->total_eswds ||
+        block_get_eswd(context, victim, &eswd) != 0) {
+        return -SXS_WASM_EIO;
+    }
+    if (!force && eswd.invalid_page_count <
+                  (sxs_s32)(metadata->pages_per_eswd / 8)) {
+        return -SXS_WASM_ENOENT;
+    }
+    if (block_victim_remove(victim) != 0) {
+        return -SXS_WASM_EIO;
+    }
+    *victim_out = victim;
     return 0;
 }
 
@@ -341,8 +516,7 @@ static sxs_s64 block_gc(struct sxs_policy_context *context,
         }
         source_dense_index = sxs_ppa_to_page_index(source_ppa);
         if ((sxs_s64)source_dense_index >= 0 &&
-            block_state_read_u64(context, BLOCK_REVERSE_MAP_OBJECT,
-                                 source_dense_index, &lpn) == 0 &&
+            block_map_read(block_reverse_map, source_dense_index, &lpn) == 0 &&
             lpn != BLOCK_UNMAPPED && lpn < metadata->total_logical_pages) {
             if (block_update_mapping(context, lpn, source_ppa,
                                      result.ppa) != 0) {
@@ -395,7 +569,7 @@ static sxs_u64 block_read_action(struct sxs_policy_context *context,
             sectors = end_lba - current_lba;
         }
         if (lpn >= metadata->total_logical_pages ||
-            block_state_read_u64(context, BLOCK_MAP_OBJECT, lpn, &ppa) != 0) {
+            block_map_read(block_forward_map, lpn, &ppa) != 0) {
             sxs_completion_status_set(BLOCK_NVME_INVALID_FIELD);
             return 0;
         }
@@ -460,8 +634,7 @@ static sxs_u64 block_write_action(struct sxs_policy_context *context,
             sectors = end_lba - current_lba;
         }
         if (lpn >= metadata->total_logical_pages ||
-            block_state_read_u64(context, BLOCK_MAP_OBJECT,
-                                 lpn, &old_ppa) != 0 ||
+            block_map_read(block_forward_map, lpn, &old_ppa) != 0 ||
             block_rotate_if_full(context, metadata) != 0) {
             sxs_completion_status_set(BLOCK_NVME_INVALID_FIELD);
             return 0;
@@ -488,7 +661,9 @@ static sxs_u64 block_write_action(struct sxs_policy_context *context,
             return 0;
         }
         if (old_ppa != BLOCK_UNMAPPED) {
-            if (BLOCK_HANDLE_OLD_PAGE(context, lpn, old_ppa) != 0) {
+            if (BLOCK_HANDLE_OLD_PAGE(context, lpn, old_ppa) != 0 ||
+                block_victim_refresh_ppa(context, metadata,
+                                         old_ppa) != 0) {
                 sxs_completion_status_set(BLOCK_NVME_INTERNAL_ERROR);
                 return 0;
             }
@@ -577,12 +752,12 @@ static sxs_u64 block_dsm_action(struct sxs_policy_context *context,
             sxs_u64 ppa;
 
             if (lpn >= metadata->total_logical_pages ||
-                block_state_read_u64(context, BLOCK_MAP_OBJECT,
-                                     lpn, &ppa) != 0 ||
+                block_map_read(block_forward_map, lpn, &ppa) != 0 ||
                 ppa == BLOCK_UNMAPPED) {
                 continue;
             }
-            if (BLOCK_HANDLE_OLD_PAGE(context, lpn, ppa) != 0) {
+            if (BLOCK_HANDLE_OLD_PAGE(context, lpn, ppa) != 0 ||
+                block_victim_refresh_ppa(context, metadata, ppa) != 0) {
                 return SXS_WASM_ACTION_ERROR;
             }
             if (block_update_mapping(context, lpn, ppa,
@@ -609,44 +784,30 @@ static sxs_u64 block_policy_init(struct sxs_policy_context *context)
     }
     total_eswds = geometry.total_blocks_log / geometry.total_luns;
     page_size = (sxs_u64)geometry.sectors_per_page * geometry.sector_size;
-    if (total_eswds < 2 || total_eswds > 0xffffffffULL ||
+    if (total_eswds < 2 || total_eswds > BLOCK_MAX_ESWDS ||
+        geometry.total_pages_log > BLOCK_MAX_LOGICAL_PAGES ||
         page_size == 0 || page_size > SXS_WASM_MAX_PAGE_BYTES) {
         return SXS_WASM_ACTION_ERROR;
     }
-    if (sxs_state_create(BLOCK_MAP_OBJECT, sizeof(sxs_u64),
-                         geometry.total_pages_log,
-                         SXS_STATE_INIT_U64, BLOCK_UNMAPPED) != 0 ||
-        sxs_state_create(BLOCK_REVERSE_MAP_OBJECT, sizeof(sxs_u64),
-                         geometry.total_pages_log,
-                         SXS_STATE_INIT_U64, BLOCK_UNMAPPED) != 0 ||
-        sxs_state_create(BLOCK_METADATA_OBJECT, sizeof(metadata), 1,
-                         0, 0) != 0 ||
-        sxs_state_create(BLOCK_ESWD_CLASS_OBJECT, 1, total_eswds,
-                         0, 0) != 0) {
-        return SXS_WASM_ACTION_ERROR;
+    metadata = (struct block_wasm_metadata) {
+        .total_logical_pages = geometry.total_pages_log,
+        .total_eswds = total_eswds,
+        .pages_per_eswd = geometry.total_luns * geometry.pages_per_block,
+        .sectors_per_page = geometry.sectors_per_page,
+        .sector_size = geometry.sector_size,
+        .page_size = page_size,
+        .current_eswd = 0,
+        .free_eswds = total_eswds - 1,
+        .gc_low_watermark = total_eswds / 4 ? total_eswds / 4 : 1,
+        .gc_urgent_watermark = total_eswds / 20 ? total_eswds / 20 : 1,
+    };
+    block_victim_count = 0;
+    for (sxs_u32 id = 0; id < BLOCK_MAX_ESWDS; id++) {
+        block_victim_positions[id] = 0;
+        block_victim_valid_pages[id] = 0;
     }
-
-    if (!(context->flags & SXS_FLAG_STATE_RESTORED)) {
-        metadata = (struct block_wasm_metadata) {
-            .total_logical_pages = geometry.total_pages_log,
-            .total_eswds = total_eswds,
-            .pages_per_eswd = geometry.total_luns *
-                              geometry.pages_per_block,
-            .sectors_per_page = geometry.sectors_per_page,
-            .sector_size = geometry.sector_size,
-            .page_size = page_size,
-            .current_eswd = 0,
-            .free_eswds = total_eswds - 1,
-            .gc_low_watermark = total_eswds / 4 ? total_eswds / 4 : 1,
-            .gc_urgent_watermark = total_eswds / 20 ?
-                                   total_eswds / 20 : 1,
-        };
-        if (block_write_metadata(&metadata) != 0 ||
-            block_state_write_class(context, 0,
-                                    BLOCK_ESWD_CURRENT) != 0) {
-            return SXS_WASM_ACTION_ERROR;
-        }
-    } else if (block_read_metadata(context, &metadata) != 0) {
+    if (block_write_metadata(&metadata) != 0 ||
+        block_state_write_class(context, 0, BLOCK_ESWD_CURRENT) != 0) {
         return SXS_WASM_ACTION_ERROR;
     }
 
@@ -662,7 +823,7 @@ static sxs_u64 block_policy_init(struct sxs_policy_context *context)
     namespace_config.controller_blob_length = 0;
     if (sxs_eswd_config_stage(&eswd_config) != 0 ||
         sxs_namespace_config_stage(&namespace_config) != 0 ||
-        sxs_ftl_finalize_stage() != 0 ||
+        sxs_eswd_layout_finalize_stage() != 0 ||
         sxs_subscribe(SXS_EVENT_NVME_IO, BLOCK_NVME_READ,
                       BLOCK_PAIR_READ, 0) != 0 ||
         sxs_subscribe(SXS_EVENT_NVME_IO, BLOCK_NVME_WRITE,

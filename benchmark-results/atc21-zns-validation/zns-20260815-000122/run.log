@@ -1,0 +1,8 @@
+[atc21-validation] Mode: zns
+[atc21-validation] Device: /dev/nvme0n1
+[atc21-validation] Results: /home/femu/atc21-zns-validation-results/zns-20260815-000122
+[atc21-validation] Calibration only: 1
+[atc21-validation] Resetting all ZNS zones
+[atc21-validation] Peak write throughput: 290.283 MiB/s
+[atc21-validation] Wrote /home/femu/atc21-zns-validation-results/zns-reference.env
+[atc21-validation] Complete: /home/femu/atc21-zns-validation-results/zns-20260815-000122

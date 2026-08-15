@@ -1,15 +1,17 @@
 #include "qemu/osdep.h"
 #include "policy-engine.h"
-#include "policy-runtime.h"
-#include "policy-state.h"
-#include "policy-wamr-vm.h"
-#include "meta-interface-policy.h"
+#include "policy-wamr.h"
+#include "meta-interface-protocol.h"
 #include "policy/policy-wasm-abi.h"
 #include "qemu/error-report.h"
 
 #include <elf.h>
 #include <inttypes.h>
 #include <openssl/crypto.h>
+
+/* Generated in the build directory from meta-interface-policy.wasm. */
+extern const uint8_t pe_meta_interface_policy_wasm[];
+extern const size_t pe_meta_interface_policy_wasm_size;
 
 static __thread uint32_t pe_executing_slots;
 
@@ -50,7 +52,6 @@ static void runtime_policy_clear_identity(struct runtime_policy_record *record)
     record->origin = PE_ORIGIN_STORED;
     record->state = PE_RUNTIME_INACTIVE;
     record->vm = NULL;
-    record->state_store = NULL;
     record->fault_count = 0;
     record->owned_oob_count = 0;
     memset(record->owned_oob, 0, sizeof(record->owned_oob));
@@ -85,7 +86,7 @@ int pe_activation_stage_subscription(struct pe_policy_execution *execution,
         break;
     case SXS_EVENT_BACKEND:
         if (selector != SXS_WASM_SELECTOR_ANY &&
-            selector > FTL_BACKEND_EVENT_ERASE) {
+            selector > BBM_EVENT_ERASE) {
             return -SXS_WASM_EINVAL;
         }
         break;
@@ -203,14 +204,15 @@ int pe_activation_stage_namespace_config(
     return 0;
 }
 
-int pe_activation_stage_ftl_finalize(struct pe_policy_execution *execution)
+int pe_activation_stage_eswd_layout_finalize(
+    struct pe_policy_execution *execution)
 {
     if (!execution || !execution->engine || !execution->owner ||
         execution->authoritative_phase != SXS_PHASE_INIT ||
         !execution->activation) {
         return -SXS_WASM_EPERM;
     }
-    execution->activation->finalize_staged = true;
+    execution->activation->eswd_layout_finalize_staged = true;
     return 0;
 }
 
@@ -330,7 +332,7 @@ static int pe_read_policy_payload(struct ssd *ssd,
     *payload_out = NULL;
     payload = g_try_malloc(desc->policy_size_bytes);
     if (!payload ||
-        bbm_policy_storage_read(ssd->fb, ssd->bbm, desc->blocks,
+        bbm_policy_storage_read(ssd->raw_flash, ssd->bbm, desc->blocks,
                                 desc->block_count, payload,
                                 desc->policy_size_bytes) != 0 ||
         (desc->expected_payload &&
@@ -379,7 +381,7 @@ static void copy_nvme_event(struct pe_policy_execution *execution,
 }
 
 static void copy_backend_event(struct pe_policy_execution *execution,
-                               struct FtlBackendEvent *event)
+                               const struct BbmEvent *event)
 {
     struct sxs_backend_event *destination =
         &execution->event_snapshot.backend;
@@ -631,15 +633,14 @@ uint64_t pe_dispatch_admin_cmd(struct policy_engine *pe, struct ssd *ssd,
     return 0;
 }
 
-void pe_dispatch_backend_event(struct policy_engine *pe, struct FtlBackend *fb,
-                               struct bbm *ctx,
-                               struct FtlBackendEvent *event)
+void pe_dispatch_flash_event(const struct BbmEvent *event, void *context)
 {
+    struct policy_engine *pe = context;
     struct pe_policy_subscription *subscriptions;
     size_t count;
     size_t i;
 
-    if (!pe || !fb || !ctx || !event) {
+    if (!pe || !event) {
         return;
     }
     subscriptions = snapshot_subscriptions(
@@ -648,12 +649,13 @@ void pe_dispatch_backend_event(struct policy_engine *pe, struct FtlBackend *fb,
         uint64_t ignored;
         bool fault;
 
-        execute_subscription(pe, &subscriptions[i], event, &ignored, &fault);
+        execute_subscription(pe, &subscriptions[i], (void *)event, &ignored,
+                             &fault);
     }
     g_free(subscriptions);
 }
 
-void pe_dispatch_pswd_transition(struct FtlBackend *fb,
+void pe_dispatch_pswd_transition(struct RawFlash *fb,
                                  const struct PswdStateTransitionEvent *event,
                                  void *notify_ctx)
 {
@@ -761,7 +763,6 @@ struct policy_engine *pe_create(struct ssd *ssd)
     pe = g_new0(struct policy_engine, 1);
     pe->ssd = ssd;
     qemu_mutex_init(&pe->management_lock);
-    qemu_mutex_init(&pe->state_lock);
     for (i = 0; i < MAX_RUNTIME_POLICIES; i++) {
         qemu_mutex_init(&pe->runtime_policies[i].execution_lock);
         pe->runtime_policies[i].state = PE_RUNTIME_INACTIVE;
@@ -914,8 +915,8 @@ static int validate_activation_transaction(
     uint32_t new_oob_count = 0;
     uint32_t i;
 
-    page_size = (uint64_t)pe->ssd->fb->sp.secs_per_pg *
-                pe->ssd->fb->sp.secsz;
+    page_size = (uint64_t)pe->ssd->raw_flash->sp.secs_per_pg *
+                pe->ssd->raw_flash->sp.secsz;
     if (page_size > SXS_WASM_MAX_PAGE_BYTES ||
         !privileged_subscriptions_available(pe, record, activation) ||
         !blob_complete(activation->namespace_blob_written,
@@ -931,23 +932,25 @@ static int validate_activation_transaction(
     if (activation->namespace_config_staged && !namespace) {
         return -1;
     }
-    if (!pe->ftl_config_committed &&
+    if (!pe->policy_api_config_committed &&
         (activation->eswd_config_staged ||
-         activation->namespace_config_staged || activation->finalize_staged) &&
+         activation->namespace_config_staged ||
+         activation->eswd_layout_finalize_staged) &&
         (!activation->eswd_config_staged ||
          !activation->namespace_config_staged ||
-         !activation->finalize_staged)) {
+         !activation->eswd_layout_finalize_staged)) {
         return -1;
     }
-    if (activation->finalize_staged && !activation->eswd_config_staged &&
+    if (activation->eswd_layout_finalize_staged &&
+        !activation->eswd_config_staged &&
         !pe->ssd->eswd_config_set) {
         return -1;
     }
-    if (pe->ftl_config_committed) {
+    if (pe->policy_api_config_committed) {
         if ((activation->eswd_config_staged ||
              activation->namespace_config_staged ||
-             activation->finalize_staged) &&
-            pe->ftl_config_owner_policy_id != record->policy_id) {
+             activation->eswd_layout_finalize_staged) &&
+            pe->policy_api_config_owner_policy_id != record->policy_id) {
             return -1;
         }
         if (activation->eswd_config_staged &&
@@ -984,16 +987,16 @@ static int validate_activation_transaction(
             .blocks_per_eswd = activation->eswd_config.blocks_per_eswd,
         };
         if (!pe->ssd->bbm || !pe->ssd->bbm->geom ||
-            !eswd_config_valid(&candidate_config,
+            !flash_subsystem_eswd_config_valid(&candidate_config,
                                pe->ssd->bbm->geom->nchs,
                                pe->ssd->bbm->geom->luns_per_ch,
                                pe->ssd->bbm->geom->pls_per_lun,
                                pe->ssd->bbm->geom->blks_per_lun_log) ||
-            eswd_layout_compute(&candidate_layout, &candidate_config,
+            flash_subsystem_eswd_layout_compute(&candidate_layout, &candidate_config,
                                 pe->ssd->bbm->geom) != 0) {
             return -1;
         }
-        eswd_layout_cleanup(&candidate_layout);
+        flash_subsystem_eswd_layout_cleanup(&candidate_layout);
     }
     for (i = 0; i < activation->oob_count; i++) {
         if (!activation->oob[i].already_committed) {
@@ -1002,7 +1005,7 @@ static int validate_activation_transaction(
         }
     }
     if (new_oob_count > MAX_POLICY_OWNED_OOB - record->owned_oob_count ||
-        ftl_backend_can_register_oob_policies(pe->ssd->fb, new_oob_sizes,
+        raw_flash_can_register_oob_policies(pe->ssd->raw_flash, new_oob_sizes,
                                               new_oob_count) != 0) {
         return -1;
     }
@@ -1016,17 +1019,18 @@ static void commit_activation_resources(
     uint32_t i;
     int rc;
 
-    if (activation->eswd_config_staged && !pe->ftl_config_committed) {
+    if (activation->eswd_config_staged && !pe->policy_api_config_committed) {
         struct eswd_config config = {
             .striping_level = activation->eswd_config.striping_level,
             .blocks_per_eswd = activation->eswd_config.blocks_per_eswd,
         };
 
-        set_eswd_config(pe->ssd, &config);
+        flash_subsystem_set_eswd_config(pe->ssd, &config);
         g_assert(pe->ssd->eswd_config_set);
         pe->committed_eswd_config = config;
     }
-    if (activation->namespace_config_staged && !pe->ftl_config_committed) {
+    if (activation->namespace_config_staged &&
+        !pe->policy_api_config_committed) {
         struct NamespacePersonalityConfig config = {
             .csi = activation->namespace_config.csi,
             .nsze = activation->namespace_config.nsze,
@@ -1041,7 +1045,7 @@ static void commit_activation_resources(
                 activation->namespace_config.controller_blob_length,
         };
 
-        rc = configure_namespace_personality(pe->ssd, &config);
+        rc = flash_subsystem_configure_namespace(pe->ssd, &config);
         g_assert(rc == 0);
     }
     for (i = 0; i < activation->oob_count; i++) {
@@ -1055,7 +1059,7 @@ static void commit_activation_resources(
         snprintf(name, sizeof(name), "policy-%u-object-%u",
                  record->policy_id, staged->object_id);
         g_assert(record->owned_oob_count < MAX_POLICY_OWNED_OOB);
-        rc = ftl_register_oob_region(pe->ssd, name, staged->bytes_per_page,
+        rc = flash_subsystem_register_oob_region(pe->ssd, name, staged->bytes_per_page,
                                      &handle);
         g_assert(rc == 0);
         record->owned_oob[record->owned_oob_count++] =
@@ -1065,22 +1069,20 @@ static void commit_activation_resources(
                 .backend_handle = handle,
             };
     }
-    if (activation->finalize_staged && !pe->ssd->eswd_layout_finalized) {
-        rc = finalize_ftl_init(pe->ssd);
+    if (activation->eswd_layout_finalize_staged &&
+        !pe->ssd->eswd_layout_finalized) {
+        rc = flash_subsystem_finalize(pe->ssd);
         g_assert(rc == 0);
-        pe->ftl_config_owner_policy_id = record->policy_id;
-        pe->ftl_config_committed = true;
+        pe->policy_api_config_owner_policy_id = record->policy_id;
+        pe->policy_api_config_committed = true;
     }
 }
 
 static void activation_transaction_destroy(
-    struct pe_activation_transaction *activation, bool abort_state)
+    struct pe_activation_transaction *activation)
 {
     if (!activation) {
         return;
-    }
-    if (abort_state && activation->state_transaction) {
-        pe_policy_state_transaction_abort(activation->state_transaction);
     }
     g_free(activation->namespace_blob);
     g_free(activation->controller_blob);
@@ -1097,7 +1099,7 @@ static void activation_transaction_destroy(
 static int activate_policy_artifact(struct policy_engine *pe,
                                     struct runtime_policy_record *record,
                                     uint16_t slot, const uint8_t *artifact,
-                                    size_t artifact_size, bool restored)
+                                    size_t artifact_size)
 {
     const struct pe_wamr_load_config load_config = {
         .privilege = record->privilege,
@@ -1116,18 +1118,10 @@ static int activate_policy_artifact(struct policy_engine *pe,
         goto fail;
     }
     activation = g_new0(struct pe_activation_transaction, 1);
-    activation->state_transaction = pe_policy_state_transaction_begin(
-        record->state_store, &pe->state_bytes, &pe->state_lock);
-    if (!activation->state_transaction) {
-        goto fail;
-    }
     execution.engine = pe;
     execution.owner = record;
     execution.activation = activation;
     initialize_execution(&execution, SXS_PHASE_INIT, SXS_EVENT_NONE, 0);
-    if (restored) {
-        execution.flags |= SXS_FLAG_STATE_RESTORED;
-    }
     if (pe_wamr_vm_execute(vm, &execution, &result) != 0 || result != 0) {
         OPENSSL_cleanse(&execution, sizeof(execution));
         warn_report("policy id=%u INIT failed (result=%" PRIu64 ")",
@@ -1139,27 +1133,24 @@ static int activate_policy_artifact(struct policy_engine *pe,
     qemu_mutex_lock(&pe->management_lock);
     if (record->state != PE_RUNTIME_ACTIVATING || record->vm ||
         count_free_subscriptions(pe) < activation->subscription_count ||
-        validate_activation_transaction(pe, record, activation) != 0 ||
-        pe_policy_state_transaction_commit(
-            activation->state_transaction, &record->state_store) != 0) {
+        validate_activation_transaction(pe, record, activation) != 0) {
         qemu_mutex_unlock(&pe->management_lock);
         goto fail;
     }
-    activation->state_transaction = NULL;
     commit_activation_resources(pe, record, activation);
     publish_subscriptions_locked(pe, record, slot, activation);
     record->vm = vm;
     vm = NULL;
     record->state = PE_RUNTIME_ACTIVE;
     qemu_mutex_unlock(&pe->management_lock);
-    activation_transaction_destroy(activation, false);
+    activation_transaction_destroy(activation);
     g_free(error);
     return 0;
 
 fail:
     g_free(error);
     pe_wamr_vm_destroy(vm);
-    activation_transaction_destroy(activation, true);
+    activation_transaction_destroy(activation);
     return -1;
 }
 
@@ -1195,7 +1186,7 @@ int pe_activate_firmware_policy(struct policy_engine *pe, struct ssd *ssd,
     qemu_mutex_unlock(&pe->management_lock);
 
     rc = activate_policy_artifact(pe, record, (uint16_t)slot, artifact,
-                                  artifact_size, false);
+                                  artifact_size);
     if (rc != 0) {
         qemu_mutex_lock(&pe->management_lock);
         runtime_policy_clear_identity(record);
@@ -1225,7 +1216,6 @@ int pe_activate_stored_policy(struct policy_engine *pe, struct ssd *ssd,
     uint8_t *payload = NULL;
     int slot;
     bool new_record = false;
-    bool restored;
     int rc = -1;
 
     if (!pe || pe->ssd != ssd || !desc || !desc->blocks ||
@@ -1263,14 +1253,13 @@ int pe_activate_stored_policy(struct policy_engine *pe, struct ssd *ssd,
     }
     record->policy_version = desc->policy_version;
     record->state = PE_RUNTIME_ACTIVATING;
-    restored = record->state_store != NULL;
     qemu_mutex_unlock(&pe->management_lock);
 
     if (pe_read_policy_payload(ssd, desc, &payload) != 0) {
         goto fail;
     }
     if (activate_policy_artifact(pe, record, (uint16_t)slot, payload,
-                                 desc->policy_size_bytes, restored) != 0) {
+                                 desc->policy_size_bytes) != 0) {
         goto fail;
     }
     g_free(payload);
@@ -1283,7 +1272,7 @@ fail:
     g_free(payload);
     qemu_mutex_lock(&pe->management_lock);
     record->state = PE_RUNTIME_INACTIVE;
-    if (new_record && !record->state_store) {
+    if (new_record) {
         runtime_policy_clear_identity(record);
     }
     qemu_mutex_unlock(&pe->management_lock);
@@ -1335,9 +1324,9 @@ int pe_deactivate_policy(struct policy_engine *pe, uint32_t policy_id)
     return 0;
 }
 
-static int can_remove_policy_state_locked(struct policy_engine *pe,
-                                          uint32_t policy_id,
-                                          uint32_t generation)
+static int can_remove_policy_locked(struct policy_engine *pe,
+                                    uint32_t policy_id,
+                                    uint32_t generation)
 {
     struct runtime_policy_record *record;
     int slot;
@@ -1355,8 +1344,8 @@ static int can_remove_policy_state_locked(struct policy_engine *pe,
     for (uint32_t i = 0; i < record->owned_oob_count; i++) {
         size_t bytes_per_page;
 
-        if (ftl_backend_get_oob_policy_info(
-                pe->ssd->fb, record->owned_oob[i].backend_handle,
+        if (raw_flash_get_oob_policy_info(
+                pe->ssd->raw_flash, record->owned_oob[i].backend_handle,
                 NULL, &bytes_per_page) != 0 ||
             bytes_per_page != record->owned_oob[i].bytes_per_page) {
             return -1;
@@ -1365,8 +1354,8 @@ static int can_remove_policy_state_locked(struct policy_engine *pe,
     return 0;
 }
 
-int pe_can_remove_policy_state(struct policy_engine *pe, uint32_t policy_id,
-                               uint32_t generation)
+int pe_can_remove_policy(struct policy_engine *pe, uint32_t policy_id,
+                         uint32_t generation)
 {
     int rc;
 
@@ -1374,13 +1363,13 @@ int pe_can_remove_policy_state(struct policy_engine *pe, uint32_t policy_id,
         return -1;
     }
     qemu_mutex_lock(&pe->management_lock);
-    rc = can_remove_policy_state_locked(pe, policy_id, generation);
+    rc = can_remove_policy_locked(pe, policy_id, generation);
     qemu_mutex_unlock(&pe->management_lock);
     return rc;
 }
 
-int pe_remove_policy_state(struct policy_engine *pe, uint32_t policy_id,
-                           uint32_t generation)
+int pe_remove_policy(struct policy_engine *pe, uint32_t policy_id,
+                     uint32_t generation)
 {
     struct runtime_policy_record *record;
     int slot;
@@ -1389,7 +1378,7 @@ int pe_remove_policy_state(struct policy_engine *pe, uint32_t policy_id,
         return -1;
     }
     qemu_mutex_lock(&pe->management_lock);
-    if (can_remove_policy_state_locked(pe, policy_id, generation) != 0) {
+    if (can_remove_policy_locked(pe, policy_id, generation) != 0) {
         qemu_mutex_unlock(&pe->management_lock);
         return -1;
     }
@@ -1404,15 +1393,12 @@ int pe_remove_policy_state(struct policy_engine *pe, uint32_t policy_id,
         return -1;
     }
     for (uint32_t i = 0; i < record->owned_oob_count; i++) {
-        if (ftl_backend_unregister_oob_policy(
-                pe->ssd->fb, record->owned_oob[i].backend_handle) != 0) {
+        if (raw_flash_unregister_oob_policy(
+                pe->ssd->raw_flash, record->owned_oob[i].backend_handle) != 0) {
             qemu_mutex_unlock(&pe->management_lock);
             return -1;
         }
     }
-    pe_policy_state_store_destroy(record->state_store, &pe->state_bytes,
-                                  &pe->state_lock);
-    record->state_store = NULL;
     runtime_policy_clear_identity(record);
     qemu_mutex_unlock(&pe->management_lock);
     return 0;

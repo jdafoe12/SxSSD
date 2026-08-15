@@ -2,13 +2,12 @@
 #define BBM_H
 
 #include "../nvme.h"
-#include "../backend/ftl-backend.h"
-#include "policy-engine-types.h"
+#include "raw-flash.h"
 
 /*
- * BBM provides the pseudo-physical address layer above the raw FTL backend.
- * It translates host/FTL addresses, maintains overprovisioned-block mappings,
- * and synchronously reports backend operations to the policy engine.
+ * BBM provides the pseudo-physical address layer above raw flash. It owns
+ * overprovisioned-block mappings, translates addresses, and reports completed
+ * operations through an optional typed callback.
  *
  * Future remapping must preserve media parallelism by choosing a replacement
  * in an appropriate channel/LUN/plane locality.  The exact constraint remains
@@ -18,7 +17,9 @@ typedef struct ppa PseudoPpa;
 typedef struct pba PseudoPba;
 
 struct bbm;
-struct policy_engine;
+struct BbmEvent;
+
+typedef void (*BbmEventNotify)(const struct BbmEvent *event, void *context);
 
 /* Logical geometry (after OP/bad-block) maintained by BBM. */
 struct bbm_geom {
@@ -80,8 +81,9 @@ struct bbm {
     /* Logical geometry (after overprovisioning) */
     struct bbm_geom *geom;
 
-    /* Policy engine (set by FTL at init); backend and pSWD hooks live there */
-    struct policy_engine *policy_engine;
+    /* Operation events travel upward without coupling BBM to policy-engine. */
+    BbmEventNotify event_notify;
+    void *event_notify_context;
 
     /* Generic bookkeeping for physical blocks excluded from pseudo allocation. */
     uint64_t total_phys_blks;
@@ -113,19 +115,19 @@ int bbm_translate_ppa(const struct bbm *ctx, const PseudoPpa *pppa, struct ppa *
  * be added.
  */
 int bbm_policy_storage_geometry(
-    const struct FtlBackend *fb, const struct bbm *ctx,
+    const struct RawFlash *fb, const struct bbm *ctx,
     struct bbm_policy_storage_geometry *geometry);
 bool bbm_policy_storage_block_valid(const struct bbm *ctx,
                                     const struct pba *block);
 int bbm_policy_storage_claim(struct bbm *ctx, const struct pba *block);
 int bbm_policy_storage_release(struct bbm *ctx, const struct pba *block);
-int bbm_policy_storage_read(struct FtlBackend *fb, const struct bbm *ctx,
+int bbm_policy_storage_read(struct RawFlash *fb, const struct bbm *ctx,
                             const struct pba *blocks, uint32_t block_count,
                             void *data, uint32_t length);
-int bbm_policy_storage_write(struct FtlBackend *fb, const struct bbm *ctx,
+int bbm_policy_storage_write(struct RawFlash *fb, const struct bbm *ctx,
                              const struct pba *blocks, uint32_t block_count,
                              const void *data, uint32_t length);
-int bbm_policy_storage_erase(struct FtlBackend *fb, const struct bbm *ctx,
+int bbm_policy_storage_erase(struct RawFlash *fb, const struct bbm *ctx,
                              const struct pba *blocks, uint32_t block_count);
 
 enum BbmEventCmd {
@@ -140,8 +142,8 @@ enum BbmEventType {
 };
 
 /*
- * FTL-facing operation metadata.  BBM maps this to FtlBackendEvent and
- * synchronously dispatches the resulting backend event to policies.
+ * Policy-API-facing operation metadata. BBM maps this to RawFlashEvent, then
+ * reports the completed operation synchronously through event_notify.
  *
  * TODO(error-event): define a dedicated policy error event that carries the
  * relevant non-zero status entries without conflating them with the operation
@@ -153,77 +155,67 @@ struct BbmEvent {
     uint32_t count;
     int *status_list; /* optional per-operation status storage */
     int64_t stime;    /* request start time */
-    int64_t lat;      /* end-to-end latency as seen by BBM/FTL */
+    int64_t lat;      /* latency reported by raw flash */
 };
 
-/* These are for serving NVMe requests directly. */
-int bbm_read(struct FtlBackend *fb, const struct bbm *ctx,
-             struct NvmeRequest *req, PseudoPpa *ppas,
-             uint64_t ppa_count, uint64_t page_size, struct BbmEvent *event);
-int bbm_write(struct FtlBackend *fb, const struct bbm *ctx,
-              struct NvmeRequest *req, PseudoPpa *ppas,
-              uint64_t ppa_count, uint64_t page_size, struct BbmEvent *event);
-
-/* Direct operations on the FTL backend, without involving the host. */
-int bbm_raw_read(struct FtlBackend *fb, const struct bbm *ctx,
-                 uint8_t *buffer, PseudoPpa *ppas,
-                 uint64_t ppa_count, uint64_t page_size,
-                 void *oob_buf, size_t oob_offset, size_t oob_len,
-                 struct BbmEvent *event);
-int bbm_raw_write(struct FtlBackend *fb, const struct bbm *ctx,
-                  uint8_t *buffer, PseudoPpa *ppas,
-                  uint64_t ppa_count, uint64_t page_size,
-                  const void *oob_buf, size_t oob_offset, size_t oob_len,
-                  struct BbmEvent *event);
-int bbm_raw_erase(struct FtlBackend *fb, const struct bbm *ctx,
-                  PseudoPba *pbns, uint64_t blk_count,
-                  struct BbmEvent *event);
+int bbm_read(struct RawFlash *fb, const struct bbm *ctx, uint8_t *buffer,
+             PseudoPpa *ppas, uint64_t page_count, uint64_t page_size,
+             void *oob_buf, size_t oob_offset, size_t oob_len,
+             struct BbmEvent *event);
+int bbm_write(struct RawFlash *fb, const struct bbm *ctx,
+              const uint8_t *buffer, PseudoPpa *ppas, uint64_t page_count,
+              uint64_t page_size, const void *oob_buf, size_t oob_offset,
+              size_t oob_len, struct BbmEvent *event);
+int bbm_erase(struct RawFlash *fb, const struct bbm *ctx,
+              PseudoPba *blocks, uint64_t block_count,
+              struct BbmEvent *event);
 
 /*
  * Query erase count for a *pseudo* block address.
  * BBM translates pseudo -> physical and delegates to backend.
  * Returns >= 0 on success, -1 on invalid input.
  */
-int bbm_get_erase_cnt(const struct FtlBackend *fb, const struct bbm *ctx,
+int bbm_get_erase_cnt(const struct RawFlash *fb, const struct bbm *ctx,
                       const PseudoPba *ppba);
 
 /* Page validity: BBM translates PseudoPpa -> ppa/pba and calls backend. */
-void bbm_mark_page_valid(struct FtlBackend *fb, const struct bbm *ctx,
+void bbm_mark_page_valid(struct RawFlash *fb, const struct bbm *ctx,
                          const PseudoPpa *ppa);
-void bbm_mark_page_invalid(struct FtlBackend *fb, const struct bbm *ctx,
+void bbm_mark_page_invalid(struct RawFlash *fb, const struct bbm *ctx,
                            const PseudoPpa *ppa);
-void bbm_mark_block_free(struct FtlBackend *fb, const struct bbm *ctx,
+void bbm_mark_block_free(struct RawFlash *fb, const struct bbm *ctx,
                          const PseudoPpa *ppa);
-int bbm_get_page_status(struct FtlBackend *fb, const struct bbm *ctx,
+int bbm_get_page_status(struct RawFlash *fb, const struct bbm *ctx,
                         const PseudoPpa *ppa);
-void bbm_get_block_vpc_ipc(struct FtlBackend *fb, const struct bbm *ctx,
+void bbm_get_block_vpc_ipc(struct RawFlash *fb, const struct bbm *ctx,
                            const PseudoPpa *ppa, int *vpc, int *ipc);
 
-void bbm_set_policy_engine(struct bbm *ctx, struct policy_engine *pe);
+void bbm_set_event_notify(struct bbm *ctx, BbmEventNotify notify,
+                          void *context);
 
 /*
  * Future bad-block/error-handling mechanisms.  These are intentionally kept
  * as explicit design points even where implementation is incomplete:
  * mark/sanitize/remap, capacity shrink, read retry, and physical data moves.
  */
-int bbm_mark_block_bad(struct FtlBackend *fb, const struct bbm *ctx,
+int bbm_mark_block_bad(struct RawFlash *fb, const struct bbm *ctx,
                        const struct ppa *ppa);
 
-int bbm_sanitize_block(struct FtlBackend *fb, const struct bbm *ctx,
+int bbm_sanitize_block(struct RawFlash *fb, const struct bbm *ctx,
                        const struct ppa *ppa);
 
-int bbm_remap_block(struct FtlBackend *fb, const struct bbm *ctx,
+int bbm_remap_block(struct RawFlash *fb, const struct bbm *ctx,
                     const struct ppa *ppa);
 
-int bbm_shrink_ssd(struct FtlBackend *fb, const struct bbm *ctx);
+int bbm_shrink_ssd(struct RawFlash *fb, const struct bbm *ctx);
 
-int bbm_read_retry(struct FtlBackend *fb, const struct bbm *ctx,
+int bbm_read_retry(struct RawFlash *fb, const struct bbm *ctx,
                    const struct ppa *ppa);
 
-int bbm_move_valid_data(struct FtlBackend *fb, const struct bbm *ctx,
+int bbm_move_valid_data(struct RawFlash *fb, const struct bbm *ctx,
                         const struct ppa *ppa);
 
-int bbm_move_all_data(struct FtlBackend *fb, const struct bbm *ctx,
+int bbm_move_all_data(struct RawFlash *fb, const struct bbm *ctx,
                       const struct ppa *ppa);
 
 #endif

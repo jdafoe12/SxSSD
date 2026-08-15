@@ -54,6 +54,8 @@ struct zns_zone_state {
     sxs_u16 reserved;
     sxs_u64 start_lba;
     sxs_u64 capacity;
+    sxs_u64 write_pointer; /* Logical ZNS write pointer visible to the host. */
+    sxs_u64 data_end_lba;  /* First LBA after host-written data. */
 };
 
 struct zns_policy_state {

@@ -44,7 +44,6 @@ fi
     -mno-atomics -mno-bulk-memory -mno-reference-types -mno-simd128 \
     -mllvm -disable-loop-idiom-all -I"$(dirname "$input")" \
     -Wl,--no-entry,--strip-all -Wl,"$memory_export" \
-    -Wl,--export=__stack_pointer \
     -Wl,--initial-memory=2097152,--max-memory=2097152 \
     -Wl,-z,stack-size=65536 -Wl,--allow-undefined-file="$allowlist" \
     -o "$output" "$input"

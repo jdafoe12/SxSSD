@@ -13,10 +13,6 @@ typedef __INT64_TYPE__ sxs_s64;
 #define SXS_WASM_MAX_PAGE_BYTES 4096U
 #define SXS_WASM_MAX_ARTIFACT_BYTES (1024U * 1024U)
 #define SXS_WASM_MAX_SUBSCRIPTIONS_PER_POLICY 64U
-#define SXS_WASM_MAX_STATE_OBJECTS 32U
-#define SXS_WASM_MAX_STATE_ELEMENT_BYTES 256U
-#define SXS_WASM_MAX_STATE_BYTES_PER_POLICY (256ULL * 1024ULL * 1024ULL)
-#define SXS_WASM_MAX_STATE_BYTES_GLOBAL (512ULL * 1024ULL * 1024ULL)
 #define SXS_WASM_SELECTOR_ANY 0xffffffffU
 #define SXS_WASM_ACTION_ERROR (~0ULL)
 
@@ -44,20 +40,6 @@ enum sxs_event_kind {
     SXS_EVENT_BACKEND = 3,
     SXS_EVENT_PSWD_TRANSITION = 4,
     SXS_EVENT_BACKGROUND = 5,
-};
-
-enum sxs_policy_context_flags {
-    SXS_FLAG_STATE_RESTORED = 1U << 0,
-};
-
-enum sxs_state_flags {
-    SXS_STATE_INIT_U64 = 1U << 0,
-    SXS_STATE_SECRET = 1U << 1,
-};
-
-enum sxs_eswd_range_operation {
-    SXS_ESWD_CHECK_SEQUENTIAL_WRITE = 1,
-    SXS_ESWD_CHECK_READ = 2,
 };
 
 enum sxs_namespace_blob_kind {
@@ -150,14 +132,6 @@ struct sxs_page_read_request {
 struct sxs_page_append_request {
     sxs_u32 eswd_id, oob_object_id;
 };
-struct sxs_eswd_stage_write_request {
-    sxs_u32 eswd_id, lba_count;
-    sxs_u64 start_lba, request_byte_offset;
-};
-struct sxs_eswd_page_read_request {
-    sxs_u32 eswd_id, reserved;
-    sxs_u64 page_lba;
-};
 struct sxs_page_result {
     sxs_s32 status;
     sxs_u32 committed_lbas;
@@ -211,14 +185,6 @@ extern sxs_s32 sxs_pswd_event_get(struct sxs_pswd_event *output);
 
 SXS_IMPORT("sxs_subscribe")
 extern sxs_s32 sxs_subscribe(sxs_u32, sxs_u32, sxs_u32, sxs_u32);
-SXS_IMPORT("sxs_state_create")
-extern sxs_s32 sxs_state_create(sxs_u32, sxs_u32, sxs_u64, sxs_u32, sxs_u64);
-SXS_IMPORT("sxs_state_read")
-extern sxs_s32 sxs_state_read(sxs_u32, sxs_u64, sxs_u32, void *, sxs_u32);
-SXS_IMPORT("sxs_state_write")
-extern sxs_s32 sxs_state_write(sxs_u32, sxs_u64, sxs_u32, const void *, sxs_u32);
-SXS_IMPORT("sxs_state_fill_u64")
-extern sxs_s32 sxs_state_fill_u64(sxs_u32, sxs_u64);
 SXS_IMPORT("sxs_backend_status_get")
 extern sxs_s32 sxs_backend_status_get(sxs_u64 index, sxs_s32 *output);
 SXS_IMPORT("sxs_geometry_get")
@@ -257,15 +223,11 @@ extern sxs_s32 sxs_eswd_config_stage(const struct sxs_eswd_config *value);
 SXS_IMPORT("sxs_namespace_config_stage")
 extern sxs_s32 sxs_namespace_config_stage(
     const struct sxs_namespace_config *value);
-SXS_IMPORT("sxs_ftl_finalize_stage")
-extern sxs_s32 sxs_ftl_finalize_stage(void);
+SXS_IMPORT("sxs_eswd_layout_finalize_stage")
+extern sxs_s32 sxs_eswd_layout_finalize_stage(void);
 SXS_IMPORT("sxs_oob_register_stage")
 extern sxs_s32 sxs_oob_register_stage(sxs_u32, sxs_u32);
 SXS_IMPORT("sxs_eswd_wp_get") extern sxs_s64 sxs_eswd_wp_get(sxs_u32);
-SXS_IMPORT("sxs_eswd_effective_wp_get")
-extern sxs_s64 sxs_eswd_effective_wp_get(sxs_u32);
-SXS_IMPORT("sxs_eswd_range_check")
-extern sxs_s32 sxs_eswd_range_check(sxs_u32, sxs_u32, sxs_u64, sxs_u32);
 SXS_IMPORT("sxs_eswd_to_ppa")
 extern sxs_s64 sxs_eswd_to_ppa(sxs_u32, sxs_u32);
 SXS_IMPORT("sxs_ppa_to_eswd")
@@ -291,14 +253,6 @@ extern sxs_s32 sxs_page_append(const struct sxs_page_append_request *request,
 SXS_IMPORT("sxs_page_migrate")
 extern sxs_s32 sxs_page_migrate(sxs_u64 source, sxs_u32 destination,
                                 struct sxs_page_result *result);
-SXS_IMPORT("sxs_eswd_stage_write")
-extern sxs_s32 sxs_eswd_stage_write(
-    const struct sxs_eswd_stage_write_request *request,
-    struct sxs_page_result *result);
-SXS_IMPORT("sxs_eswd_page_read")
-extern sxs_s32 sxs_eswd_page_read(
-    const struct sxs_eswd_page_read_request *request,
-    void *data, sxs_u32 data_length, struct sxs_page_result *result);
 SXS_IMPORT("sxs_namespace_blob_stage")
 extern sxs_s32 sxs_namespace_blob_stage(sxs_u32, sxs_u32,
                                         const void *, sxs_u32);

@@ -265,22 +265,22 @@ deactivate_remove()
     "$SCRIPT_DIR/policyctl" remove "$DEVICE" "$policy_id" >/dev/null
 }
 
-echo "[wamr-test] authoritative phase, condition rollback, and owner isolation"
+echo "[wamr-test] authoritative phase and owner isolation"
 ISOLATION_ID=4200
 install_activate "$POLICY_DIR/wasm-isolation-policy.wasm" "$ISOLATION_ID"
 [ "$("$SCRIPT_DIR/policyctl" probe "$DEVICE" 0xe5 0)" = "0x49534f4c" ] ||
-    fail "condition effects or public phase forgery bypassed isolation"
+    fail "condition memory or public phase checks bypassed isolation"
 deactivate_remove "$ISOLATION_ID"
 
-echo "[wamr-test] same-generation state preservation and update reset"
+echo "[wamr-test] policy-owned memory lifecycle"
 STATE_ID=4201
 install_activate "$POLICY_DIR/wasm-state-policy.wasm" "$STATE_ID"
 [ "$("$SCRIPT_DIR/policyctl" probe "$DEVICE" 0xe8 0)" = "0x53540001" ] ||
     fail "state counter did not begin at one"
 "$SCRIPT_DIR/policyctl" deactivate "$DEVICE" "$STATE_ID" >/dev/null
 "$SCRIPT_DIR/policyctl" activate "$DEVICE" "$STATE_ID" >/dev/null
-[ "$("$SCRIPT_DIR/policyctl" probe "$DEVICE" 0xe8 0)" = "0x53540002" ] ||
-    fail "same-generation reactivation did not preserve state"
+[ "$("$SCRIPT_DIR/policyctl" probe "$DEVICE" 0xe8 0)" = "0x53540001" ] ||
+    fail "reactivated policy did not receive fresh linear memory"
 "$SCRIPT_DIR/policyctl" deactivate "$DEVICE" "$STATE_ID" >/dev/null
 "$SCRIPT_DIR/policyctl" update "$DEVICE" \
     "$POLICY_DIR/wasm-state-policy.wasm" "$STATE_ID" 2 >/dev/null

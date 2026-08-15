@@ -76,10 +76,10 @@ extern sxs_s32 sxs_privileged_policy_activate_stored(
     sxs_u32 block_count);
 SXS_PRIVILEGED_IMPORT("sxs_privileged_policy_deactivate")
 extern sxs_s32 sxs_privileged_policy_deactivate(sxs_u32);
-SXS_PRIVILEGED_IMPORT("sxs_privileged_policy_state_can_remove")
-extern sxs_s32 sxs_privileged_policy_state_can_remove(sxs_u32, sxs_u32);
-SXS_PRIVILEGED_IMPORT("sxs_privileged_policy_state_remove")
-extern sxs_s32 sxs_privileged_policy_state_remove(sxs_u32, sxs_u32);
+SXS_PRIVILEGED_IMPORT("sxs_privileged_policy_can_remove")
+extern sxs_s32 sxs_privileged_policy_can_remove(sxs_u32, sxs_u32);
+SXS_PRIVILEGED_IMPORT("sxs_privileged_policy_remove")
+extern sxs_s32 sxs_privileged_policy_remove(sxs_u32, sxs_u32);
 
 SXS_PRIVILEGED_IMPORT("sxs_privileged_device_attestation_sign")
 extern sxs_s32 sxs_privileged_device_attestation_sign(

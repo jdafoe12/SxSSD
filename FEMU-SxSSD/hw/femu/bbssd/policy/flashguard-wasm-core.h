@@ -3,13 +3,6 @@
 
 #include "policy-wasm-abi.h"
 
-#define FLASHGUARD_READ_BITMAP_OBJECT 10U
-#define FLASHGUARD_RETAINED_BITMAP_OBJECT 11U
-#define FLASHGUARD_TIMESTAMP_OBJECT 12U
-#define FLASHGUARD_OOB_SHADOW_OBJECT 13U
-#define FLASHGUARD_SETTINGS_OBJECT 14U
-#define FLASHGUARD_RETAINED_LIST_OBJECT 15U
-#define FLASHGUARD_RETAINED_POSITION_OBJECT 16U
 #define FLASHGUARD_OOB_OBJECT 1U
 
 #define FLASHGUARD_PAIR_LIST 10U
@@ -17,6 +10,8 @@
 #define FLASHGUARD_ADMIN_LIST 0xe0U
 #define FLASHGUARD_ADMIN_READ 0xe1U
 #define FLASHGUARD_MAX_LIST_ENTRIES 128U
+#define FLASHGUARD_MAX_LOGICAL_PAGES 4194304U
+#define FLASHGUARD_BITMAP_BYTES ((FLASHGUARD_MAX_LOGICAL_PAGES + 7U) / 8U)
 #define FLASHGUARD_RETAINED_FLAG 1U
 #define FLASHGUARD_RETENTION_NS \
     (20ULL * 24ULL * 60ULL * 60ULL * 1000000000ULL)
@@ -39,6 +34,15 @@ struct flashguard_settings {
     sxs_u64 retention_window_ns;
     sxs_u64 retained_count;
 };
+
+static sxs_u8 flashguard_read_bitmap[FLASHGUARD_BITMAP_BYTES];
+static sxs_u8 flashguard_retained_bitmap[FLASHGUARD_BITMAP_BYTES];
+static sxs_u64 flashguard_timestamps[FLASHGUARD_MAX_LOGICAL_PAGES];
+static struct flashguard_shadow
+    flashguard_shadows[FLASHGUARD_MAX_LOGICAL_PAGES];
+static sxs_u64 flashguard_retained_list[FLASHGUARD_MAX_LOGICAL_PAGES];
+static sxs_u32 flashguard_retained_positions[FLASHGUARD_MAX_LOGICAL_PAGES];
+static struct flashguard_settings flashguard_policy_settings;
 
 struct __attribute__((packed)) flashguard_list_header {
     sxs_u32 version;
@@ -103,65 +107,48 @@ static sxs_s64 flashguard_gc_before_erase(
 
 #include "block-policy-wasm-core.h"
 
-static sxs_s64 flashguard_state_read(struct sxs_policy_context *context,
-                                     sxs_u32 object_id, sxs_u64 index,
-                                     void *value, sxs_u32 length)
-{
-    (void)context;
-    return sxs_state_read(object_id, index, 0, value, length);
-}
-
-static sxs_s64 flashguard_state_write(struct sxs_policy_context *context,
-                                      sxs_u32 object_id, sxs_u64 index,
-                                      const void *value, sxs_u32 length)
-{
-    (void)context;
-    return sxs_state_write(object_id, index, 0, value, length);
-}
-
 static sxs_s64 flashguard_page_index(sxs_u64 ppa, sxs_u64 *index_out)
 {
     sxs_u64 index = sxs_ppa_to_page_index(ppa);
 
-    if ((sxs_s64)index < 0) {
+    if ((sxs_s64)index < 0 ||
+        index >= flashguard_policy_settings.physical_pages ||
+        index >= FLASHGUARD_MAX_LOGICAL_PAGES) {
         return -SXS_WASM_EINVAL;
     }
     *index_out = index;
     return 0;
 }
 
-static sxs_s64 flashguard_bitmap_get(struct sxs_policy_context *context,
-                                     sxs_u32 object_id, sxs_u64 page_index,
+static sxs_s64 flashguard_bitmap_get(const sxs_u8 *bitmap,
+                                     sxs_u64 page_index,
                                      sxs_u32 *set_out)
 {
-    sxs_u8 value;
-    sxs_s64 result = flashguard_state_read(context, object_id,
-                                           page_index >> 3, &value, 1);
-
-    if (result == 0) {
-        *set_out = (value & (1U << (page_index & 7))) != 0;
+    if (!set_out || page_index >= flashguard_policy_settings.physical_pages ||
+        page_index >= FLASHGUARD_MAX_LOGICAL_PAGES) {
+        return -SXS_WASM_EINVAL;
     }
-    return result;
+    *set_out = (bitmap[page_index >> 3] &
+                (1U << (page_index & 7))) != 0;
+    return 0;
 }
 
-static sxs_s64 flashguard_bitmap_set(struct sxs_policy_context *context,
-                                     sxs_u32 object_id, sxs_u64 page_index,
+static sxs_s64 flashguard_bitmap_set(sxs_u8 *bitmap, sxs_u64 page_index,
                                      sxs_u32 set)
 {
-    sxs_u8 value;
-    sxs_s64 result = flashguard_state_read(context, object_id,
-                                           page_index >> 3, &value, 1);
+    sxs_u8 *value;
 
-    if (result != 0) {
-        return result;
+    if (page_index >= flashguard_policy_settings.physical_pages ||
+        page_index >= FLASHGUARD_MAX_LOGICAL_PAGES) {
+        return -SXS_WASM_EINVAL;
     }
+    value = &bitmap[page_index >> 3];
     if (set) {
-        value |= 1U << (page_index & 7);
+        *value |= 1U << (page_index & 7);
     } else {
-        value &= ~(1U << (page_index & 7));
+        *value &= ~(1U << (page_index & 7));
     }
-    return flashguard_state_write(context, object_id, page_index >> 3,
-                                  &value, 1);
+    return 0;
 }
 
 static sxs_s64 flashguard_retained_add(struct sxs_policy_context *context,
@@ -171,35 +158,31 @@ static sxs_s64 flashguard_retained_add(struct sxs_policy_context *context,
     sxs_u32 position;
     sxs_u32 retained;
 
-    if (flashguard_bitmap_get(context, FLASHGUARD_RETAINED_BITMAP_OBJECT,
+    (void)context;
+    if (flashguard_bitmap_get(flashguard_retained_bitmap,
                               page_index, &retained) != 0) {
         return -SXS_WASM_EIO;
     }
     if (retained) {
         return 0;
     }
-    if (flashguard_state_read(context, FLASHGUARD_SETTINGS_OBJECT, 0,
-                              &settings, sizeof(settings)) != 0 ||
-        settings.retained_count >= settings.physical_pages) {
+    settings = flashguard_policy_settings;
+    if (settings.retained_count >= settings.physical_pages) {
         return -SXS_WASM_ENOSPC;
     }
     if (settings.retained_count >= 0xffffffffULL) {
         return -SXS_WASM_ENOSPC;
     }
     position = (sxs_u32)settings.retained_count + 1;
-    if (flashguard_state_write(context, FLASHGUARD_RETAINED_LIST_OBJECT,
-                               settings.retained_count, &ppa,
-                               sizeof(ppa)) != 0 ||
-        flashguard_state_write(context, FLASHGUARD_RETAINED_POSITION_OBJECT,
-                               page_index, &position,
-                               sizeof(position)) != 0 ||
-        flashguard_bitmap_set(context, FLASHGUARD_RETAINED_BITMAP_OBJECT,
+    flashguard_retained_list[settings.retained_count] = ppa;
+    flashguard_retained_positions[page_index] = position;
+    if (flashguard_bitmap_set(flashguard_retained_bitmap,
                               page_index, 1) != 0) {
         return -SXS_WASM_EIO;
     }
     settings.retained_count++;
-    return flashguard_state_write(context, FLASHGUARD_SETTINGS_OBJECT, 0,
-                                  &settings, sizeof(settings));
+    flashguard_policy_settings = settings;
+    return 0;
 }
 
 static sxs_s64 flashguard_retained_remove(struct sxs_policy_context *context,
@@ -209,23 +192,19 @@ static sxs_s64 flashguard_retained_remove(struct sxs_policy_context *context,
     sxs_u32 position;
     sxs_u64 last_ppa;
     sxs_u64 last_page_index;
-    sxs_u64 zero = 0;
-    sxs_u32 zero_position = 0;
     sxs_u32 retained;
 
-    if (flashguard_bitmap_get(context, FLASHGUARD_RETAINED_BITMAP_OBJECT,
+    (void)context;
+    if (flashguard_bitmap_get(flashguard_retained_bitmap,
                               page_index, &retained) != 0) {
         return -SXS_WASM_EIO;
     }
     if (!retained) {
         return 0;
     }
-    if (flashguard_state_read(context, FLASHGUARD_SETTINGS_OBJECT, 0,
-                              &settings, sizeof(settings)) != 0 ||
-        flashguard_state_read(context,
-                              FLASHGUARD_RETAINED_POSITION_OBJECT,
-                              page_index, &position, sizeof(position)) != 0 ||
-        position == 0 || position > settings.retained_count ||
+    settings = flashguard_policy_settings;
+    position = flashguard_retained_positions[page_index];
+    if (position == 0 || position > settings.retained_count ||
         settings.retained_count == 0) {
         return -SXS_WASM_EIO;
     }
@@ -234,48 +213,31 @@ static sxs_s64 flashguard_retained_remove(struct sxs_policy_context *context,
     if (position != settings.retained_count) {
         sxs_u32 moved_position = position + 1;
 
-        if (flashguard_state_read(context, FLASHGUARD_RETAINED_LIST_OBJECT,
-                                  settings.retained_count, &last_ppa,
-                                  sizeof(last_ppa)) != 0 ||
-            flashguard_page_index(last_ppa, &last_page_index) != 0 ||
-            flashguard_state_write(context, FLASHGUARD_RETAINED_LIST_OBJECT,
-                                   position, &last_ppa,
-                                   sizeof(last_ppa)) != 0 ||
-            flashguard_state_write(
-                context, FLASHGUARD_RETAINED_POSITION_OBJECT,
-                last_page_index, &moved_position,
-                sizeof(moved_position)) != 0) {
+        last_ppa = flashguard_retained_list[settings.retained_count];
+        if (flashguard_page_index(last_ppa, &last_page_index) != 0) {
             return -SXS_WASM_EIO;
         }
+        flashguard_retained_list[position] = last_ppa;
+        flashguard_retained_positions[last_page_index] = moved_position;
     }
-    if (flashguard_state_write(context, FLASHGUARD_RETAINED_LIST_OBJECT,
-                               settings.retained_count, &zero,
-                               sizeof(zero)) != 0 ||
-        flashguard_state_write(context,
-                               FLASHGUARD_RETAINED_POSITION_OBJECT,
-                               page_index, &zero_position,
-                               sizeof(zero_position)) != 0 ||
-        flashguard_bitmap_set(context, FLASHGUARD_RETAINED_BITMAP_OBJECT,
-                              page_index, 0) != 0 ||
-        flashguard_state_write(context, FLASHGUARD_SETTINGS_OBJECT, 0,
-                               &settings, sizeof(settings)) != 0) {
+    flashguard_retained_list[settings.retained_count] = 0;
+    flashguard_retained_positions[page_index] = 0;
+    if (flashguard_bitmap_set(flashguard_retained_bitmap,
+                              page_index, 0) != 0) {
         return -SXS_WASM_EIO;
     }
+    flashguard_policy_settings = settings;
     return 0;
 }
 
 static sxs_s64 flashguard_clear_tracking(struct sxs_policy_context *context,
                                          sxs_u64 page_index)
 {
-    sxs_u64 zero = 0;
-
-    if (flashguard_bitmap_set(context, FLASHGUARD_READ_BITMAP_OBJECT,
-                              page_index, 0) != 0 ||
-        flashguard_retained_remove(context, page_index) != 0 ||
-        flashguard_state_write(context, FLASHGUARD_TIMESTAMP_OBJECT,
-                               page_index, &zero, sizeof(zero)) != 0) {
+    if (flashguard_bitmap_set(flashguard_read_bitmap, page_index, 0) != 0 ||
+        flashguard_retained_remove(context, page_index) != 0) {
         return -SXS_WASM_EIO;
     }
+    flashguard_timestamps[page_index] = 0;
     return 0;
 }
 
@@ -287,33 +249,13 @@ static sxs_s64 flashguard_init(struct sxs_policy_context *context,
         .physical_pages = geometry->total_pages_log,
         .retention_window_ns = FLASHGUARD_RETENTION_NS,
     };
-    sxs_u64 bitmap_bytes = (geometry->total_pages_log + 7) / 8;
-
+    (void)context;
     (void)metadata;
-    if (bitmap_bytes == 0 ||
-        sxs_state_create(FLASHGUARD_READ_BITMAP_OBJECT, 1,
-                         bitmap_bytes, 0, 0) != 0 ||
-        sxs_state_create(FLASHGUARD_RETAINED_BITMAP_OBJECT, 1,
-                         bitmap_bytes, 0, 0) != 0 ||
-        sxs_state_create(FLASHGUARD_TIMESTAMP_OBJECT, sizeof(sxs_u64),
-                         geometry->total_pages_log, 0, 0) != 0 ||
-        sxs_state_create(FLASHGUARD_OOB_SHADOW_OBJECT,
-                         sizeof(struct flashguard_shadow),
-                         geometry->total_pages_log, 0, 0) != 0 ||
-        sxs_state_create(FLASHGUARD_RETAINED_LIST_OBJECT, sizeof(sxs_u64),
-                         geometry->total_pages_log, 0, 0) != 0 ||
-        sxs_state_create(FLASHGUARD_RETAINED_POSITION_OBJECT,
-                         sizeof(sxs_u32), geometry->total_pages_log,
-                         0, 0) != 0 ||
-        sxs_state_create(FLASHGUARD_SETTINGS_OBJECT, sizeof(settings),
-                         1, 0, 0) != 0) {
+    if (geometry->total_pages_log == 0 ||
+        geometry->total_pages_log > FLASHGUARD_MAX_LOGICAL_PAGES) {
         return -SXS_WASM_ENOSPC;
     }
-    if (!(context->flags & SXS_FLAG_STATE_RESTORED) &&
-        flashguard_state_write(context, FLASHGUARD_SETTINGS_OBJECT,
-                               0, &settings, sizeof(settings)) != 0) {
-        return -SXS_WASM_EIO;
-    }
+    flashguard_policy_settings = settings;
     if (sxs_oob_register_stage(FLASHGUARD_OOB_OBJECT,
                                sizeof(struct flashguard_oob)) != 0 ||
         sxs_subscribe(SXS_EVENT_NVME_ADMIN, FLASHGUARD_ADMIN_LIST,
@@ -351,23 +293,18 @@ static sxs_s64 flashguard_handle_old_page(struct sxs_policy_context *context,
 
     (void)lpn;
     if (flashguard_page_index(old_ppa, &page_index) != 0 ||
-        flashguard_bitmap_get(context, FLASHGUARD_READ_BITMAP_OBJECT,
+        flashguard_bitmap_get(flashguard_read_bitmap,
                               page_index, &was_read) != 0) {
         return -SXS_WASM_EIO;
     }
     if (was_read) {
-        if (flashguard_retained_add(context, old_ppa, page_index) != 0 ||
-            flashguard_state_read(context, FLASHGUARD_TIMESTAMP_OBJECT,
-                                  page_index, &timestamp,
-                                  sizeof(timestamp)) != 0) {
+        if (flashguard_retained_add(context, old_ppa, page_index) != 0) {
             return -SXS_WASM_EIO;
         }
+        timestamp = flashguard_timestamps[page_index];
         if (timestamp == 0) {
             timestamp = sxs_time_now_ns();
-            return flashguard_state_write(context,
-                                          FLASHGUARD_TIMESTAMP_OBJECT,
-                                          page_index, &timestamp,
-                                          sizeof(timestamp));
+            flashguard_timestamps[page_index] = timestamp;
         }
         return 0;
     }
@@ -391,8 +328,8 @@ static sxs_s64 flashguard_after_new_page(struct sxs_policy_context *context,
         flashguard_clear_tracking(context, page_index) != 0) {
         return -SXS_WASM_EIO;
     }
-    return flashguard_state_write(context, FLASHGUARD_OOB_SHADOW_OBJECT,
-                                  page_index, &shadow, sizeof(shadow));
+    flashguard_shadows[page_index] = shadow;
+    return 0;
 }
 
 static sxs_s64 flashguard_on_page_read(struct sxs_policy_context *context,
@@ -401,11 +338,11 @@ static sxs_s64 flashguard_on_page_read(struct sxs_policy_context *context,
     sxs_u64 page_index;
 
     (void)lpn;
+    (void)context;
     if (flashguard_page_index(ppa, &page_index) != 0) {
         return -SXS_WASM_EIO;
     }
-    return flashguard_bitmap_set(context, FLASHGUARD_READ_BITMAP_OBJECT,
-                                 page_index, 1);
+    return flashguard_bitmap_set(flashguard_read_bitmap, page_index, 1);
 }
 
 static sxs_u32 flashguard_gc_should_migrate(struct sxs_policy_context *context,
@@ -418,15 +355,13 @@ static sxs_u32 flashguard_gc_should_migrate(struct sxs_policy_context *context,
     sxs_u32 retained;
 
     if (flashguard_page_index(ppa, &page_index) != 0 ||
-        flashguard_bitmap_get(context, FLASHGUARD_RETAINED_BITMAP_OBJECT,
+        flashguard_bitmap_get(flashguard_retained_bitmap,
                               page_index, &retained) != 0 || !retained) {
         return 1;
     }
-    if (flashguard_state_read(context, FLASHGUARD_TIMESTAMP_OBJECT,
-                              page_index, &timestamp, sizeof(timestamp)) != 0 ||
-        flashguard_state_read(context, FLASHGUARD_SETTINGS_OBJECT,
-                              0, &settings, sizeof(settings)) != 0 ||
-        timestamp == 0 || settings.retention_window_ns == 0) {
+    timestamp = flashguard_timestamps[page_index];
+    settings = flashguard_policy_settings;
+    if (timestamp == 0 || settings.retention_window_ns == 0) {
         return 1;
     }
     now = sxs_time_now_ns();
@@ -451,24 +386,22 @@ static sxs_s64 flashguard_gc_after_migrate(struct sxs_policy_context *context,
     (void)lpn;
     if (flashguard_page_index(old_ppa, &old_index) != 0 ||
         flashguard_page_index(new_ppa, &new_index) != 0 ||
-        flashguard_bitmap_get(context, FLASHGUARD_READ_BITMAP_OBJECT,
+        flashguard_bitmap_get(flashguard_read_bitmap,
                               old_index, &was_read) != 0 ||
-        flashguard_bitmap_get(context, FLASHGUARD_RETAINED_BITMAP_OBJECT,
-                              old_index, &retained) != 0 ||
-        flashguard_state_read(context, FLASHGUARD_TIMESTAMP_OBJECT,
-                              old_index, &timestamp, sizeof(timestamp)) != 0 ||
-        flashguard_state_read(context, FLASHGUARD_OOB_SHADOW_OBJECT,
-                              old_index, &shadow, sizeof(shadow)) != 0 ||
-        flashguard_clear_tracking(context, old_index) != 0 ||
-        flashguard_clear_tracking(context, new_index) != 0 ||
-        flashguard_bitmap_set(context, FLASHGUARD_READ_BITMAP_OBJECT,
-                              new_index, was_read) != 0 ||
-        flashguard_state_write(context, FLASHGUARD_TIMESTAMP_OBJECT,
-                               new_index, &timestamp, sizeof(timestamp)) != 0 ||
-        flashguard_state_write(context, FLASHGUARD_OOB_SHADOW_OBJECT,
-                               new_index, &shadow, sizeof(shadow)) != 0) {
+        flashguard_bitmap_get(flashguard_retained_bitmap,
+                              old_index, &retained) != 0) {
         return -SXS_WASM_EIO;
     }
+    timestamp = flashguard_timestamps[old_index];
+    shadow = flashguard_shadows[old_index];
+    if (flashguard_clear_tracking(context, old_index) != 0 ||
+        flashguard_clear_tracking(context, new_index) != 0 ||
+        flashguard_bitmap_set(flashguard_read_bitmap,
+                              new_index, was_read) != 0) {
+        return -SXS_WASM_EIO;
+    }
+    flashguard_timestamps[new_index] = timestamp;
+    flashguard_shadows[new_index] = shadow;
     if (retained && flashguard_retained_add(context, new_ppa, new_index) != 0) {
         return -SXS_WASM_EIO;
     }
@@ -501,8 +434,9 @@ static sxs_s64 flashguard_get_page_record(
 {
     sxs_u64 page_index;
 
+    (void)context;
     if (flashguard_page_index(ppa, &page_index) != 0 ||
-        flashguard_bitmap_get(context, FLASHGUARD_RETAINED_BITMAP_OBJECT,
+        flashguard_bitmap_get(flashguard_retained_bitmap,
                               page_index, retained_out) != 0) {
         return -SXS_WASM_EIO;
     }
@@ -511,14 +445,8 @@ static sxs_s64 flashguard_get_page_record(
         *shadow_out = (struct flashguard_shadow) {0};
         return 0;
     }
-    if (flashguard_state_read(context, FLASHGUARD_TIMESTAMP_OBJECT,
-                              page_index, timestamp_out,
-                              sizeof(*timestamp_out)) != 0 ||
-        flashguard_state_read(context, FLASHGUARD_OOB_SHADOW_OBJECT,
-                              page_index, shadow_out,
-                              sizeof(*shadow_out)) != 0) {
-        return -SXS_WASM_EIO;
-    }
+    *timestamp_out = flashguard_timestamps[page_index];
+    *shadow_out = flashguard_shadows[page_index];
     return 0;
 }
 
@@ -533,9 +461,8 @@ static sxs_u64 flashguard_list(struct sxs_policy_context *context)
     if (maximum > FLASHGUARD_MAX_LIST_ENTRIES) {
         maximum = FLASHGUARD_MAX_LIST_ENTRIES;
     }
-    if (flashguard_state_read(context, FLASHGUARD_SETTINGS_OBJECT, 0,
-                              &settings, sizeof(settings)) != 0 ||
-        settings.retained_count > 0xffffffffULL) {
+    settings = flashguard_policy_settings;
+    if (settings.retained_count > 0xffffffffULL) {
         sxs_completion_status_set(BLOCK_NVME_INTERNAL_ERROR);
         return 0;
     }
@@ -551,9 +478,8 @@ static sxs_u64 flashguard_list(struct sxs_policy_context *context)
         sxs_u64 timestamp;
         sxs_u32 retained;
 
-        if (flashguard_state_read(context, FLASHGUARD_RETAINED_LIST_OBJECT,
-                                  ordinal, &ppa, sizeof(ppa)) != 0 ||
-            flashguard_get_page_record(context, ppa, &retained,
+        ppa = flashguard_retained_list[ordinal];
+        if (flashguard_get_page_record(context, ppa, &retained,
                                        &timestamp, &shadow) != 0 ||
             !retained) {
             sxs_completion_status_set(BLOCK_NVME_INTERNAL_ERROR);

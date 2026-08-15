@@ -51,8 +51,7 @@ meta_interface_wasm = custom_target(
     files('bbssd/policy/privileged-wasm-imports.allow'),
   ],
   depend_files: files(
-    'bbssd/meta-interface-policy.h',
-    'bbssd/policy-attestation-format.h',
+    'bbssd/meta-interface-protocol.h',
     'bbssd/policy/check-wasm-policy.sh',
     'bbssd/policy/generate-policy-import-allowlists.sh',
     'bbssd/policy/policy-imports.def',
@@ -74,7 +73,7 @@ meta_interface_embedded = custom_target(
 )
 
 femu_ss = ss.source_set()
-femu_ss.add(files('dma.c', 'intr.c', 'nvme-util.c', 'nvme-admin.c', 'nvme-io.c', 'femu.c', 'nossd/nop.c', 'nand/nand.c', 'timing-model/timing.c', 'ocssd/oc12.c', 'ocssd/oc20.c', 'zns/zns.c', 'zns/zftl.c','bbssd/bb.c', 'bbssd/bbm.c', 'bbssd/eswd-config.c', 'bbssd/eswd-layout.c', 'bbssd/ftl.c', 'bbssd/device-signing.c', 'bbssd/policy-crypto.c', 'bbssd/policy-state.c', 'bbssd/policy-api.c', 'bbssd/policy-wamr-imports.c', 'bbssd/policy-wamr-vm.c', 'bbssd/policy-engine.c', 'lib/pqueue.c', 'lib/rte_ring.c', 'backend/dram.c', 'backend/ftl-backend.c'), meta_interface_embedded)
+femu_ss.add(files('dma.c', 'intr.c', 'nvme-util.c', 'nvme-admin.c', 'nvme-io.c', 'femu.c', 'nossd/nop.c', 'nand/nand.c', 'timing-model/timing.c', 'ocssd/oc12.c', 'ocssd/oc20.c', 'zns/zns.c', 'zns/zftl.c', 'bbssd/bb.c', 'bbssd/bbm.c', 'bbssd/raw-flash.c', 'bbssd/device-trust.c', 'bbssd/policy-crypto.c', 'bbssd/policy-api.c', 'bbssd/policy-wamr.c', 'bbssd/policy-engine.c', 'lib/pqueue.c', 'lib/rte_ring.c', 'backend/dram.c'), meta_interface_embedded)
 femu_ss.add(when: openssl, if_true: openssl)
 femu_ss.add(when: wamr_for_femu, if_true: wamr_for_femu)
 

@@ -1,0 +1,1 @@
+/home/femu/scripts/atc21_zns_comparison/atc21-write --mode block --device /dev/nvme0n1 --output-dir /home/femu/stream-policy-results/smoke/block-baseline-20260814-173952 --offset 0 --working-set 12884901888 --zone-size 67108864 --bs 65536 --streams 4 --iodepth 32 --warmup 5 --runtime 20

@@ -2,7 +2,6 @@
 
 #define ISOLATION_OPCODE 0xe5U
 #define ISOLATION_PAIR 1U
-#define ISOLATION_STATE_OBJECT 1U
 #define ISOLATION_OOB_OBJECT 1U
 #define ISOLATION_PASS 0x49534f4cU
 #define ISOLATION_FORBIDDEN_EFFECT 0x42414400U
@@ -21,13 +20,7 @@ static sxs_u64 attempt_forbidden_effects(struct sxs_policy_context *context)
     (void)context;
     condition_memory_probe = value;
 
-    if (sxs_state_write(ISOLATION_STATE_OBJECT, 0, 0, &value,
-                        sizeof(sxs_u64)) != -SXS_WASM_EPERM ||
-        sxs_state_create(2, sizeof(sxs_u64), 1, 0, 0) !=
-            -SXS_WASM_EPERM ||
-        sxs_state_fill_u64(ISOLATION_STATE_OBJECT, 1) !=
-            -SXS_WASM_EPERM ||
-        sxs_completion_result_set(ISOLATION_FORBIDDEN_EFFECT) !=
+    if (sxs_completion_result_set(ISOLATION_FORBIDDEN_EFFECT) !=
             -SXS_WASM_EPERM ||
         sxs_completion_status_set(0) != -SXS_WASM_EPERM ||
         sxs_command_write(0, &byte, 1) != -SXS_WASM_EPERM ||
@@ -37,7 +30,7 @@ static sxs_u64 attempt_forbidden_effects(struct sxs_policy_context *context)
         sxs_oob_register_stage(ISOLATION_OOB_OBJECT, 1) !=
             -SXS_WASM_EPERM ||
         sxs_eswd_config_stage(&config) != -SXS_WASM_EPERM ||
-        sxs_ftl_finalize_stage() != -SXS_WASM_EPERM ||
+        sxs_eswd_layout_finalize_stage() != -SXS_WASM_EPERM ||
         sxs_crypto_random(&byte, 1) != -SXS_WASM_EPERM ||
         sxs_crypto_x25519_public(nonce, 32, crypto_output, 32) !=
             -SXS_WASM_EPERM ||
@@ -47,8 +40,7 @@ static sxs_u64 attempt_forbidden_effects(struct sxs_policy_context *context)
             -SXS_WASM_EPERM) {
         return 0;
     }
-    /* HMAC is side-effect-free outside linear memory, so conditions may use
-     * it.  Its output is covered by the condition memory snapshot/rollback. */
+    /* HMAC is side-effect-free outside policy-owned linear memory. */
     if (sxs_crypto_hmac_sha256(nonce, 32, nonce, 32,
                                crypto_output, 32) != 0) {
         return 0;
@@ -58,9 +50,7 @@ static sxs_u64 attempt_forbidden_effects(struct sxs_policy_context *context)
 
 static sxs_u64 isolation_init(void)
 {
-    return sxs_state_create(ISOLATION_STATE_OBJECT, sizeof(sxs_u64), 1,
-                            0, 0) == 0 &&
-                   sxs_oob_register_stage(ISOLATION_OOB_OBJECT, 1) == 0 &&
+    return sxs_oob_register_stage(ISOLATION_OOB_OBJECT, 1) == 0 &&
                    sxs_subscribe(SXS_EVENT_NVME_ADMIN,
                                  ISOLATION_OPCODE, ISOLATION_PAIR,
                                  0) == 0 ?
@@ -83,12 +73,8 @@ static sxs_u64 isolation_condition(struct sxs_policy_context *context)
 
 static sxs_u64 isolation_action(struct sxs_policy_context *context)
 {
-    sxs_u64 value = 1;
-
     (void)context;
-    if (sxs_state_read(ISOLATION_STATE_OBJECT, 0, 0, &value,
-                       sizeof(value)) != 0 || value != 0 ||
-        condition_memory_probe != 0 ||
+    if (condition_memory_probe != 0xfeedfaceULL ||
         sxs_completion_result_set(ISOLATION_PASS) != 0) {
         return SXS_WASM_ACTION_ERROR;
     }

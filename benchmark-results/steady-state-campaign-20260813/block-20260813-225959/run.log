@@ -1,0 +1,16 @@
+[atc21-comparison] Mode: block
+[atc21-comparison] Device: /dev/nvme0n1
+[atc21-comparison] Results: /home/femu/steady-state-campaign-20260813/block-20260813-225959
+[atc21-comparison] Requirement: use a freshly started FEMU instance
+[atc21-write] Using 192 initially empty regions; reclamation begins on reuse
+[atc21-write] Warmup: 300 seconds
+[atc21-write] Measuring: 300 seconds
+[atc21-write] 60/300 seconds: 190.88 MiB/s average
+[atc21-write] 120/300 seconds: 189.43 MiB/s average
+[atc21-write] 180/300 seconds: 187.25 MiB/s average
+[atc21-write] 240/300 seconds: 187.10 MiB/s average
+[atc21-write] 300/300 seconds: 187.43 MiB/s average
+[atc21-write] Complete: 187.43 MiB/s, errors=0
+
+[atc21-comparison] Complete. Results are in:
+/home/femu/steady-state-campaign-20260813/block-20260813-225959

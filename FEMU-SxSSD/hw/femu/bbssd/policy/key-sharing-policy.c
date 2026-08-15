@@ -4,7 +4,6 @@
 #define KEY_SHARING_FETCH_OPCODE 0xe2U
 #define KEY_SHARING_SUBMIT_PAIR 1U
 #define KEY_SHARING_FETCH_PAIR 2U
-#define KEY_SHARING_STATE_OBJECT 1U
 #define KEY_SHARING_FIELD_SIZE 32U
 #define KEY_SHARING_SIGNATURE_SIZE 64U
 
@@ -26,6 +25,8 @@ struct key_sharing_state {
     sxs_u32 shared_key_valid;
     sxs_u32 pending_response_valid;
 };
+
+static struct key_sharing_state key_sharing_state;
 
 static const sxs_u8 tapp_public_key[32] = {
     0xb8, 0xde, 0xd4, 0x25, 0xfe, 0xf9, 0x63, 0x1f,
@@ -65,10 +66,7 @@ static sxs_s64 hmac_sha256(const sxs_u8 *key, sxs_u32 key_length,
 
 static sxs_u64 key_sharing_init(void)
 {
-    if (sxs_state_create(KEY_SHARING_STATE_OBJECT,
-                         sizeof(struct key_sharing_state), 1,
-                         SXS_STATE_SECRET, 0) != 0 ||
-        sxs_subscribe(SXS_EVENT_NVME_ADMIN,
+    if (sxs_subscribe(SXS_EVENT_NVME_ADMIN,
                       KEY_SHARING_SUBMIT_OPCODE,
                       KEY_SHARING_SUBMIT_PAIR, 0) != 0 ||
         sxs_subscribe(SXS_EVENT_NVME_ADMIN,
@@ -87,14 +85,22 @@ static sxs_u64 key_sharing_condition(const struct sxs_policy_context *context)
 
 static sxs_s64 read_state(struct key_sharing_state *state)
 {
-    return sxs_state_read(KEY_SHARING_STATE_OBJECT, 0, 0, state,
-                          sizeof(*state));
+    if (!state) {
+        return -SXS_WASM_EINVAL;
+    }
+    bytes_copy((sxs_u8 *)state, (const sxs_u8 *)&key_sharing_state,
+               sizeof(*state));
+    return 0;
 }
 
 static sxs_s64 write_state(const struct key_sharing_state *state)
 {
-    return sxs_state_write(KEY_SHARING_STATE_OBJECT, 0, 0, state,
-                           sizeof(*state));
+    if (!state) {
+        return -SXS_WASM_EINVAL;
+    }
+    bytes_copy((sxs_u8 *)&key_sharing_state, (const sxs_u8 *)state,
+               sizeof(*state));
+    return 0;
 }
 
 static sxs_u64 fetch_response(struct sxs_policy_context *context)

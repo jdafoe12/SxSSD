@@ -16,8 +16,8 @@ WASM_CFLAGS = --target=wasm32-unknown-unknown -O2 -g0 -Wall -Wextra \
 	-mllvm -disable-loop-idiom-all -I.
 
 # wasm-ld learned --export-memory after LLVM 12.  LLVM 12 can still produce
-# the required exported fixed memory with --export-all; it also needs feature
-# checking disabled to export the mutable __stack_pointer global.
+# the required exported fixed memory with --export-all; that broader export
+# requires feature checking to be disabled for mutable globals.
 WASM_HAS_EXPORT_MEMORY := $(shell \
 	ld_path="$$($(WASM_CC) --target=wasm32-unknown-unknown \
 		-print-prog-name=wasm-ld 2>/dev/null)"; \
@@ -30,8 +30,20 @@ WASM_MEMORY_EXPORT_FLAGS = -Wl,--export-all,--no-check-features
 endif
 
 WASM_LDFLAGS = -Wl,--no-entry,--strip-all $(WASM_MEMORY_EXPORT_FLAGS) \
-	-Wl,--export=__stack_pointer \
 	-Wl,--initial-memory=65536,--max-memory=65536 \
+	-Wl,-z,stack-size=16384
+# Memory is part of each policy artifact's declaration. Block policies reserve
+# their fixed-size maps, and ZNS reserves one partial-page buffer per zone.
+# Policies without large fixed state keep the 64 KiB default above.
+BLOCK_WASM_LDFLAGS = -Wl,--no-entry,--strip-all $(WASM_MEMORY_EXPORT_FLAGS) \
+	-Wl,--initial-memory=71303168,--max-memory=71303168 \
+	-Wl,-z,stack-size=16384
+FLASHGUARD_WASM_LDFLAGS = \
+	-Wl,--no-entry,--strip-all $(WASM_MEMORY_EXPORT_FLAGS) \
+	-Wl,--initial-memory=220200960,--max-memory=220200960 \
+	-Wl,-z,stack-size=16384
+ZNS_WASM_LDFLAGS = -Wl,--no-entry,--strip-all $(WASM_MEMORY_EXPORT_FLAGS) \
+	-Wl,--initial-memory=2097152,--max-memory=2097152 \
 	-Wl,-z,stack-size=16384
 WASM_IMPORT_ALLOWLIST = wasm-imports.allow
 PRIVILEGED_WASM_IMPORT_ALLOWLIST = privileged-wasm-imports.allow
@@ -40,7 +52,6 @@ WASM_IMPORT_GENERATOR = generate-policy-import-allowlists.sh
 META_INTERFACE_POLICY = meta-interface-policy.wasm
 META_INTERFACE_LDFLAGS = \
 	-Wl,--no-entry,--strip-all $(WASM_MEMORY_EXPORT_FLAGS) \
-	-Wl,--export=__stack_pointer \
 	-Wl,--initial-memory=2097152,--max-memory=2097152 \
 	-Wl,-z,stack-size=65536
 
@@ -52,6 +63,10 @@ PRODUCTION_POLICIES = \
 	signing-test-policy.wasm \
 	key-sharing-policy.wasm \
 	wasm-smoke-policy.wasm
+EXPERIMENT_POLICIES = \
+	block-interface-policy-streams-1.wasm \
+	block-interface-policy-streams-2.wasm \
+	block-interface-policy-streams-4.wasm
 TEST_POLICIES = \
 	wasm-isolation-policy.wasm \
 	wasm-state-policy.wasm \
@@ -61,21 +76,24 @@ TEST_POLICIES = \
 	wasm-runtime-fault-policy.wasm
 NEGATIVE_FIXTURES = wasm-forbidden-policy.wasm \
 		wasm-privileged-forbidden-policy.wasm native-forbidden-policy.so
-GENERATED = $(PRODUCTION_POLICIES) $(TEST_POLICIES) $(NEGATIVE_FIXTURES) \
-		$(META_INTERFACE_POLICY)
+GENERATED = $(PRODUCTION_POLICIES) $(EXPERIMENT_POLICIES) \
+		$(TEST_POLICIES) $(NEGATIVE_FIXTURES) $(META_INTERFACE_POLICY)
 LEGACY_ARTIFACTS = \
 	block-interface-policy-baseline.so \
 	block-interface-policy-flashguard.so \
 	block-interface-flashguard-policy.so \
 	zns-policy.so signing-test-policy.so key-sharing-policy.so
 
-.PHONY: all tool wasm fixtures isolation-test reproducible check-toolchain \
-	check-imports clean
+.PHONY: all tool wasm experiments fixtures isolation-test reproducible \
+	check-toolchain check-imports clean
 
-all: check-toolchain check-imports $(PRODUCTION_POLICIES) $(TEST_POLICIES) \
-		$(NEGATIVE_FIXTURES) $(META_INTERFACE_POLICY)
+all: check-toolchain check-imports $(PRODUCTION_POLICIES) \
+		$(EXPERIMENT_POLICIES) $(TEST_POLICIES) $(NEGATIVE_FIXTURES) \
+		$(META_INTERFACE_POLICY)
 
 tool wasm: all
+
+experiments: check-toolchain check-imports $(EXPERIMENT_POLICIES)
 
 fixtures: check-toolchain check-imports $(TEST_POLICIES) $(NEGATIVE_FIXTURES)
 
@@ -94,16 +112,44 @@ check-imports:
 		$(WASM_IMPORT_ALLOWLIST) $(PRIVILEGED_WASM_IMPORT_ALLOWLIST)
 
 BLOCK_DEPS = block-policy-wasm-core.h policy-wasm-abi.h
+STREAM_DEPS = stream-policy-wasm-core.h policy-wasm-abi.h
 FLASHGUARD_DEPS = flashguard-wasm-core.h $(BLOCK_DEPS)
+POLICY_BUILD_DEPS = check-wasm-policy.sh $(WASM_IMPORT_ALLOWLIST) \
+	$(PRIVILEGED_WASM_IMPORT_ALLOWLIST) $(WASM_IMPORT_CATALOG) \
+	$(WASM_IMPORT_GENERATOR)
 
-block-interface-policy-baseline.wasm: block-interface-policy-baseline.c $(BLOCK_DEPS)
-block-interface-policy-flashguard.wasm: block-interface-policy-flashguard.c $(FLASHGUARD_DEPS)
-block-interface-flashguard-policy.wasm: block-interface-flashguard-policy.c $(FLASHGUARD_DEPS)
-zns-policy.wasm: zns-policy.c zns-policy.h policy-wasm-abi.h
+BLOCK_POLICIES = block-interface-policy-baseline.wasm
+STREAM_POLICIES = block-interface-policy-streams-1.wasm \
+		block-interface-policy-streams-2.wasm \
+		block-interface-policy-streams-4.wasm
+
+$(BLOCK_POLICIES): %.wasm: %.c $(BLOCK_DEPS) $(POLICY_BUILD_DEPS)
+	$(WASM_CC) $(WASM_CFLAGS) $(BLOCK_WASM_LDFLAGS) \
+		-Wl,--allow-undefined-file=$(WASM_IMPORT_ALLOWLIST) -o $@ $<
+	@./check-wasm-policy.sh "$@"
+$(STREAM_POLICIES): %.wasm: %.c $(STREAM_DEPS) $(POLICY_BUILD_DEPS)
+	$(WASM_CC) $(WASM_CFLAGS) $(BLOCK_WASM_LDFLAGS) \
+		-Wl,--allow-undefined-file=$(WASM_IMPORT_ALLOWLIST) -o $@ $<
+	@./check-wasm-policy.sh "$@"
+block-interface-policy-flashguard.wasm: block-interface-policy-flashguard.c \
+		$(FLASHGUARD_DEPS) $(POLICY_BUILD_DEPS)
+	$(WASM_CC) $(WASM_CFLAGS) $(FLASHGUARD_WASM_LDFLAGS) \
+		-Wl,--allow-undefined-file=$(WASM_IMPORT_ALLOWLIST) -o $@ $<
+	@./check-wasm-policy.sh "$@"
+block-interface-flashguard-policy.wasm: block-interface-flashguard-policy.c \
+		$(FLASHGUARD_DEPS) $(POLICY_BUILD_DEPS)
+	$(WASM_CC) $(WASM_CFLAGS) $(FLASHGUARD_WASM_LDFLAGS) \
+		-Wl,--allow-undefined-file=$(WASM_IMPORT_ALLOWLIST) -o $@ $<
+	@./check-wasm-policy.sh "$@"
+zns-policy.wasm: zns-policy.c zns-policy.h policy-wasm-abi.h \
+		$(POLICY_BUILD_DEPS)
+	$(WASM_CC) $(WASM_CFLAGS) $(ZNS_WASM_LDFLAGS) \
+		-Wl,--allow-undefined-file=$(WASM_IMPORT_ALLOWLIST) -o $@ $<
+	@./check-wasm-policy.sh "$@"
 signing-test-policy.wasm: signing-test-policy.c policy-wasm-abi.h
 key-sharing-policy.wasm: key-sharing-policy.c key-sharing.h policy-wasm-abi.h
 meta-interface-policy.wasm: ../meta-interface-policy.c \
-		../meta-interface-policy.h ../policy-attestation-format.h \
+		../meta-interface-protocol.h \
 		policy-wasm-abi.h policy-privileged-wasm-abi.h \
 		check-wasm-policy.sh \
 		$(PRIVILEGED_WASM_IMPORT_ALLOWLIST) $(WASM_IMPORT_CATALOG) \
@@ -143,13 +189,36 @@ wasm-privileged-forbidden-policy.wasm: wasm-privileged-forbidden-policy.c \
 
 reproducible: all
 	@tmp_dir=$$(mktemp -d); trap 'rm -rf "$$tmp_dir"' EXIT; \
-	for artifact in $(PRODUCTION_POLICIES) $(TEST_POLICIES); do \
+	for artifact in $(filter-out $(BLOCK_POLICIES) $(STREAM_POLICIES) \
+		block-interface-policy-flashguard.wasm \
+		block-interface-flashguard-policy.wasm zns-policy.wasm,$(PRODUCTION_POLICIES) \
+		$(TEST_POLICIES)); do \
 		source=$${artifact%.wasm}.c; \
 		$(WASM_CC) $(WASM_CFLAGS) $(WASM_LDFLAGS) \
 			-Wl,--allow-undefined-file=$(WASM_IMPORT_ALLOWLIST) \
 			-o "$$tmp_dir/$$artifact" "$$source" || exit 1; \
 		cmp -s "$$artifact" "$$tmp_dir/$$artifact" || { \
 			echo "error: non-reproducible artifact $$artifact" >&2; exit 1; }; \
+	done; \
+	$(WASM_CC) $(WASM_CFLAGS) $(ZNS_WASM_LDFLAGS) \
+		-Wl,--allow-undefined-file=$(WASM_IMPORT_ALLOWLIST) \
+		-o "$$tmp_dir/zns-policy.wasm" zns-policy.c; \
+	cmp -s zns-policy.wasm "$$tmp_dir/zns-policy.wasm" || { \
+		echo "error: non-reproducible artifact zns-policy.wasm" >&2; exit 1; }; \
+	for artifact in $(BLOCK_POLICIES) $(STREAM_POLICIES); do \
+		source=$${artifact%.wasm}.c; \
+		$(WASM_CC) $(WASM_CFLAGS) $(BLOCK_WASM_LDFLAGS) \
+			-Wl,--allow-undefined-file=$(WASM_IMPORT_ALLOWLIST) \
+			-o "$$tmp_dir/$$artifact" "$$source" || exit 1; \
+		cmp -s "$$artifact" "$$tmp_dir/$$artifact" || exit 1; \
+	done; \
+	for artifact in block-interface-policy-flashguard.wasm \
+		block-interface-flashguard-policy.wasm; do \
+		source=$${artifact%.wasm}.c; \
+		$(WASM_CC) $(WASM_CFLAGS) $(FLASHGUARD_WASM_LDFLAGS) \
+			-Wl,--allow-undefined-file=$(WASM_IMPORT_ALLOWLIST) \
+			-o "$$tmp_dir/$$artifact" "$$source" || exit 1; \
+		cmp -s "$$artifact" "$$tmp_dir/$$artifact" || exit 1; \
 	done; \
 	$(WASM_CC) $(WASM_CFLAGS) -I.. $(META_INTERFACE_LDFLAGS) \
 		-Wl,--allow-undefined-file=$(PRIVILEGED_WASM_IMPORT_ALLOWLIST) \

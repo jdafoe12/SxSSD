@@ -1,0 +1,12 @@
+[atc21-comparison] Mode: block-streams-2
+[atc21-comparison] Device: /dev/nvme0n1
+[atc21-comparison] Results: /home/femu/stream-policy-results/smoke/block-streams-2-20260814-174454
+[atc21-comparison] Requirement: use a freshly started FEMU instance
+[atc21-write] Using 192 initially empty regions; reclamation begins on reuse
+[atc21-write] Warmup: 5 seconds
+[atc21-write] Measuring: 20 seconds
+[atc21-write] 20/20 seconds: 642.25 MiB/s average
+[atc21-write] Complete: 642.25 MiB/s, errors=0
+
+[atc21-comparison] Complete. Results are in:
+/home/femu/stream-policy-results/smoke/block-streams-2-20260814-174454

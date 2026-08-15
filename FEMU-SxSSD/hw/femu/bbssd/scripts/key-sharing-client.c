@@ -14,8 +14,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-#include "../device-identity.h"
-#include "../device-signing.h"
+#include "../device-trust.h"
 #include "../policy/key-sharing.h"
 
 static int send_admin_cmd(const char *device, uint8_t opcode, void *buffer,

@@ -13,7 +13,7 @@
  *
  * The typed policy declarations remain in policy-wasm-abi.h and
  * policy-privileged-wasm-abi.h.  The explicit runtime registration tables
- * remain in policy-wamr-imports.c.  An ABI change must update both this
+ * remain explicit in policy-wamr.c. An ABI change must update both this
  * manifest and those tables.  This manifest also generates the linker
  * allowlists for policy builds.
  */
@@ -28,14 +28,6 @@ SXS_COMMON_IMPORT(pswd_event_get, sxs_pswd_event_get,
                   import_pswd_event_get, "(*)i", NO_META)
 SXS_COMMON_IMPORT(subscribe, sxs_subscribe,
                   import_subscribe, "(iiii)i", META)
-SXS_COMMON_IMPORT(state_create, sxs_state_create,
-                  import_state_create, "(iiIiI)i", NO_META)
-SXS_COMMON_IMPORT(state_read, sxs_state_read,
-                  import_state_read, "(iIi*~)i", NO_META)
-SXS_COMMON_IMPORT(state_write, sxs_state_write,
-                  import_state_write, "(iIi*~)i", NO_META)
-SXS_COMMON_IMPORT(state_fill_u64, sxs_state_fill_u64,
-                  import_state_fill_u64, "(iI)i", NO_META)
 SXS_COMMON_IMPORT(backend_status_get, sxs_backend_status_get,
                   import_backend_status_get, "(I*)i", NO_META)
 SXS_COMMON_IMPORT(geometry_get, sxs_geometry_get,
@@ -72,16 +64,13 @@ SXS_COMMON_IMPORT(eswd_config_stage, sxs_eswd_config_stage,
                   import_eswd_config_stage, "(*)i", NO_META)
 SXS_COMMON_IMPORT(namespace_config_stage, sxs_namespace_config_stage,
                   import_namespace_config_stage, "(*)i", NO_META)
-SXS_COMMON_IMPORT(ftl_finalize_stage, sxs_ftl_finalize_stage,
-                  import_ftl_finalize_stage, "()i", NO_META)
+SXS_COMMON_IMPORT(eswd_layout_finalize_stage,
+                  sxs_eswd_layout_finalize_stage,
+                  import_eswd_layout_finalize_stage, "()i", NO_META)
 SXS_COMMON_IMPORT(oob_register_stage, sxs_oob_register_stage,
                   import_oob_register_stage, "(ii)i", NO_META)
 SXS_COMMON_IMPORT(eswd_wp_get, sxs_eswd_wp_get,
                   import_eswd_wp_get, "(i)I", NO_META)
-SXS_COMMON_IMPORT(eswd_effective_wp_get, sxs_eswd_effective_wp_get,
-                  import_eswd_effective_wp_get, "(i)I", NO_META)
-SXS_COMMON_IMPORT(eswd_range_check, sxs_eswd_range_check,
-                  import_eswd_range_check, "(iiIi)i", NO_META)
 SXS_COMMON_IMPORT(eswd_to_ppa, sxs_eswd_to_ppa,
                   import_eswd_to_ppa, "(ii)I", NO_META)
 SXS_COMMON_IMPORT(ppa_to_eswd, sxs_ppa_to_eswd,
@@ -100,10 +89,6 @@ SXS_COMMON_IMPORT(eswd_erase, sxs_eswd_erase,
                   import_eswd_erase, "(i)I", NO_META)
 SXS_COMMON_IMPORT(page_migrate, sxs_page_migrate,
                   import_page_migrate, "(Ii*)i", NO_META)
-SXS_COMMON_IMPORT(eswd_stage_write, sxs_eswd_stage_write,
-                  import_eswd_stage_write, "(**)i", NO_META)
-SXS_COMMON_IMPORT(eswd_page_read, sxs_eswd_page_read,
-                  import_eswd_page_read, "(**~*)i", NO_META)
 SXS_COMMON_IMPORT(namespace_blob_stage, sxs_namespace_blob_stage,
                   import_namespace_blob_stage, "(ii*~)i", NO_META)
 SXS_COMMON_IMPORT(crypto_random, sxs_crypto_random,
@@ -158,12 +143,12 @@ SXS_PRIVILEGED_IMPORT(policy_activate_stored,
 SXS_PRIVILEGED_IMPORT(policy_deactivate,
                       sxs_privileged_policy_deactivate,
                       import_privileged_policy_deactivate, "(i)i")
-SXS_PRIVILEGED_IMPORT(policy_state_can_remove,
-                      sxs_privileged_policy_state_can_remove,
-                      import_privileged_policy_state_can_remove, "(ii)i")
-SXS_PRIVILEGED_IMPORT(policy_state_remove,
-                      sxs_privileged_policy_state_remove,
-                      import_privileged_policy_state_remove, "(ii)i")
+SXS_PRIVILEGED_IMPORT(policy_can_remove,
+                      sxs_privileged_policy_can_remove,
+                      import_privileged_policy_can_remove, "(ii)i")
+SXS_PRIVILEGED_IMPORT(policy_remove,
+                      sxs_privileged_policy_remove,
+                      import_privileged_policy_remove, "(ii)i")
 SXS_PRIVILEGED_IMPORT(device_attestation_sign,
                       sxs_privileged_device_attestation_sign,
                       import_privileged_device_attestation_sign, "(*~*~)i")

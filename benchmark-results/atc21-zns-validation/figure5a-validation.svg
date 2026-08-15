@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="520" viewBox="0 0 900 520">
+<rect width="100%" height="100%" fill="white"/>
+<text x="95" y="30" font-family="sans-serif" font-size="20">Validation: achieved write throughput</text>
+<line x1="95" y1="440" x2="865" y2="440" stroke="#222"/>
+<line x1="95" y1="55" x2="95" y2="440" stroke="#222"/>
+<line x1="95.0" y1="55" x2="95.0" y2="440" stroke="#e5e5e5"/>
+<text x="95.0" y="462" text-anchor="middle" font-family="sans-serif" font-size="12">0</text>
+<line x1="254.3" y1="55" x2="254.3" y2="440" stroke="#e5e5e5"/>
+<text x="254.3" y="462" text-anchor="middle" font-family="sans-serif" font-size="12">60</text>
+<line x1="413.6" y1="55" x2="413.6" y2="440" stroke="#e5e5e5"/>
+<text x="413.6" y="462" text-anchor="middle" font-family="sans-serif" font-size="12">120</text>
+<line x1="572.9" y1="55" x2="572.9" y2="440" stroke="#e5e5e5"/>
+<text x="572.9" y="462" text-anchor="middle" font-family="sans-serif" font-size="12">180</text>
+<line x1="732.2" y1="55" x2="732.2" y2="440" stroke="#e5e5e5"/>
+<text x="732.2" y="462" text-anchor="middle" font-family="sans-serif" font-size="12">240</text>
+<line x1="891.6" y1="55" x2="891.6" y2="440" stroke="#e5e5e5"/>
+<text x="891.6" y="462" text-anchor="middle" font-family="sans-serif" font-size="12">300</text>
+<line x1="95" y1="440.0" x2="865" y2="440.0" stroke="#e5e5e5"/>
+<text x="85" y="444.0" text-anchor="end" font-family="sans-serif" font-size="12">0</text>
+<line x1="95" y1="367.6" x2="865" y2="367.6" stroke="#e5e5e5"/>
+<text x="85" y="371.6" text-anchor="end" font-family="sans-serif" font-size="12">60</text>
+<line x1="95" y1="295.2" x2="865" y2="295.2" stroke="#e5e5e5"/>
+<text x="85" y="299.2" text-anchor="end" font-family="sans-serif" font-size="12">120</text>
+<line x1="95" y1="222.8" x2="865" y2="222.8" stroke="#e5e5e5"/>
+<text x="85" y="226.8" text-anchor="end" font-family="sans-serif" font-size="12">180</text>
+<line x1="95" y1="150.3" x2="865" y2="150.3" stroke="#e5e5e5"/>
+<text x="85" y="154.3" text-anchor="end" font-family="sans-serif" font-size="12">240</text>
+<line x1="95" y1="77.9" x2="865" y2="77.9" stroke="#e5e5e5"/>
+<text x="85" y="81.9" text-anchor="end" font-family="sans-serif" font-size="12">300</text>
+<line x1="95" y1="5.5" x2="865" y2="5.5" stroke="#e5e5e5"/>
+<text x="85" y="9.5" text-anchor="end" font-family="sans-serif" font-size="12">360</text>
+<line x1="95" y1="440" x2="865.0" y2="90.0" stroke="#777" stroke-dasharray="5 5"/>
+<polyline points="95.0,440.0 121.6,427.9 201.2,391.7 320.7,337.4 480.0,265.0 865.0,124.8" fill="none" stroke="#177e89" stroke-width="2.5"/>
+<circle cx="95.0" cy="440.0" r="4" fill="#177e89"/>
+<circle cx="121.6" cy="427.9" r="4" fill="#177e89"/>
+<circle cx="201.2" cy="391.7" r="4" fill="#177e89"/>
+<circle cx="320.7" cy="337.4" r="4" fill="#177e89"/>
+<circle cx="480.0" cy="265.0" r="4" fill="#177e89"/>
+<circle cx="865.0" cy="124.8" r="4" fill="#177e89"/>
+<polyline points="95.0,440.0 121.6,427.9 201.2,391.8 320.7,343.3 480.0,366.4 865.0,381.3" fill="none" stroke="#c84c09" stroke-width="2.5"/>
+<circle cx="95.0" cy="440.0" r="4" fill="#c84c09"/>
+<circle cx="121.6" cy="427.9" r="4" fill="#c84c09"/>
+<circle cx="201.2" cy="391.8" r="4" fill="#c84c09"/>
+<circle cx="320.7" cy="343.3" r="4" fill="#c84c09"/>
+<circle cx="480.0" cy="366.4" r="4" fill="#c84c09"/>
+<circle cx="865.0" cy="381.3" r="4" fill="#c84c09"/>
+<polyline points="95.0,440.0 121.6,427.9 201.2,391.7 320.7,337.8 480.0,328.5 865.0,328.1" fill="none" stroke="#674ea7" stroke-width="2.5"/>
+<circle cx="95.0" cy="440.0" r="4" fill="#674ea7"/>
+<circle cx="121.6" cy="427.9" r="4" fill="#674ea7"/>
+<circle cx="201.2" cy="391.7" r="4" fill="#674ea7"/>
+<circle cx="320.7" cy="337.8" r="4" fill="#674ea7"/>
+<circle cx="480.0" cy="328.5" r="4" fill="#674ea7"/>
+<circle cx="865.0" cy="328.1" r="4" fill="#674ea7"/>
+<line x1="365" y1="70" x2="385" y2="70" stroke="#177e89" stroke-width="3"/>
+<text x="391" y="74" font-family="sans-serif" font-size="11">ZNS (0% FTL data OP)</text>
+<line x1="520" y1="70" x2="540" y2="70" stroke="#c84c09" stroke-width="3"/>
+<text x="546" y="74" font-family="sans-serif" font-size="11">Block (7% effective OP)</text>
+<line x1="675" y1="70" x2="695" y2="70" stroke="#674ea7" stroke-width="3"/>
+<text x="701" y="74" font-family="sans-serif" font-size="11">Block (28% effective OP)</text>
+<text x="480.0" y="500" text-anchor="middle" font-family="sans-serif" font-size="14">Requested write throughput (MiB/s)</text>
+<text x="20" y="247.5" transform="rotate(-90 20 247.5)" text-anchor="middle" font-family="sans-serif" font-size="14">Achieved write throughput (MiB/s)</text>
+</svg>

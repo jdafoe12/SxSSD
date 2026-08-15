@@ -1,5 +1,4 @@
-#include "meta-interface-policy.h"
-#include "policy-attestation-format.h"
+#include "meta-interface-protocol.h"
 #include "policy/policy-privileged-wasm-abi.h"
 
 #define NVME_SUCCESS 0x0000U
@@ -238,7 +237,8 @@ static sxs_s32 prepare_history_record(
 static void commit_history_record(const struct meta_history_record *record,
                                   const sxs_u8 next_head[32])
 {
-    state.history[state.history_count++] = *record;
+    bytes_copy(&state.history[state.history_count++], record,
+               sizeof(*record));
     bytes_copy(state.history_head, next_head, 32);
 }
 
@@ -465,7 +465,7 @@ static sxs_s32 select_policy_blocks(
         if (claimed) {
             continue;
         }
-        blocks[found++] = candidate;
+        bytes_copy(&blocks[found++], &candidate, sizeof(candidate));
         if (found == count) {
             state.next_policy_alloc_index = (linear + 1) % candidates;
             return 0;
@@ -662,7 +662,7 @@ static sxs_u64 update_policy(const struct sxs_nvme_event *event)
         release_blocks(replacement.blocks, replacement.block_count);
         return complete(NVME_DATA_TRANSFER_ERROR | NVME_DNR);
     }
-    if (sxs_privileged_policy_state_can_remove(
+    if (sxs_privileged_policy_can_remove(
             policy_id, current->generation) != 0 ||
         reclaim_storage(current->blocks, current->block_count) != 0) {
         reclaim_storage(replacement.blocks, replacement.block_count);
@@ -675,11 +675,11 @@ static sxs_u64 update_policy(const struct sxs_nvme_event *event)
     replacement.policy_size = policy_size;
     replacement.active = 0;
     replacement.in_use = 1;
-    *current = replacement;
+    bytes_copy(current, &replacement, sizeof(replacement));
     commit_generation(generation_index, 0, policy_id, generation);
     commit_history_record(&history, next_head);
-    /* The new generation is committed; old inactive state is cleanup only. */
-    sxs_privileged_policy_state_remove(policy_id, generation - 1);
+    /* The new generation is committed; old runtime resources are cleanup. */
+    sxs_privileged_policy_remove(policy_id, generation - 1);
     return complete(NVME_SUCCESS);
 }
 
@@ -702,15 +702,14 @@ static sxs_u64 remove_policy(const struct sxs_nvme_event *event)
     if (prepare_history_record(POLICY_HISTORY_OP_REMOVE, policy_id,
                                record->generation, &history,
                                next_head) != 0 ||
-        sxs_privileged_policy_state_can_remove(
+        sxs_privileged_policy_can_remove(
             policy_id, record->generation) != 0) {
         return complete(NVME_INTERNAL_DEVICE_ERROR | NVME_DNR);
     }
     if (reclaim_storage(record->blocks, record->block_count) != 0) {
         return complete(NVME_DATA_TRANSFER_ERROR | NVME_DNR);
     }
-    if (sxs_privileged_policy_state_remove(policy_id,
-                                            record->generation) != 0) {
+    if (sxs_privileged_policy_remove(policy_id, record->generation) != 0) {
         return complete(NVME_INTERNAL_DEVICE_ERROR | NVME_DNR);
     }
     commit_history_record(&history, next_head);

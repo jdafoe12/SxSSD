@@ -4,8 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "../device-identity.h"
-#include "../device-signing.h"
+#include "../device-trust.h"
 
 static int verify(const uint8_t public_key[32], const uint8_t *data,
                   size_t data_len, const uint8_t signature[64])
@@ -134,7 +133,7 @@ int main(int argc, char **argv)
     memcpy(bootstrap_message + offset, policy_ephemeral_public_key,
            sizeof(policy_ephemeral_public_key));
 
-    if (sign_policy_key_bootstrap(owner_nonce, owner_ephemeral_public_key,
+    if (device_trust_sign_policy_key_bootstrap(owner_nonce, owner_ephemeral_public_key,
                                   policy_ephemeral_public_key, signature) != 0 ||
         verify(SXS_DEVICE_PUBLIC_KEY, bootstrap_message,
                sizeof(bootstrap_message), signature) != 0 ||
@@ -149,23 +148,23 @@ int main(int argc, char **argv)
         fprintf(stderr, "modified bootstrap transcript verified unexpectedly\n");
         return 1;
     }
-    if (sign_with_attestation_key(attestation_like, sizeof(attestation_like),
+    if (device_trust_sign_attestation(attestation_like, sizeof(attestation_like),
                                   signature) != 0 ||
         verify(SXS_DEVICE_PUBLIC_KEY, attestation_like,
                sizeof(attestation_like), signature) != 0) {
         fprintf(stderr, "privileged device signing failed\n");
         return 1;
     }
-    if (sign_policy_key_bootstrap(NULL, owner_ephemeral_public_key,
+    if (device_trust_sign_policy_key_bootstrap(NULL, owner_ephemeral_public_key,
                                   policy_ephemeral_public_key, signature) == 0 ||
-        sign_policy_key_bootstrap(owner_nonce, NULL,
+        device_trust_sign_policy_key_bootstrap(owner_nonce, NULL,
                                   policy_ephemeral_public_key, signature) == 0 ||
-        sign_policy_key_bootstrap(owner_nonce, owner_ephemeral_public_key,
+        device_trust_sign_policy_key_bootstrap(owner_nonce, owner_ephemeral_public_key,
                                   NULL, signature) == 0 ||
-        sign_policy_key_bootstrap(owner_nonce, owner_ephemeral_public_key,
+        device_trust_sign_policy_key_bootstrap(owner_nonce, owner_ephemeral_public_key,
                                   policy_ephemeral_public_key, NULL) == 0 ||
-        sign_with_attestation_key(NULL, 1, signature) == 0 ||
-        sign_with_attestation_key(attestation_like,
+        device_trust_sign_attestation(NULL, 1, signature) == 0 ||
+        device_trust_sign_attestation(attestation_like,
                                   sizeof(attestation_like), NULL) == 0) {
         fprintf(stderr, "invalid signing arguments were accepted\n");
         return 1;

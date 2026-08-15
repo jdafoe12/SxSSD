@@ -5,8 +5,7 @@
 SXS_EXPORT_INIT
 sxs_s32 sxs_policy_init(void)
 {
-    if (sxs_state_create(1, sizeof(sxs_u64), 1024, 0, 0) != 0 ||
-        sxs_oob_register_stage(1, 1) != 0 ||
+    if (sxs_oob_register_stage(1, 1) != 0 ||
         sxs_subscribe(SXS_EVENT_NVME_ADMIN, TRANSACTION_OPCODE, 1, 0) != 0) {
         return -SXS_WASM_EIO;
     }

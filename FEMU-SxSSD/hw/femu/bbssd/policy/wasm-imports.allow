@@ -3,10 +3,6 @@ sxs_nvme_event_get
 sxs_backend_event_get
 sxs_pswd_event_get
 sxs_subscribe
-sxs_state_create
-sxs_state_read
-sxs_state_write
-sxs_state_fill_u64
 sxs_backend_status_get
 sxs_geometry_get
 sxs_layout_get
@@ -25,11 +21,9 @@ sxs_completion_result_set
 sxs_time_now_ns
 sxs_eswd_config_stage
 sxs_namespace_config_stage
-sxs_ftl_finalize_stage
+sxs_eswd_layout_finalize_stage
 sxs_oob_register_stage
 sxs_eswd_wp_get
-sxs_eswd_effective_wp_get
-sxs_eswd_range_check
 sxs_eswd_to_ppa
 sxs_ppa_to_eswd
 sxs_page_read
@@ -39,8 +33,6 @@ sxs_eswd_reset
 sxs_eswd_advance_wp
 sxs_eswd_erase
 sxs_page_migrate
-sxs_eswd_stage_write
-sxs_eswd_page_read
 sxs_namespace_blob_stage
 sxs_crypto_random
 sxs_crypto_ed25519_verify

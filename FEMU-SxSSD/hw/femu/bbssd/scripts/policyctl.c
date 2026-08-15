@@ -14,8 +14,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "../device-identity.h"
-#include "../policy-attestation-format.h"
+#include "../device-trust.h"
+#include "../meta-interface-protocol.h"
 
 #define NVME_CMD_INIT_SESSION_SUBMIT  0x93
 #define NVME_CMD_INIT_SESSION_FETCH   0x94

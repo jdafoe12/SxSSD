@@ -1,10 +1,16 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/*
+ * Derived in part from the FEMU BBSSD ftl.h implementation.
+ * SxSSD modifications by Josh Dafoe: 2025-12-16 through 2026-08-23.
+ */
+
 #ifndef FEMU_SXSSD_POLICY_API_H
 #define FEMU_SXSSD_POLICY_API_H
 
 #include "../nvme.h"
 #include "./bbm.h"
-#include "policy/policy-privileged-wasm-abi.h"
-#include "policy/policy-wasm-abi.h"
+#include "policy/include/policy-privileged-wasm-abi.h"
+#include "policy/include/policy-wasm-abi.h"
 
 struct policy_engine;
 
@@ -38,7 +44,10 @@ struct eswd_layout {
     uint32_t blks_per_eswd;
     uint32_t pgs_per_eswd;
     enum eswd_striping_level striping_level;
-    uint32_t *eswd_to_starting_block;
+    /* Ordered pseudo-block members, indexed [eswd_id * blks_per_eswd + slot]. */
+    PseudoPba *members;
+    /* Reverse owner map indexed by pseudo-block; -1 denotes an unassigned block. */
+    int32_t *pseudo_block_owner;
     uint32_t tt_pl;
     uint32_t blks_per_pl;
 };
@@ -106,6 +115,7 @@ struct ssd_channel {
 /* eSWDs are mechanisms. Policies own queue and victim-selection decisions. */
 struct eswd {
     uint32_t id;
+    bool active;
     int vpc;           /* valid page count in this eSWD */
     int ipc;           /* invalid page count in this eSWD */
     uint32_t wp_page_index;  /* next page to write in this eSWD (0..pgs_per_eswd-1) */
@@ -200,6 +210,12 @@ int64_t policy_api_ppa_to_page_index(struct pe_policy_execution *execution,
                                  uint64_t ppa);
 int32_t policy_api_page_status_get(struct pe_policy_execution *execution,
                                uint64_t ppa);
+int32_t policy_api_pswd_get(struct pe_policy_execution *execution,
+                            uint64_t ppa, struct sxs_pswd_event *destination);
+int32_t policy_api_pswd_retire(struct pe_policy_execution *execution,
+                               uint64_t ppa);
+int32_t policy_api_pswd_remap(struct pe_policy_execution *execution,
+                              uint64_t ppa);
 
 /* Access to the current NVMe request, command, DSM ranges, and completion. */
 int32_t policy_api_request_read(struct pe_policy_execution *execution,
@@ -242,6 +258,14 @@ int64_t policy_api_eswd_to_ppa(struct pe_policy_execution *execution,
                            uint32_t eswd_id, uint32_t page_index);
 int32_t policy_api_ppa_to_eswd(struct pe_policy_execution *execution, uint64_t ppa,
                            struct sxs_eswd_location *destination);
+int32_t policy_api_eswd_member_get(struct pe_policy_execution *execution,
+                                   uint32_t eswd_id, uint32_t member_index,
+                                   uint64_t *ppa_out);
+int32_t policy_api_eswd_release(struct pe_policy_execution *execution,
+                                uint32_t eswd_id);
+int32_t policy_api_eswd_rebind(struct pe_policy_execution *execution,
+                               uint32_t eswd_id, const uint64_t *members,
+                               uint32_t member_count);
 
 /* Physical-page and eSWD data operations performed during an action. */
 int32_t policy_api_page_read(struct pe_policy_execution *execution,

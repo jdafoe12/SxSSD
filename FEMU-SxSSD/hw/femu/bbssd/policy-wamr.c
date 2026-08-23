@@ -1,9 +1,10 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #include "qemu/osdep.h"
 #include "policy-wamr.h"
 #include "policy-api.h"
 #include "qemu/error-report.h"
 
-#define WASM_ENABLE_INSTRUCTION_METERING 1
 #include <wasm_export.h>
 
 #define PE_WAMR_ERROR_BYTES 256U
@@ -22,7 +23,6 @@ struct pe_wamr_vm {
     wasm_function_inst_t init_function;
     wasm_function_inst_t condition_function;
     wasm_function_inst_t action_function;
-    wasm_memory_inst_t memory;
 };
 
 enum pe_wamr_runtime_state {
@@ -342,6 +342,7 @@ struct pe_wamr_vm *pe_wamr_vm_create_with_config(
         .max_memory_pages = 0, /* Use the fixed maximum declared by the policy. */
     };
     wasm_valkind_t pair_parameter = WASM_I32;
+    wasm_memory_inst_t memory;
     uint64_t memory_pages;
     uint64_t memory_page_bytes;
     char error[PE_WAMR_ERROR_BYTES] = {0};
@@ -379,26 +380,25 @@ struct pe_wamr_vm *pe_wamr_vm_create_with_config(
         set_error(error_out, error);
         goto fail;
     }
-    if (!wasm_runtime_set_running_mode(vm->instance, Mode_Interp)) {
-        set_error(error_out, "WAMR safe interpreter configuration failed");
+    if (!wasm_runtime_set_running_mode(vm->instance, Mode_Fast_JIT)) {
+        set_error(error_out, "WAMR Fast JIT configuration failed");
         goto fail;
     }
+    info_report("[PolicyEngine] WAMR policy runtime: fast-jit");
     wasm_runtime_set_bounds_checks(vm->instance, true);
     if (!wasm_runtime_is_bounds_checks_enabled(vm->instance)) {
         set_error(error_out, "WAMR memory bounds checks are unavailable");
         goto fail;
     }
-    vm->memory = wasm_runtime_get_default_memory(vm->instance);
-    memory_pages = vm->memory ?
-        wasm_memory_get_cur_page_count(vm->memory) : 0;
-    memory_page_bytes = vm->memory ?
-        wasm_memory_get_bytes_per_page(vm->memory) : 0;
-    if (!vm->memory || memory_pages == 0 || memory_page_bytes == 0 ||
-        memory_pages != wasm_memory_get_max_page_count(vm->memory) ||
+    memory = wasm_runtime_get_default_memory(vm->instance);
+    memory_pages = memory ? wasm_memory_get_cur_page_count(memory) : 0;
+    memory_page_bytes = memory ? wasm_memory_get_bytes_per_page(memory) : 0;
+    if (!memory || memory_pages == 0 || memory_page_bytes == 0 ||
+        memory_pages != wasm_memory_get_max_page_count(memory) ||
         memory_page_bytes >
             (uint64_t)PE_WAMR_MAX_LINEAR_MEMORY_PAGES * PE_WAMR_PAGE_BYTES /
                 memory_pages ||
-        wasm_memory_get_shared(vm->memory)) {
+        wasm_memory_get_shared(memory)) {
         set_error(error_out,
                   "policy must define fixed memory of at most 256 MiB");
         goto fail;
@@ -510,8 +510,6 @@ int pe_wamr_vm_execute(struct pe_wamr_vm *vm,
     }
 
     wasm_runtime_clear_exception(vm->instance);
-    wasm_runtime_set_instruction_count_limit(vm->exec_env,
-                                              PE_WAMR_INSTRUCTION_LIMIT);
     wasm_runtime_set_user_data(vm->exec_env, execution);
     called = wasm_runtime_call_wasm_a(vm->exec_env, function, 1, &result,
                                       argument_count,
@@ -641,6 +639,22 @@ static int32_t import_pswd_event_get(wasm_exec_env_t env,
     return 0;
 }
 
+static int32_t import_flash_error_event_get(
+    wasm_exec_env_t env, struct sxs_flash_error_event *output)
+{
+    struct pe_policy_execution *execution = execution_from_env(env);
+
+    if (!execution ||
+        execution->authoritative_event_kind != SXS_EVENT_FLASH_ERROR) {
+        return -SXS_WASM_EPERM;
+    }
+    if (!fixed_buffer_is_valid(env, output, sizeof(*output))) {
+        return -SXS_WASM_EINVAL;
+    }
+    memcpy(output, &execution->event_snapshot.flash_error, sizeof(*output));
+    return 0;
+}
+
 static int32_t import_subscribe(wasm_exec_env_t env, uint32_t kind,
                                 uint32_t selector, uint32_t pair,
                                 uint32_t flags)
@@ -763,6 +777,41 @@ static int32_t import_ppa_to_eswd(wasm_exec_env_t env, uint64_t ppa,
     return result;
 }
 
+static int32_t import_eswd_member_get(wasm_exec_env_t env, uint32_t eswd_id,
+                                      uint32_t member_index, uint64_t *output)
+{
+    uint64_t native_output;
+    int32_t result;
+
+    if (!fixed_buffer_is_valid(env, output, sizeof(*output))) {
+        return -SXS_WASM_EINVAL;
+    }
+    result = policy_api_eswd_member_get(execution_from_env(env), eswd_id,
+                                        member_index, &native_output);
+    if (result == 0) {
+        memcpy(output, &native_output, sizeof(native_output));
+    }
+    return result;
+}
+
+static int32_t import_eswd_release(wasm_exec_env_t env, uint32_t eswd_id)
+{
+    return policy_api_eswd_release(execution_from_env(env), eswd_id);
+}
+
+static int32_t import_eswd_rebind(wasm_exec_env_t env, uint32_t eswd_id,
+                                  const uint64_t *members,
+                                  uint32_t member_count)
+{
+    if (member_count > UINT32_MAX / sizeof(*members) ||
+        !fixed_buffer_is_valid(env, members,
+                               (size_t)member_count * sizeof(*members))) {
+        return -SXS_WASM_EINVAL;
+    }
+    return policy_api_eswd_rebind(execution_from_env(env), eswd_id, members,
+                                  member_count);
+}
+
 static int32_t import_ppa_validate(wasm_exec_env_t env, uint64_t ppa)
 {
     return policy_api_ppa_validate(execution_from_env(env), ppa);
@@ -776,6 +825,32 @@ static int64_t import_ppa_to_page_index(wasm_exec_env_t env, uint64_t ppa)
 static int32_t import_page_status_get(wasm_exec_env_t env, uint64_t ppa)
 {
     return policy_api_page_status_get(execution_from_env(env), ppa);
+}
+
+static int32_t import_pswd_get(wasm_exec_env_t env, uint64_t ppa,
+                               struct sxs_pswd_event *output)
+{
+    struct sxs_pswd_event native_output;
+    int32_t result;
+
+    if (!fixed_buffer_is_valid(env, output, sizeof(*output))) {
+        return -SXS_WASM_EINVAL;
+    }
+    result = policy_api_pswd_get(execution_from_env(env), ppa, &native_output);
+    if (result == 0) {
+        memcpy(output, &native_output, sizeof(native_output));
+    }
+    return result;
+}
+
+static int32_t import_pswd_retire(wasm_exec_env_t env, uint64_t ppa)
+{
+    return policy_api_pswd_retire(execution_from_env(env), ppa);
+}
+
+static int32_t import_pswd_remap(wasm_exec_env_t env, uint64_t ppa)
+{
+    return policy_api_pswd_remap(execution_from_env(env), ppa);
 }
 
 static int64_t import_eswd_wp_get(wasm_exec_env_t env, uint32_t eswd_id)
@@ -1201,6 +1276,8 @@ static NativeSymbol native_symbols[] = {
     {"sxs_nvme_event_get", (void *)import_nvme_event_get, "(*)i", NULL},
     {"sxs_backend_event_get", (void *)import_backend_event_get, "(*)i", NULL},
     {"sxs_pswd_event_get", (void *)import_pswd_event_get, "(*)i", NULL},
+    {"sxs_flash_error_event_get", (void *)import_flash_error_event_get,
+     "(*)i", NULL},
     {"sxs_subscribe", (void *)import_subscribe, "(iiii)i", NULL},
     {"sxs_backend_status_get", (void *)import_backend_status_get,
      "(I*)i", NULL},
@@ -1211,6 +1288,9 @@ static NativeSymbol native_symbols[] = {
     {"sxs_ppa_validate", (void *)import_ppa_validate, "(I)i", NULL},
     {"sxs_ppa_to_page_index", (void *)import_ppa_to_page_index, "(I)I", NULL},
     {"sxs_page_status_get", (void *)import_page_status_get, "(I)i", NULL},
+    {"sxs_pswd_get", (void *)import_pswd_get, "(I*)i", NULL},
+    {"sxs_pswd_retire", (void *)import_pswd_retire, "(I)i", NULL},
+    {"sxs_pswd_remap", (void *)import_pswd_remap, "(I)i", NULL},
     {"sxs_request_read", (void *)import_request_read, "(I*~)i", NULL},
     {"sxs_request_write", (void *)import_request_write, "(I*~)i", NULL},
     {"sxs_command_read", (void *)import_command_read, "(i*~)i", NULL},
@@ -1231,6 +1311,9 @@ static NativeSymbol native_symbols[] = {
     {"sxs_eswd_wp_get", (void *)import_eswd_wp_get, "(i)I", NULL},
     {"sxs_eswd_to_ppa", (void *)import_eswd_to_ppa, "(ii)I", NULL},
     {"sxs_ppa_to_eswd", (void *)import_ppa_to_eswd, "(I*)i", NULL},
+    {"sxs_eswd_member_get", (void *)import_eswd_member_get, "(ii*)i", NULL},
+    {"sxs_eswd_release", (void *)import_eswd_release, "(i)i", NULL},
+    {"sxs_eswd_rebind", (void *)import_eswd_rebind, "(i*i)i", NULL},
     {"sxs_page_read", (void *)import_page_read, "(**~*~*)i", NULL},
     {"sxs_page_append", (void *)import_page_append, "(**~*~*)i", NULL},
     {"sxs_page_invalidate", (void *)import_page_invalidate, "(I)i", NULL},

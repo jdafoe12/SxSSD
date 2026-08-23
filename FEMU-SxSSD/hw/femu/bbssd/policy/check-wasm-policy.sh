@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 set -eu
 
 artifact=${1:?usage: check-wasm-policy.sh POLICY.wasm}

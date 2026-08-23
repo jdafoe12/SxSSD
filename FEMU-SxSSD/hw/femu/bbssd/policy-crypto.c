@@ -1,179 +1,264 @@
-#include "qemu/osdep.h"
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #include "policy-crypto.h"
 
-#include <openssl/crypto.h>
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
-#include <openssl/kdf.h>
-#include <openssl/rand.h>
+#include <nettle/curve25519.h>
+#include <nettle/eddsa.h>
+#include <nettle/gcm.h>
+#include <nettle/hkdf.h>
+#include <nettle/hmac.h>
+#include <nettle/memops.h>
+#include <nettle/sha2.h>
+#include <nettle/version.h>
+#include <string.h>
 
-int pe_crypto_random(uint8_t *output, size_t length)
+#define PE_SHA256_SIZE 32
+#define PE_GCM_TAG_SIZE 16
+#define PE_HKDF_MAX_OUTPUT (255U * PE_SHA256_SIZE)
+
+#if NETTLE_VERSION_MAJOR >= 4
+#define PE_SHA256_DIGEST(context, output) \
+    sha256_digest((context), (output))
+#define PE_HMAC_SHA256_DIGEST(context, output) \
+    hmac_sha256_digest((context), (output))
+#define PE_GCM_AES256_DIGEST(context, output) \
+    gcm_aes256_digest((context), (output))
+#else
+#define PE_SHA256_DIGEST(context, output) \
+    sha256_digest((context), PE_SHA256_SIZE, (output))
+#define PE_HMAC_SHA256_DIGEST(context, output) \
+    hmac_sha256_digest((context), PE_SHA256_SIZE, (output))
+#define PE_GCM_AES256_DIGEST(context, output) \
+    gcm_aes256_digest((context), PE_GCM_TAG_SIZE, (output))
+#endif
+
+static const uint8_t pe_crypto_empty;
+
+static int pe_crypto_buffers_valid(const struct pe_crypto_buffer *parts,
+                                   size_t part_count)
 {
-    if ((!output && length != 0) || length > INT_MAX) {
+    size_t i;
+
+    if (!parts && part_count != 0) {
+        return 0;
+    }
+    for (i = 0; i < part_count; i++) {
+        if (!parts[i].data && parts[i].length != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+void pe_crypto_secure_zero(void *data, size_t length)
+{
+    typedef void *(*memset_fn)(void *, int, size_t);
+    /* Volatile indirection prevents dead-store elimination of the wipe. */
+    static memset_fn volatile secure_memset = memset;
+
+    if (data && length != 0) {
+        secure_memset(data, 0, length);
+    }
+}
+
+int pe_crypto_equal(const void *left, const void *right, size_t length)
+{
+    if (length == 0) {
+        return 1;
+    }
+    if (!left || !right) {
+        return 0;
+    }
+    return memeql_sec(left, right, length);
+}
+
+int pe_crypto_ed25519_public(const uint8_t private_key[32],
+                             uint8_t public_key[32])
+{
+    if (!private_key || !public_key) {
         return -1;
     }
-    return length == 0 || RAND_bytes(output, length) == 1 ? 0 : -1;
+    ed25519_sha512_public_key(public_key, private_key);
+    return 0;
+}
+
+int pe_crypto_ed25519_sign(const uint8_t private_key[32],
+                           const uint8_t *message, size_t message_length,
+                           uint8_t signature[64])
+{
+    uint8_t public_key[32];
+
+    if (!private_key || (!message && message_length != 0) || !signature) {
+        return -1;
+    }
+    ed25519_sha512_public_key(public_key, private_key);
+    ed25519_sha512_sign(public_key, private_key, message_length,
+                       message ? message : &pe_crypto_empty, signature);
+    pe_crypto_secure_zero(public_key, sizeof(public_key));
+    return 0;
 }
 
 int pe_crypto_ed25519_verify(const uint8_t public_key[32],
                              const uint8_t *message, size_t message_length,
                              const uint8_t signature[64])
 {
-    EVP_PKEY *key = NULL;
-    EVP_MD_CTX *context = NULL;
-    int rc = -1;
-
     if (!public_key || (!message && message_length != 0) || !signature) {
         return -1;
     }
-    key = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL,
-                                      public_key, 32);
-    context = EVP_MD_CTX_new();
-    if (key && context &&
-        EVP_DigestVerifyInit(context, NULL, NULL, NULL, key) == 1 &&
-        EVP_DigestVerify(context, signature, 64, message,
-                         message_length) == 1) {
-        rc = 0;
-    }
-    EVP_MD_CTX_free(context);
-    EVP_PKEY_free(key);
-    return rc;
+    return ed25519_sha512_verify(public_key, message_length,
+                                message ? message : &pe_crypto_empty,
+                                signature) ? 0 : -1;
 }
 
 int pe_crypto_x25519_public(const uint8_t private_key[32],
                             uint8_t public_key[32])
 {
-    EVP_PKEY *key = NULL;
-    size_t length = 32;
-    int rc = -1;
-
     if (!private_key || !public_key) {
         return -1;
     }
-    key = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL,
-                                       private_key, 32);
-    if (key && EVP_PKEY_get_raw_public_key(key, public_key, &length) == 1 &&
-        length == 32) {
-        rc = 0;
-    }
-    EVP_PKEY_free(key);
-    if (rc != 0) {
-        OPENSSL_cleanse(public_key, 32);
-    }
-    return rc;
+    curve25519_mul_g(public_key, private_key);
+    return 0;
 }
 
 int pe_crypto_x25519_shared(const uint8_t private_key[32],
                             const uint8_t peer_public_key[32],
                             uint8_t shared_secret[32])
 {
-    EVP_PKEY *private = NULL;
-    EVP_PKEY *peer = NULL;
-    EVP_PKEY_CTX *context = NULL;
-    size_t length = 32;
-    int rc = -1;
+    static const uint8_t zero[32];
 
     if (!private_key || !peer_public_key || !shared_secret) {
         return -1;
     }
-    private = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL,
-                                           private_key, 32);
-    peer = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL,
-                                       peer_public_key, 32);
-    context = private ? EVP_PKEY_CTX_new(private, NULL) : NULL;
-    if (private && peer && context &&
-        EVP_PKEY_derive_init(context) == 1 &&
-        EVP_PKEY_derive_set_peer(context, peer) == 1 &&
-        EVP_PKEY_derive(context, shared_secret, &length) == 1 &&
-        length == 32) {
-        rc = 0;
+    curve25519_mul(shared_secret, private_key, peer_public_key);
+    if (pe_crypto_equal(shared_secret, zero, sizeof(zero))) {
+        pe_crypto_secure_zero(shared_secret, 32);
+        return -1;
     }
-    EVP_PKEY_CTX_free(context);
-    EVP_PKEY_free(peer);
-    EVP_PKEY_free(private);
-    if (rc != 0) {
-        OPENSSL_cleanse(shared_secret, 32);
+    return 0;
+}
+
+int pe_crypto_hmac_sha256v(const uint8_t *key, size_t key_length,
+                           const struct pe_crypto_buffer *parts,
+                           size_t part_count, uint8_t output[32])
+{
+    struct hmac_sha256_ctx context;
+    size_t i;
+
+    if ((!key && key_length != 0) ||
+        !pe_crypto_buffers_valid(parts, part_count) || !output) {
+        return -1;
     }
-    return rc;
+    hmac_sha256_set_key(&context, key_length,
+                        key_length ? key : &pe_crypto_empty);
+    for (i = 0; i < part_count; i++) {
+        if (parts[i].length != 0) {
+            hmac_sha256_update(&context, parts[i].length, parts[i].data);
+        }
+    }
+    PE_HMAC_SHA256_DIGEST(&context, output);
+    pe_crypto_secure_zero(&context, sizeof(context));
+    return 0;
 }
 
 int pe_crypto_hmac_sha256(const uint8_t *key, size_t key_length,
                           const uint8_t *message, size_t message_length,
                           uint8_t output[32])
 {
-    unsigned int output_length = 0;
+    const struct pe_crypto_buffer part = { message, message_length };
 
-    if ((!key && key_length != 0) ||
-        (!message && message_length != 0) || !output ||
-        key_length > INT_MAX) {
+    return pe_crypto_hmac_sha256v(key, key_length, &part, 1, output);
+}
+
+int pe_crypto_sha256v(const struct pe_crypto_buffer *parts,
+                      size_t part_count, uint8_t output[32])
+{
+    struct sha256_ctx context;
+    size_t i;
+
+    if (!pe_crypto_buffers_valid(parts, part_count) || !output) {
         return -1;
     }
-    if (!HMAC(EVP_sha256(), key, key_length, message, message_length,
-              output, &output_length) || output_length != 32) {
-        OPENSSL_cleanse(output, 32);
-        return -1;
+    sha256_init(&context);
+    for (i = 0; i < part_count; i++) {
+        if (parts[i].length != 0) {
+            sha256_update(&context, parts[i].length, parts[i].data);
+        }
     }
+    PE_SHA256_DIGEST(&context, output);
+    pe_crypto_secure_zero(&context, sizeof(context));
     return 0;
 }
 
 int pe_crypto_sha256(const uint8_t *message, size_t message_length,
                      uint8_t output[32])
 {
-    EVP_MD_CTX *context = NULL;
-    unsigned int output_length = 0;
-    int rc = -1;
+    const struct pe_crypto_buffer part = { message, message_length };
 
-    if ((!message && message_length != 0) || !output) {
-        return -1;
-    }
-    context = EVP_MD_CTX_new();
-    if (context &&
-        EVP_DigestInit_ex(context, EVP_sha256(), NULL) == 1 &&
-        (!message_length ||
-         EVP_DigestUpdate(context, message, message_length) == 1) &&
-        EVP_DigestFinal_ex(context, output, &output_length) == 1 &&
-        output_length == 32) {
-        rc = 0;
-    }
-    EVP_MD_CTX_free(context);
-    if (rc != 0) {
-        OPENSSL_cleanse(output, 32);
-    }
-    return rc;
+    return pe_crypto_sha256v(&part, 1, output);
 }
 
 int pe_crypto_hkdf_sha256(const uint8_t *key, size_t key_length,
+                          const uint8_t *salt, size_t salt_length,
                           const uint8_t *info, size_t info_length,
                           uint8_t *output, size_t output_length)
 {
-    static const uint8_t empty = 0;
-    const uint8_t *key_input = key_length ? key : &empty;
-    const uint8_t *info_input = info_length ? info : &empty;
-    EVP_PKEY_CTX *context = NULL;
-    size_t derived_length = output_length;
-    int rc = -1;
+    struct hmac_sha256_ctx context;
+    uint8_t pseudorandom_key[PE_SHA256_SIZE];
 
-    if ((!key && key_length) || (!info && info_length) ||
-        (!output && output_length) || key_length > INT_MAX ||
-        info_length > INT_MAX) {
+    if ((!key && key_length != 0) || (!salt && salt_length != 0) ||
+        (!info && info_length != 0) || (!output && output_length != 0) ||
+        output_length > PE_HKDF_MAX_OUTPUT) {
         return -1;
     }
-    context = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
-    if (context && EVP_PKEY_derive_init(context) == 1 &&
-        EVP_PKEY_CTX_set_hkdf_md(context, EVP_sha256()) == 1 &&
-        EVP_PKEY_CTX_set1_hkdf_key(context, key_input,
-                                   (int)key_length) == 1 &&
-        EVP_PKEY_CTX_add1_hkdf_info(context, info_input,
-                                    (int)info_length) == 1 &&
-        EVP_PKEY_derive(context, output, &derived_length) == 1 &&
-        derived_length == output_length) {
-        rc = 0;
+    if (output_length == 0) {
+        return 0;
     }
-    EVP_PKEY_CTX_free(context);
-    if (rc != 0 && output) {
-        OPENSSL_cleanse(output, output_length);
+
+    hmac_sha256_set_key(&context, salt_length,
+                        salt_length ? salt : &pe_crypto_empty);
+    hkdf_extract(&context,
+                 (nettle_hash_update_func *)hmac_sha256_update,
+                 (nettle_hash_digest_func *)hmac_sha256_digest,
+                 key_length, key_length ? key : &pe_crypto_empty,
+                 pseudorandom_key);
+    hmac_sha256_set_key(&context, sizeof(pseudorandom_key),
+                        pseudorandom_key);
+    hkdf_expand(&context,
+                (nettle_hash_update_func *)hmac_sha256_update,
+                (nettle_hash_digest_func *)hmac_sha256_digest,
+                PE_SHA256_SIZE, info_length,
+                info_length ? info : &pe_crypto_empty,
+                output_length, output);
+    pe_crypto_secure_zero(pseudorandom_key, sizeof(pseudorandom_key));
+    pe_crypto_secure_zero(&context, sizeof(context));
+    return 0;
+}
+
+int pe_crypto_aes256_gcm_encrypt(const uint8_t key[32],
+                                 const uint8_t nonce[12],
+                                 const uint8_t *aad, size_t aad_length,
+                                 const uint8_t *plaintext,
+                                 size_t plaintext_length,
+                                 uint8_t *ciphertext, uint8_t tag[16])
+{
+    struct gcm_aes256_ctx context;
+
+    if (!key || !nonce || (!aad && aad_length != 0) ||
+        (!plaintext && plaintext_length != 0) ||
+        (!ciphertext && plaintext_length != 0) || !tag) {
+        return -1;
     }
-    return rc;
+    gcm_aes256_set_key(&context, key);
+    gcm_aes256_set_iv(&context, 12, nonce);
+    if (aad_length != 0) {
+        gcm_aes256_update(&context, aad_length, aad);
+    }
+    if (plaintext_length != 0) {
+        gcm_aes256_encrypt(&context, plaintext_length, ciphertext, plaintext);
+    }
+    PE_GCM_AES256_DIGEST(&context, tag);
+    pe_crypto_secure_zero(&context, sizeof(context));
+    return 0;
 }
 
 int pe_crypto_aes256_gcm_decrypt(const uint8_t key[32],
@@ -184,42 +269,30 @@ int pe_crypto_aes256_gcm_decrypt(const uint8_t key[32],
                                  const uint8_t tag[16],
                                  uint8_t *plaintext)
 {
-    EVP_CIPHER_CTX *context = NULL;
-    int output_length = 0;
-    int final_length = 0;
+    struct gcm_aes256_ctx context;
+    uint8_t computed_tag[PE_GCM_TAG_SIZE];
     int rc = -1;
 
-    if (!key || !nonce || (!aad && aad_length) ||
-        (!ciphertext && ciphertext_length) || !tag ||
-        (!plaintext && ciphertext_length) ||
-        aad_length > INT_MAX || ciphertext_length > INT_MAX) {
+    if (!key || !nonce || (!aad && aad_length != 0) ||
+        (!ciphertext && ciphertext_length != 0) || !tag ||
+        (!plaintext && ciphertext_length != 0)) {
         return -1;
     }
-    context = EVP_CIPHER_CTX_new();
-    if (!context ||
-        EVP_DecryptInit_ex(context, EVP_aes_256_gcm(), NULL, NULL, NULL) !=
-            1 ||
-        EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1 ||
-        EVP_DecryptInit_ex(context, NULL, NULL, key, nonce) != 1 ||
-        (aad_length &&
-         EVP_DecryptUpdate(context, NULL, &output_length, aad,
-                           (int)aad_length) != 1) ||
-        (ciphertext_length &&
-         EVP_DecryptUpdate(context, plaintext, &output_length, ciphertext,
-                           (int)ciphertext_length) != 1) ||
-        EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_GCM_SET_TAG, 16,
-                            (void *)tag) != 1 ||
-        EVP_DecryptFinal_ex(context, plaintext + output_length,
-                            &final_length) != 1 ||
-        (size_t)(output_length + final_length) != ciphertext_length) {
-        goto cleanup;
+    gcm_aes256_set_key(&context, key);
+    gcm_aes256_set_iv(&context, 12, nonce);
+    if (aad_length != 0) {
+        gcm_aes256_update(&context, aad_length, aad);
     }
-    rc = 0;
-
-cleanup:
-    EVP_CIPHER_CTX_free(context);
-    if (rc != 0 && plaintext) {
-        OPENSSL_cleanse(plaintext, ciphertext_length);
+    if (ciphertext_length != 0) {
+        gcm_aes256_decrypt(&context, ciphertext_length, plaintext, ciphertext);
     }
+    PE_GCM_AES256_DIGEST(&context, computed_tag);
+    if (pe_crypto_equal(computed_tag, tag, sizeof(computed_tag))) {
+        rc = 0;
+    } else if (plaintext) {
+        pe_crypto_secure_zero(plaintext, ciphertext_length);
+    }
+    pe_crypto_secure_zero(computed_tag, sizeof(computed_tag));
+    pe_crypto_secure_zero(&context, sizeof(context));
     return rc;
 }

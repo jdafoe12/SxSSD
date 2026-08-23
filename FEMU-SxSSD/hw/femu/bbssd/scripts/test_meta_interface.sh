@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -208,7 +209,7 @@ run_policyctl "$SCRIPT_DIR/policyctl" install "$DEVICE" \
 run_policyctl "$SCRIPT_DIR/policyctl" activate "$DEVICE" \
     "$KEY_SHARING_ID" >/dev/null
 output="$(run_policyctl "$SCRIPT_DIR/key-sharing-client" "$DEVICE" \
-    "$BBSSD_DIR/admin-simulation/admin_private.pem")"
+    "$BBSSD_DIR/admin-simulation/admin_private.hex")"
 assert_contains "$output" "key sharing passed"
 assert_contains "$output" "invalid TApp authentication rejected"
 run_policyctl "$SCRIPT_DIR/policyctl" deactivate "$DEVICE" \

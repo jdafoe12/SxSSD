@@ -1,5 +1,7 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #include "meta-interface-protocol.h"
-#include "policy/policy-privileged-wasm-abi.h"
+#include "policy/include/policy-privileged-wasm-abi.h"
 
 #define NVME_SUCCESS 0x0000U
 #define NVME_INVALID_OPCODE 0x0001U

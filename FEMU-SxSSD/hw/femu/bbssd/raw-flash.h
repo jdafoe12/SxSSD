@@ -1,3 +1,10 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/*
+ * Derived in part from the FEMU BBSSD FTL through the former
+ * hw/femu/backend/ftl-backend.h implementation.
+ * SxSSD modifications by Josh Dafoe: 2025-12-04 through 2026-08-23.
+ */
+
 #ifndef FEMU_SXSSD_RAW_FLASH_H
 #define FEMU_SXSSD_RAW_FLASH_H
 
@@ -5,8 +12,8 @@
 #include "../backend/dram.h"
 
 /*
- * Raw flash owns physical geometry, media bytes, OOB bytes, page validity,
- * erase counts, pSWD state, and NAND timing. Its callers use physical
+ * Raw flash owns physical geometry, media bytes, OOB bytes, physical program
+ * state, erase counts, and NAND timing. Its callers use physical
  * addresses. Pseudo-to-physical translation belongs to BBM.
  */
 #define BLK_BITS    (16)
@@ -50,14 +57,14 @@ struct pba {
     };
 };
 
-/* Page validity status (per-page in each pSWD block). */
+/* Page validity status for physical media pages. */
 enum RawFlashPageStatus {
     PG_FREE = 0,
     PG_INVALID = 1,
     PG_VALID = 2
 };
 
-/* pSWD (per-block sequential write) state machine; owned exclusively by raw flash layer. */
+/* Shared logical pSWD state values.  The state itself is owned by BBM. */
 enum pswd_block_state {
     PSWD_FREE,
     PSWD_OPEN,
@@ -65,29 +72,18 @@ enum pswd_block_state {
     PSWD_BAD
 };
 
-struct pswd_block_ctx {
+/*
+ * Raw per-physical-block state.  This deliberately mirrors enough NAND
+ * programming state to enforce physical sequential writes, but it is not a
+ * pSWD: a pSWD has a stable pseudo-physical identity and lives in BBM.
+ */
+struct raw_block_ctx {
     enum pswd_block_state state;
     int wp;         /* current write pointer (next page to write) */
     int erase_cnt;  /* erase count for this block */
     int vpc;        /* valid page count in this block */
     int ipc;        /* invalid page count in this block */
 };
-
-/* pSWD state transition event: filled and passed to notify callback (policy-facing; pba only). */
-struct PswdStateTransitionEvent {
-    enum pswd_block_state old_state;
-    enum pswd_block_state new_state;
-    struct pba pba;
-    int erase_cnt;
-    int wp;
-};
-
-struct RawFlash;  /* forward declaration for callback typedef below */
-
-/* Invoked synchronously after raw flash changes a block's pSWD state. */
-typedef void (*RawFlashPswdTransitionNotify)(struct RawFlash *fb,
-                                       const struct PswdStateTransitionEvent *event,
-                                       void *notify_ctx);
 
 enum RawFlashEventCommand {
     RAW_FLASH_EVENT_READ,
@@ -123,6 +119,15 @@ struct RawFlashEvent {
                     // 0 is success. Non-zero is failure.
     int64_t stime; /* Request arrival time. */
     int64_t lat;
+};
+
+/* Test-only deterministic primitive-operation failure injection. */
+struct RawFlashFaultInjection {
+    bool active;
+    bool one_shot;
+    enum RawFlashEventCommand command;
+    struct pba block;
+    int status;
 };
 
 struct ssdparams {
@@ -202,17 +207,14 @@ struct RawFlash {
     struct OobPolicyRegistration oob_policies[MAX_OOB_POLICIES];
     int oob_policy_count;
 
-    /* pSWD state per physical block (state, wp, erase_cnt, vpc, ipc); length sp.tt_blks */
-    struct pswd_block_ctx *pswd_state;
+    /* Physical state per physical block; length sp.tt_blks. */
+    struct raw_block_ctx *physical_state;
     /* Per-page validity indexed by physical block and page. */
     uint8_t *page_validity;
 
-    /* Direct upward notification for the raw-flash-owned pSWD state. */
-    RawFlashPswdTransitionNotify pswd_transition_notify;
-    void *pswd_transition_notify_ctx;
-
     struct ssdparams sp;
     struct RawFlashTiming bt;
+    struct RawFlashFaultInjection test_fault;
 };
 
 int raw_flash_init(struct RawFlash *fb, SsdDramBackend *mbe,
@@ -255,13 +257,18 @@ void* raw_flash_get_oob_for_policy(struct RawFlash *fb,
      struct ppa *ppa,
      int policy_handle);
 
-/* Page validity (per pSWD block); physical addresses. */
+/* Physical-page validity and physical block accounting. */
 void raw_flash_mark_page_valid(struct RawFlash *fb, const struct ppa *ppa);
 void raw_flash_mark_page_invalid(struct RawFlash *fb, const struct ppa *ppa);
 void raw_flash_mark_block_free(struct RawFlash *fb, const struct pba *pba);
 int raw_flash_get_page_status(const struct RawFlash *fb, const struct ppa *ppa);
 void raw_flash_get_block_vpc_ipc(const struct RawFlash *fb, const struct pba *pba, int *vpc, int *ipc);
 
-void raw_flash_set_pswd_transition_notify(struct RawFlash *fb, RawFlashPswdTransitionNotify notify, void *notify_ctx);
+int raw_flash_mark_block_bad(struct RawFlash *fb, const struct pba *pba);
+bool raw_flash_block_is_bad(const struct RawFlash *fb, const struct pba *pba);
+void raw_flash_test_inject_failure(struct RawFlash *fb,
+                                   enum RawFlashEventCommand command,
+                                   const struct pba *block, int status,
+                                   bool one_shot);
 
 #endif /* FEMU_SXSSD_RAW_FLASH_H */

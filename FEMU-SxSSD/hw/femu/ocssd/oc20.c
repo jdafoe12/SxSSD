@@ -1,3 +1,8 @@
+/*
+ * Modified for SxSSD by Josh Dafoe.
+ * SxSSD modifications: 2025-12-04 through 2026-08-23.
+ */
+
 #include "./oc20.h"
 
 static inline bool is_oc20_admin_cmd(uint8_t opcode)

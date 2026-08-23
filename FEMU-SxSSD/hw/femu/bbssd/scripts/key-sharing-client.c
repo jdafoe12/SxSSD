@@ -1,12 +1,8 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/nvme_ioctl.h>
-#include <openssl/crypto.h>
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
-#include <openssl/kdf.h>
-#include <openssl/pem.h>
-#include <openssl/rand.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,7 +11,9 @@
 #include <unistd.h>
 
 #include "../device-trust.h"
-#include "../policy/key-sharing.h"
+#include "../policy/include/key-sharing.h"
+#include "../policy-crypto.h"
+#include "host-crypto.h"
 
 static int send_admin_cmd(const char *device, uint8_t opcode, void *buffer,
                           uint32_t data_len, int quiet)
@@ -58,10 +56,7 @@ static int sign_tapp_request(struct key_sharing_request *request,
 {
     static const uint8_t domain[] = KEY_SHARING_TAPP_AUTH_DOMAIN;
     uint8_t message[(sizeof(domain) - 1) + 2 * KEY_SHARING_FIELD_SIZE];
-    EVP_PKEY *private_key = NULL;
-    EVP_MD_CTX *ctx = NULL;
-    FILE *key_file = NULL;
-    size_t signature_len = sizeof(request->tapp_signature);
+    uint8_t private_key[32];
     size_t offset = 0;
     int rc = -1;
 
@@ -72,52 +67,30 @@ static int sign_tapp_request(struct key_sharing_request *request,
     memcpy(message + offset, request->owner_ephemeral_public_key,
            KEY_SHARING_FIELD_SIZE);
 
-    key_file = fopen(private_key_path, "r");
-    if (!key_file) {
-        perror("open TApp private key");
-        goto cleanup;
-    }
-    private_key = PEM_read_PrivateKey(key_file, NULL, NULL, NULL);
-    ctx = EVP_MD_CTX_new();
-    if (!private_key || EVP_PKEY_id(private_key) != EVP_PKEY_ED25519 || !ctx ||
-        EVP_DigestSignInit(ctx, NULL, NULL, NULL, private_key) != 1 ||
-        EVP_DigestSign(ctx, request->tapp_signature, &signature_len, message,
-                       sizeof(message)) != 1 ||
-        signature_len != sizeof(request->tapp_signature)) {
+    if (sxs_host_read_hex(private_key_path, private_key,
+                          sizeof(private_key)) != 0 ||
+        pe_crypto_ed25519_sign(private_key, message, sizeof(message),
+                                request->tapp_signature) != 0) {
         fprintf(stderr, "failed to sign key-sharing request\n");
         goto cleanup;
     }
     rc = 0;
 
 cleanup:
-    EVP_MD_CTX_free(ctx);
-    EVP_PKEY_free(private_key);
-    if (key_file) {
-        fclose(key_file);
-    }
+    pe_crypto_secure_zero(private_key, sizeof(private_key));
     return rc;
 }
 
 static int generate_x25519_keypair(uint8_t public_key[32],
                                    uint8_t private_key[32])
 {
-    EVP_PKEY_CTX *ctx = NULL;
-    EVP_PKEY *key = NULL;
-    size_t public_key_len = 32;
-    size_t private_key_len = 32;
-    int rc = -1;
-
-    ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
-    if (ctx && EVP_PKEY_keygen_init(ctx) == 1 &&
-        EVP_PKEY_keygen(ctx, &key) == 1 &&
-        EVP_PKEY_get_raw_public_key(key, public_key, &public_key_len) == 1 &&
-        EVP_PKEY_get_raw_private_key(key, private_key, &private_key_len) == 1 &&
-        public_key_len == 32 && private_key_len == 32) {
-        rc = 0;
+    if (sxs_host_random(private_key, 32) != 0 ||
+        pe_crypto_x25519_public(private_key, public_key) != 0) {
+        pe_crypto_secure_zero(public_key, 32);
+        pe_crypto_secure_zero(private_key, 32);
+        return -1;
     }
-    EVP_PKEY_free(key);
-    EVP_PKEY_CTX_free(ctx);
-    return rc;
+    return 0;
 }
 
 static int derive_shared_key(const uint8_t private_key[32],
@@ -126,49 +99,19 @@ static int derive_shared_key(const uint8_t private_key[32],
                              uint8_t shared_key[32])
 {
     static const uint8_t info[] = KEY_SHARING_KDF_INFO;
-    EVP_PKEY *private_pkey = NULL;
-    EVP_PKEY *policy_pkey = NULL;
-    EVP_PKEY_CTX *derive_ctx = NULL;
-    EVP_PKEY_CTX *kdf_ctx = NULL;
     uint8_t shared_secret[32];
-    size_t shared_secret_len = sizeof(shared_secret);
-    size_t shared_key_len = 32;
     int rc = -1;
 
-    private_pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL,
-                                                private_key, 32);
-    policy_pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL,
-                                              policy_public_key, 32);
-    derive_ctx = private_pkey ? EVP_PKEY_CTX_new(private_pkey, NULL) : NULL;
-    if (!private_pkey || !policy_pkey || !derive_ctx ||
-        EVP_PKEY_derive_init(derive_ctx) != 1 ||
-        EVP_PKEY_derive_set_peer(derive_ctx, policy_pkey) != 1 ||
-        EVP_PKEY_derive(derive_ctx, shared_secret, &shared_secret_len) != 1 ||
-        shared_secret_len != sizeof(shared_secret)) {
-        goto cleanup;
+    if (pe_crypto_x25519_shared(private_key, policy_public_key,
+                                 shared_secret) == 0 &&
+        pe_crypto_hkdf_sha256(shared_secret, sizeof(shared_secret),
+                               owner_nonce, 32, info, sizeof(info) - 1,
+                               shared_key, 32) == 0) {
+        rc = 0;
     }
-
-    kdf_ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
-    if (!kdf_ctx || EVP_PKEY_derive_init(kdf_ctx) != 1 ||
-        EVP_PKEY_CTX_set_hkdf_md(kdf_ctx, EVP_sha256()) != 1 ||
-        EVP_PKEY_CTX_set1_hkdf_salt(kdf_ctx, owner_nonce, 32) != 1 ||
-        EVP_PKEY_CTX_set1_hkdf_key(kdf_ctx, shared_secret,
-                                   sizeof(shared_secret)) != 1 ||
-        EVP_PKEY_CTX_add1_hkdf_info(kdf_ctx, info, sizeof(info) - 1) != 1 ||
-        EVP_PKEY_derive(kdf_ctx, shared_key, &shared_key_len) != 1 ||
-        shared_key_len != 32) {
-        goto cleanup;
-    }
-    rc = 0;
-
-cleanup:
-    OPENSSL_cleanse(shared_secret, sizeof(shared_secret));
-    EVP_PKEY_CTX_free(kdf_ctx);
-    EVP_PKEY_CTX_free(derive_ctx);
-    EVP_PKEY_free(policy_pkey);
-    EVP_PKEY_free(private_pkey);
+    pe_crypto_secure_zero(shared_secret, sizeof(shared_secret));
     if (rc != 0) {
-        memset(shared_key, 0, 32);
+        pe_crypto_secure_zero(shared_key, 32);
     }
     return rc;
 }
@@ -178,10 +121,7 @@ static int verify_bootstrap_signature(
     const struct key_sharing_response *response)
 {
     uint8_t message[SXS_KEY_BOOTSTRAP_MESSAGE_SIZE];
-    EVP_PKEY *public_key = NULL;
-    EVP_MD_CTX *ctx = NULL;
     size_t offset = 0;
-    int rc = -1;
 
     memcpy(message + offset, SXS_KEY_BOOTSTRAP_DOMAIN,
            SXS_KEY_BOOTSTRAP_DOMAIN_SIZE);
@@ -192,19 +132,9 @@ static int verify_bootstrap_signature(
     offset += 32;
     memcpy(message + offset, response->policy_ephemeral_public_key, 32);
 
-    public_key = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL,
-                                             SXS_DEVICE_PUBLIC_KEY, 32);
-    ctx = EVP_MD_CTX_new();
-    if (public_key && ctx &&
-        EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, public_key) == 1 &&
-        EVP_DigestVerify(ctx, response->device_signature,
-                         sizeof(response->device_signature), message,
-                         sizeof(message)) == 1) {
-        rc = 0;
-    }
-    EVP_MD_CTX_free(ctx);
-    EVP_PKEY_free(public_key);
-    return rc;
+    return pe_crypto_ed25519_verify(SXS_DEVICE_PUBLIC_KEY, message,
+                                     sizeof(message),
+                                     response->device_signature);
 }
 
 static int compute_key_confirmation(
@@ -213,7 +143,6 @@ static int compute_key_confirmation(
 {
     static const uint8_t domain[] = KEY_SHARING_CONFIRMATION_DOMAIN;
     uint8_t message[(sizeof(domain) - 1) + 3 * KEY_SHARING_FIELD_SIZE];
-    unsigned int confirmation_len = 0;
     size_t offset = 0;
 
     memcpy(message + offset, domain, sizeof(domain) - 1);
@@ -223,11 +152,8 @@ static int compute_key_confirmation(
     memcpy(message + offset, request->owner_ephemeral_public_key, 32);
     offset += 32;
     memcpy(message + offset, policy_public_key, 32);
-    if (!HMAC(EVP_sha256(), shared_key, 32, message, sizeof(message),
-              confirmation, &confirmation_len) || confirmation_len != 32) {
-        return -1;
-    }
-    return 0;
+    return pe_crypto_hmac_sha256(shared_key, 32, message, sizeof(message),
+                                  confirmation);
 }
 
 int main(int argc, char **argv)
@@ -240,11 +166,12 @@ int main(int argc, char **argv)
     int rc = 1;
 
     if (argc != 3) {
-        fprintf(stderr, "Usage: %s <device> <TApp-private-key.pem>\n",
+        fprintf(stderr, "Usage: %s <device> <TApp-private-key.hex>\n",
                 argv[0]);
         return 1;
     }
-    if (RAND_bytes(request.owner_nonce, sizeof(request.owner_nonce)) != 1 ||
+    if (sxs_host_random(request.owner_nonce,
+                        sizeof(request.owner_nonce)) != 0 ||
         generate_x25519_keypair(request.owner_ephemeral_public_key,
                                 owner_private_key) != 0 ||
         sign_tapp_request(&request, argv[2]) != 0 ||
@@ -259,8 +186,8 @@ int main(int argc, char **argv)
         compute_key_confirmation(shared_key, &request,
                                  response.policy_ephemeral_public_key,
                                  expected_confirmation) != 0 ||
-        CRYPTO_memcmp(expected_confirmation, response.key_confirmation,
-                      sizeof(expected_confirmation)) != 0) {
+        !pe_crypto_equal(expected_confirmation, response.key_confirmation,
+                          sizeof(expected_confirmation))) {
         fprintf(stderr, "key sharing verification failed\n");
         goto cleanup;
     }
@@ -276,10 +203,11 @@ int main(int argc, char **argv)
     rc = 0;
 
 cleanup:
-    OPENSSL_cleanse(owner_private_key, sizeof(owner_private_key));
-    OPENSSL_cleanse(shared_key, sizeof(shared_key));
-    OPENSSL_cleanse(expected_confirmation, sizeof(expected_confirmation));
-    OPENSSL_cleanse(&request, sizeof(request));
-    OPENSSL_cleanse(&response, sizeof(response));
+    pe_crypto_secure_zero(owner_private_key, sizeof(owner_private_key));
+    pe_crypto_secure_zero(shared_key, sizeof(shared_key));
+    pe_crypto_secure_zero(expected_confirmation,
+                           sizeof(expected_confirmation));
+    pe_crypto_secure_zero(&request, sizeof(request));
+    pe_crypto_secure_zero(&response, sizeof(response));
     return rc;
 }

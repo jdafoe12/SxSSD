@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for SxSSD by Josh Dafoe.
+# SxSSD modifications: 2026-04-29 through 2026-08-23.
+
 # Huaicheng Li <huaicheng@cs.uchicago.edu>
 # Run FEMU as a black-box SSD (FTL managed by the device)
 

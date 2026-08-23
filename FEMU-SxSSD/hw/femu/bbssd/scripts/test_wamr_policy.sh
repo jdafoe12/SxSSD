@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,7 +32,7 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
     make -C "$POLICY_DIR" isolation-test
     # These directories may be copied from a newer host distribution.  Force
     # guest-native helper binaries so an apparently up-to-date host binary
-    # cannot retain an incompatible dependency such as libssl.so.3.
+    # cannot retain a shared-library ABI from the build host.
     make -C "$SCRIPT_DIR" -B tool
 fi
 

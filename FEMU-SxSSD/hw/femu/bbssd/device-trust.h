@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #ifndef SXS_DEVICE_TRUST_H
 #define SXS_DEVICE_TRUST_H
 

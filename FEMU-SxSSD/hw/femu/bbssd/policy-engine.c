@@ -1,13 +1,15 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #include "qemu/osdep.h"
 #include "policy-engine.h"
 #include "policy-wamr.h"
+#include "policy-crypto.h"
 #include "meta-interface-protocol.h"
-#include "policy/policy-wasm-abi.h"
+#include "policy/include/policy-wasm-abi.h"
 #include "qemu/error-report.h"
 
 #include <elf.h>
 #include <inttypes.h>
-#include <openssl/crypto.h>
 
 /* Generated in the build directory from meta-interface-policy.wasm. */
 extern const uint8_t pe_meta_interface_policy_wasm[];
@@ -92,6 +94,11 @@ int pe_activation_stage_subscription(struct pe_policy_execution *execution,
         break;
     case SXS_EVENT_PSWD_TRANSITION:
         if (selector != SXS_WASM_SELECTOR_ANY && selector > PSWD_BAD) {
+            return -SXS_WASM_EINVAL;
+        }
+        break;
+    case SXS_EVENT_FLASH_ERROR:
+        if (selector != SXS_WASM_SELECTOR_ANY && selector > BBM_EVENT_ERASE) {
             return -SXS_WASM_EINVAL;
         }
         break;
@@ -400,9 +407,29 @@ static void copy_pswd_event(struct pe_policy_execution *execution,
 
     destination->old_state = event->old_state;
     destination->new_state = event->new_state;
-    destination->pba = event->pba.pba;
+    destination->ppa = ((PseudoPpa) {
+        .g.ch = event->ppba.g.ch,
+        .g.lun = event->ppba.g.lun,
+        .g.pl = event->ppba.g.pl,
+        .g.blk = event->ppba.g.blk,
+        .g.pg = 0,
+    }).ppa;
     destination->erase_count = event->erase_cnt;
     destination->write_pointer = event->wp;
+}
+
+static void copy_flash_error_event(struct pe_policy_execution *execution,
+                                   const struct BbmErrorEvent *event)
+{
+    struct sxs_flash_error_event *destination =
+        &execution->event_snapshot.flash_error;
+
+    destination->command = event->cmd;
+    destination->io_type = event->type;
+    destination->status = event->status;
+    destination->ppa = event->pppa.ppa;
+    destination->start_time_ns = event->stime;
+    destination->latency_ns = event->lat;
 }
 
 static void build_event_execution(struct pe_policy_execution *execution,
@@ -425,6 +452,10 @@ static void build_event_execution(struct pe_policy_execution *execution,
     case SXS_EVENT_PSWD_TRANSITION:
         execution->native_event.pswd = native_event;
         copy_pswd_event(execution, native_event);
+        break;
+    case SXS_EVENT_FLASH_ERROR:
+        execution->native_event.flash_error = native_event;
+        copy_flash_error_event(execution, native_event);
         break;
     case SXS_EVENT_BACKGROUND:
         break;
@@ -499,13 +530,13 @@ static bool execute_subscription(struct policy_engine *pe,
     }
     *action_result = result;
     pe_executing_slots &= ~(1U << slot);
-    OPENSSL_cleanse(&execution, sizeof(execution));
+    pe_crypto_secure_zero(&execution, sizeof(execution));
     qemu_mutex_unlock(&record->execution_lock);
     return true;
 
 no_match:
     pe_executing_slots &= ~(1U << slot);
-    OPENSSL_cleanse(&execution, sizeof(execution));
+    pe_crypto_secure_zero(&execution, sizeof(execution));
     qemu_mutex_unlock(&record->execution_lock);
     return false;
 }
@@ -655,8 +686,7 @@ void pe_dispatch_flash_event(const struct BbmEvent *event, void *context)
     g_free(subscriptions);
 }
 
-void pe_dispatch_pswd_transition(struct RawFlash *fb,
-                                 const struct PswdStateTransitionEvent *event,
+void pe_dispatch_pswd_transition(const struct PswdStateTransitionEvent *event,
                                  void *notify_ctx)
 {
     struct policy_engine *pe = notify_ctx;
@@ -664,7 +694,7 @@ void pe_dispatch_pswd_transition(struct RawFlash *fb,
     size_t count;
     size_t i;
 
-    if (!pe || !fb || !event) {
+    if (!pe || !event) {
         return;
     }
     subscriptions = snapshot_subscriptions(
@@ -675,6 +705,28 @@ void pe_dispatch_pswd_transition(struct RawFlash *fb,
 
         execute_subscription(pe, &subscriptions[i], (void *)event,
                              &ignored, &fault);
+    }
+    g_free(subscriptions);
+}
+
+void pe_dispatch_flash_error(const struct BbmErrorEvent *event, void *context)
+{
+    struct policy_engine *pe = context;
+    struct pe_policy_subscription *subscriptions;
+    size_t count;
+    size_t i;
+
+    if (!pe || !event) {
+        return;
+    }
+    subscriptions = snapshot_subscriptions(pe, SXS_EVENT_FLASH_ERROR,
+                                            event->cmd, false, &count);
+    for (i = 0; i < count; i++) {
+        uint64_t ignored;
+        bool fault;
+
+        execute_subscription(pe, &subscriptions[i], (void *)event, &ignored,
+                             &fault);
     }
     g_free(subscriptions);
 }
@@ -1123,12 +1175,12 @@ static int activate_policy_artifact(struct policy_engine *pe,
     execution.activation = activation;
     initialize_execution(&execution, SXS_PHASE_INIT, SXS_EVENT_NONE, 0);
     if (pe_wamr_vm_execute(vm, &execution, &result) != 0 || result != 0) {
-        OPENSSL_cleanse(&execution, sizeof(execution));
+        pe_crypto_secure_zero(&execution, sizeof(execution));
         warn_report("policy id=%u INIT failed (result=%" PRIu64 ")",
                     record->policy_id, result);
         goto fail;
     }
-    OPENSSL_cleanse(&execution, sizeof(execution));
+    pe_crypto_secure_zero(&execution, sizeof(execution));
 
     qemu_mutex_lock(&pe->management_lock);
     if (record->state != PE_RUNTIME_ACTIVATING || record->vm ||

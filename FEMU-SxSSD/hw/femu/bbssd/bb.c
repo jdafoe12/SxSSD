@@ -1,3 +1,10 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/*
+ * Modified for SxSSD by Josh Dafoe.
+ * SxSSD modifications: 2025-12-16 through 2026-08-23.
+ * Includes code reorganized from the FEMU BBSSD ftl.c implementation.
+ */
+
 #include "../nvme.h"
 #include "./policy-api.h"
 #include "./policy-engine.h"
@@ -47,8 +54,10 @@ static void bbssd_init(FemuCtrl *n)
     ssd->policy_engine = pe_create(ssd);
     bbm_set_event_notify(ssd->bbm, pe_dispatch_flash_event,
                          ssd->policy_engine);
-    raw_flash_set_pswd_transition_notify(
-        ssd->raw_flash, pe_dispatch_pswd_transition, ssd->policy_engine);
+    bbm_set_pswd_transition_notify(
+        ssd->bbm, pe_dispatch_pswd_transition, ssd->policy_engine);
+    bbm_set_error_notify(ssd->bbm, pe_dispatch_flash_error,
+                         ssd->policy_engine);
 
     if (pe_bootstrap_meta_interface_policy(ssd->policy_engine, ssd) != 0) {
         fprintf(stderr, "[BBSSD] Failed to bootstrap meta-interface policy\n");

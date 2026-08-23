@@ -18,6 +18,20 @@ FEMU/hw/femu/bbssd/workload-eval/workload_sets/results/
 device_timing.csv
 policyctl_timing.csv
 
+# Private and historical SxSSD experiments
+/benchmark-results/
+/steady-state-results/
+/FEMU-SxSSD/hw/femu/bbssd/scripts/atc21_zns_comparison/
+/FEMU-SxSSD/hw/femu/bbssd/scripts/atc21_zns_validation/
+/FEMU-SxSSD/hw/femu/bbssd/scripts/zns_block_comparison/
+/FEMU-SxSSD/hw/femu/bbssd/scripts/steady-state-comparison/
+/FEMU-SxSSD/hw/femu/bbssd/scripts/max_io_collection/
+/FEMU-SxSSD/hw/femu/bbssd/ubpf-config/
+
+# Local SxSSD build products
+/FEMU-SxSSD/build-*/
+/FEMU-SxSSD/hw/femu/bbssd/scripts/policyctl
+
 # Local VM images and editor files
 *.qcow2
 .DS_Store

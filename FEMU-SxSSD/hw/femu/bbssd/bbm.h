@@ -1,3 +1,10 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/*
+ * Includes SxSSD adaptations of FEMU BBSSD FTL geometry and
+ * address-management definitions.
+ * SxSSD modifications by Josh Dafoe: 2025-12-16 through 2026-08-23.
+ */
+
 #ifndef BBM_H
 #define BBM_H
 
@@ -18,8 +25,31 @@ typedef struct pba PseudoPba;
 
 struct bbm;
 struct BbmEvent;
+struct BbmErrorEvent;
+struct PswdStateTransitionEvent;
 
 typedef void (*BbmEventNotify)(const struct BbmEvent *event, void *context);
+typedef void (*BbmErrorNotify)(const struct BbmErrorEvent *event, void *context);
+typedef void (*BbmPswdTransitionNotify)(
+    const struct PswdStateTransitionEvent *event, void *context);
+
+/* Stable pSWD state indexed by a pseudo-physical block. */
+struct bbm_pswd_ctx {
+    enum pswd_block_state state;
+    uint32_t wp;
+    uint32_t vpc;
+    uint32_t ipc;
+    bool remapping;
+};
+
+/* Logical pSWD transition.  ppba is never a raw physical address. */
+struct PswdStateTransitionEvent {
+    enum pswd_block_state old_state;
+    enum pswd_block_state new_state;
+    PseudoPba ppba;
+    int erase_cnt;
+    int wp;
+};
 
 /* Logical geometry (after OP/bad-block) maintained by BBM. */
 struct bbm_geom {
@@ -73,10 +103,10 @@ struct bbm {
     uint32_t reserved_per_lun;
 
     /*
-     * Block-level map indexed by (channel, LUN, logical block).  The caller's
-     * plane and page coordinates remain unchanged during translation.
+     * Block-level map indexed by (channel, LUN, plane, logical block).
      */
     struct pba *maptbl;
+    struct bbm_pswd_ctx *pswd_state;
 
     /* Logical geometry (after overprovisioning) */
     struct bbm_geom *geom;
@@ -84,6 +114,10 @@ struct bbm {
     /* Operation events travel upward without coupling BBM to policy-engine. */
     BbmEventNotify event_notify;
     void *event_notify_context;
+    BbmErrorNotify error_notify;
+    void *error_notify_context;
+    BbmPswdTransitionNotify pswd_transition_notify;
+    void *pswd_transition_notify_context;
 
     /* Generic bookkeeping for physical blocks excluded from pseudo allocation. */
     uint64_t total_phys_blks;
@@ -158,15 +192,25 @@ struct BbmEvent {
     int64_t lat;      /* latency reported by raw flash */
 };
 
-int bbm_read(struct RawFlash *fb, const struct bbm *ctx, uint8_t *buffer,
+/* One policy-facing primitive-operation failure. */
+struct BbmErrorEvent {
+    enum BbmEventCmd cmd;
+    enum BbmEventType type;
+    PseudoPpa pppa;
+    int status;
+    int64_t stime;
+    int64_t lat;
+};
+
+int bbm_read(struct RawFlash *fb, struct bbm *ctx, uint8_t *buffer,
              PseudoPpa *ppas, uint64_t page_count, uint64_t page_size,
              void *oob_buf, size_t oob_offset, size_t oob_len,
              struct BbmEvent *event);
-int bbm_write(struct RawFlash *fb, const struct bbm *ctx,
+int bbm_write(struct RawFlash *fb, struct bbm *ctx,
               const uint8_t *buffer, PseudoPpa *ppas, uint64_t page_count,
               uint64_t page_size, const void *oob_buf, size_t oob_offset,
               size_t oob_len, struct BbmEvent *event);
-int bbm_erase(struct RawFlash *fb, const struct bbm *ctx,
+int bbm_erase(struct RawFlash *fb, struct bbm *ctx,
               PseudoPba *blocks, uint64_t block_count,
               struct BbmEvent *event);
 
@@ -192,20 +236,24 @@ void bbm_get_block_vpc_ipc(struct RawFlash *fb, const struct bbm *ctx,
 
 void bbm_set_event_notify(struct bbm *ctx, BbmEventNotify notify,
                           void *context);
+void bbm_set_error_notify(struct bbm *ctx, BbmErrorNotify notify,
+                          void *context);
+void bbm_set_pswd_transition_notify(struct bbm *ctx,
+                                    BbmPswdTransitionNotify notify,
+                                    void *context);
+int bbm_pswd_get(const struct bbm *ctx, const PseudoPba *ppba,
+                 struct bbm_pswd_ctx *destination);
 
 /*
  * Future bad-block/error-handling mechanisms.  These are intentionally kept
  * as explicit design points even where implementation is incomplete:
  * mark/sanitize/remap, capacity shrink, read retry, and physical data moves.
  */
-int bbm_mark_block_bad(struct RawFlash *fb, const struct bbm *ctx,
-                       const struct ppa *ppa);
+int bbm_mark_block_bad(struct RawFlash *fb, struct bbm *ctx,
+                       const PseudoPba *ppba);
 
-int bbm_sanitize_block(struct RawFlash *fb, const struct bbm *ctx,
-                       const struct ppa *ppa);
-
-int bbm_remap_block(struct RawFlash *fb, const struct bbm *ctx,
-                    const struct ppa *ppa);
+int bbm_remap_block(struct RawFlash *fb, struct bbm *ctx,
+                    const PseudoPba *ppba);
 
 int bbm_shrink_ssd(struct RawFlash *fb, const struct bbm *ctx);
 

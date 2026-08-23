@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 set -eu
 
 input=${1:?usage: wasm-to-c.sh INPUT.wasm OUTPUT.c SYMBOL}

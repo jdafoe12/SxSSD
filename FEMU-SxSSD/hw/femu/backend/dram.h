@@ -1,3 +1,8 @@
+/*
+ * Modified for SxSSD by Josh Dafoe.
+ * SxSSD modifications: 2025-12-04 through 2026-08-23.
+ */
+
 #ifndef __FEMU_MEM_BACKEND
 #define __FEMU_MEM_BACKEND
 

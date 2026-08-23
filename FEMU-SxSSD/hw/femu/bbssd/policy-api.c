@@ -1,15 +1,22 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/*
+ * Derived in part from the FEMU BBSSD ftl.c implementation.
+ * SxSSD modifications by Josh Dafoe: 2025-12-04 through 2026-08-23.
+ */
+
 #include "qemu/osdep.h"
 #include "policy-api.h"
 #include "device-trust.h"
 #include "policy-crypto.h"
 #include "policy-engine.h"
 
+#include "crypto/random.h"
 #include "qemu/timer.h"
 #include <errno.h>
-#include <openssl/crypto.h>
 QEMU_BUILD_BUG_ON(sizeof(struct sxs_nvme_event) != 88);
 QEMU_BUILD_BUG_ON(sizeof(struct sxs_backend_event) != 32);
 QEMU_BUILD_BUG_ON(sizeof(struct sxs_pswd_event) != 24);
+QEMU_BUILD_BUG_ON(sizeof(struct sxs_flash_error_event) != 40);
 QEMU_BUILD_BUG_ON(sizeof(struct sxs_policy_context) != 128);
 QEMU_BUILD_BUG_ON(sizeof(struct sxs_geometry) != 80);
 QEMU_BUILD_BUG_ON(sizeof(struct sxs_layout) != 32);
@@ -78,9 +85,10 @@ static int native_read_physical_page(struct ssd *ssd, const PseudoPpa *ppa,
                                      uint8_t *page_data, int oob_handle,
                                      void *oob_data, int64_t start_time_ns,
                                      uint64_t *latency_ns);
-static uint64_t native_read_page_buffer(struct ssd *ssd, const PseudoPpa *ppa,
-                                        uint8_t *buffer, int oob_handle,
-                                        void *oob_data, int64_t start_time_ns);
+static int native_read_page_buffer(struct ssd *ssd, const PseudoPpa *ppa,
+                                   uint8_t *buffer, int oob_handle,
+                                   void *oob_data, int64_t start_time_ns,
+                                   uint64_t *latency_ns);
 static int native_migrate_page(struct ssd *ssd, const PseudoPpa *source,
                                uint32_t destination_eswd_id,
                                PseudoPpa *destination,
@@ -88,7 +96,6 @@ static int native_migrate_page(struct ssd *ssd, const PseudoPpa *source,
 static int native_get_page_status(struct ssd *ssd, const PseudoPpa *ppa);
 static void native_mark_page_valid(struct ssd *ssd, PseudoPpa *ppa);
 static void native_mark_page_invalid(struct ssd *ssd, PseudoPpa *ppa);
-static void native_mark_block_free(struct ssd *ssd, PseudoPpa *ppa);
 
 /* NVMe request, command, completion, and event access. */
 static uint64_t native_get_request_buffer_size(NvmeRequest *request);
@@ -332,6 +339,78 @@ int32_t policy_api_page_status_get(struct pe_policy_execution *execution,
     return status;
 }
 
+static bool policy_api_ppba_from_ppa(struct ssd *ssd, uint64_t ppa_value,
+                                     PseudoPba *destination)
+{
+    PseudoPpa ppa = { .ppa = ppa_value };
+
+    if (!ssd || !ssd->bbm || !destination ||
+        !native_ppa_valid(ssd, &ppa)) {
+        return false;
+    }
+    destination->g.ch = ppa.g.ch;
+    destination->g.lun = ppa.g.lun;
+    destination->g.pl = ppa.g.pl;
+    destination->g.blk = ppa.g.blk;
+    return true;
+}
+
+int32_t policy_api_pswd_get(struct pe_policy_execution *execution,
+                            uint64_t ppa_value,
+                            struct sxs_pswd_event *destination)
+{
+    PseudoPba ppba = {0};
+    struct bbm_pswd_ctx pswd;
+    struct pba physical;
+
+    execution = validated_execution(execution);
+    if (!execution || !destination ||
+        !policy_api_ppba_from_ppa(execution->engine->ssd, ppa_value, &ppba) ||
+        bbm_pswd_get(execution->engine->ssd->bbm, &ppba, &pswd) != 0) {
+        return -SXS_WASM_EINVAL;
+    }
+    physical = bbm_get_maptbl_entry(execution->engine->ssd->bbm, &ppba);
+    *destination = (struct sxs_pswd_event) {
+        .old_state = pswd.state,
+        .new_state = pswd.state,
+        .ppa = ppa_value & ~((((uint64_t)1 << PG_BITS) - 1) << BLK_BITS),
+        .erase_count = raw_flash_get_erase_cnt(execution->engine->ssd->raw_flash,
+                                                &physical),
+        .write_pointer = pswd.wp,
+    };
+    return 0;
+}
+
+int32_t policy_api_pswd_retire(struct pe_policy_execution *execution,
+                               uint64_t ppa_value)
+{
+    PseudoPba ppba = {0};
+
+    execution = validated_execution(execution);
+    if (!phase_is(execution, SXS_PHASE_ACTION) ||
+        !policy_api_ppba_from_ppa(execution->engine->ssd, ppa_value, &ppba)) {
+        return -SXS_WASM_EPERM;
+    }
+    return bbm_mark_block_bad(execution->engine->ssd->raw_flash,
+                              execution->engine->ssd->bbm, &ppba) == 0
+               ? 0 : -SXS_WASM_EIO;
+}
+
+int32_t policy_api_pswd_remap(struct pe_policy_execution *execution,
+                              uint64_t ppa_value)
+{
+    PseudoPba ppba = {0};
+
+    execution = validated_execution(execution);
+    if (!phase_is(execution, SXS_PHASE_ACTION) ||
+        !policy_api_ppba_from_ppa(execution->engine->ssd, ppa_value, &ppba)) {
+        return -SXS_WASM_EPERM;
+    }
+    return bbm_remap_block(execution->engine->ssd->raw_flash,
+                           execution->engine->ssd->bbm, &ppba) == 0
+               ? 0 : -SXS_WASM_EIO;
+}
+
 static struct NvmeCommandEvent *
 nvme_execution_event(struct pe_policy_execution *execution)
 {
@@ -560,6 +639,159 @@ int32_t policy_api_ppa_to_eswd(struct pe_policy_execution *execution, uint64_t p
     return policy_api_eswd_from_ppa(execution, ppa, destination);
 }
 
+static uint64_t native_pseudo_block_owner_index(const struct bbm_geom *geom,
+                                                const PseudoPba *ppba)
+{
+    return ((((uint64_t)ppba->g.ch * geom->luns_per_ch) + ppba->g.lun) *
+             geom->pls_per_lun + ppba->g.pl) * geom->blks_per_pl_log +
+           ppba->g.blk;
+}
+
+int32_t policy_api_eswd_member_get(struct pe_policy_execution *execution,
+                                   uint32_t eswd_id, uint32_t member_index,
+                                   uint64_t *ppa_out)
+{
+    struct eswd_layout *layout;
+    struct eswd *eswd;
+    const PseudoPba *member;
+
+    execution = validated_execution(execution);
+    if (!execution || !ppa_out ||
+        !(eswd = native_find_eswd_by_id(execution->engine->ssd, eswd_id))) {
+        return -SXS_WASM_ENOENT;
+    }
+    layout = &execution->engine->ssd->eswd_layout;
+    if (member_index >= layout->blks_per_eswd || !layout->members) {
+        return -SXS_WASM_EINVAL;
+    }
+    member = &layout->members[eswd->id * layout->blks_per_eswd + member_index];
+    *ppa_out = ((PseudoPpa) {
+        .g.ch = member->g.ch, .g.lun = member->g.lun,
+        .g.pl = member->g.pl, .g.blk = member->g.blk,
+    }).ppa;
+    return 0;
+}
+
+int32_t policy_api_eswd_release(struct pe_policy_execution *execution,
+                                uint32_t eswd_id)
+{
+    struct ssd *ssd;
+    struct eswd_layout *layout;
+    struct eswd *eswd;
+    uint32_t slot;
+
+    execution = validated_execution(execution);
+    if (!phase_is(execution, SXS_PHASE_ACTION) ||
+        !execution->engine->ssd->eswd_layout_finalized) {
+        return -SXS_WASM_EPERM;
+    }
+    ssd = execution->engine->ssd;
+    eswd = native_find_eswd_by_id(ssd, eswd_id);
+    layout = &ssd->eswd_layout;
+    if (!eswd || eswd->vpc || eswd->ipc || eswd->wp_page_index) {
+        return -SXS_WASM_EBUSY;
+    }
+    for (slot = 0; slot < layout->blks_per_eswd; slot++) {
+        const PseudoPba *member =
+            &layout->members[eswd_id * layout->blks_per_eswd + slot];
+        struct bbm_pswd_ctx pswd;
+
+        if (bbm_pswd_get(ssd->bbm, member, &pswd) != 0 ||
+            pswd.state != PSWD_FREE || pswd.remapping) {
+            return -SXS_WASM_EBUSY;
+        }
+    }
+    for (slot = 0; slot < layout->blks_per_eswd; slot++) {
+        const PseudoPba *member =
+            &layout->members[eswd_id * layout->blks_per_eswd + slot];
+        layout->pseudo_block_owner[
+            native_pseudo_block_owner_index(ssd->bbm->geom, member)] = -1;
+    }
+    eswd->active = false;
+    return 0;
+}
+
+int32_t policy_api_eswd_rebind(struct pe_policy_execution *execution,
+                               uint32_t eswd_id, const uint64_t *members,
+                               uint32_t member_count)
+{
+    struct ssd *ssd;
+    struct eswd_layout *layout;
+    struct eswd *eswd;
+    PseudoPba *replacement;
+    int32_t result = 0;
+    uint32_t slot;
+
+    execution = validated_execution(execution);
+    if (!phase_is(execution, SXS_PHASE_ACTION) || !members ||
+        !execution->engine->ssd->eswd_layout_finalized) {
+        return -SXS_WASM_EPERM;
+    }
+    ssd = execution->engine->ssd;
+    layout = &ssd->eswd_layout;
+    if (eswd_id >= ssd->tt_eswds || member_count != layout->blks_per_eswd) {
+        return -SXS_WASM_EINVAL;
+    }
+    eswd = &ssd->eswds[eswd_id];
+    if (eswd->active) {
+        return -SXS_WASM_EBUSY;
+    }
+    replacement = g_try_new(PseudoPba, member_count);
+    if (!replacement) {
+        return -SXS_WASM_ENOMEM;
+    }
+    for (slot = 0; slot < member_count; slot++) {
+        PseudoPpa ppa = { .ppa = members[slot] };
+        const PseudoPba *lane =
+            &layout->members[eswd_id * layout->blks_per_eswd + slot];
+        struct bbm_pswd_ctx pswd;
+        uint64_t owner;
+
+        if (!native_ppa_valid(ssd, &ppa)) {
+            result = -SXS_WASM_EINVAL;
+            goto out;
+        }
+        replacement[slot].g.ch = ppa.g.ch;
+        replacement[slot].g.lun = ppa.g.lun;
+        replacement[slot].g.pl = ppa.g.pl;
+        replacement[slot].g.blk = ppa.g.blk;
+        if (replacement[slot].g.ch != lane->g.ch ||
+            replacement[slot].g.lun != lane->g.lun ||
+            replacement[slot].g.pl != lane->g.pl) {
+            result = -SXS_WASM_EINVAL;
+            goto out;
+        }
+        owner = native_pseudo_block_owner_index(ssd->bbm->geom,
+                                                  &replacement[slot]);
+        if (layout->pseudo_block_owner[owner] != -1 ||
+            bbm_pswd_get(ssd->bbm, &replacement[slot], &pswd) != 0 ||
+            pswd.state != PSWD_FREE || pswd.remapping) {
+            result = -SXS_WASM_EBUSY;
+            goto out;
+        }
+        for (uint32_t prior = 0; prior < slot; prior++) {
+            if (replacement[prior].pba == replacement[slot].pba) {
+                result = -SXS_WASM_EEXIST;
+                goto out;
+            }
+        }
+    }
+    for (slot = 0; slot < member_count; slot++) {
+        PseudoPba *destination =
+            &layout->members[eswd_id * layout->blks_per_eswd + slot];
+
+        *destination = replacement[slot];
+        layout->pseudo_block_owner[
+            native_pseudo_block_owner_index(ssd->bbm->geom, destination)] =
+            (int32_t)eswd_id;
+    }
+    eswd->active = true;
+    native_eswd_reset_state(ssd, eswd_id);
+out:
+    g_free(replacement);
+    return result;
+}
+
 static int write_page_result(struct sxs_page_result *result, int32_t status,
                              uint32_t committed_lbas, uint64_t ppa,
                              uint64_t latency)
@@ -630,7 +862,7 @@ int32_t policy_api_page_read(struct pe_policy_execution *execution,
     }
     if (native_oob) {
         memcpy(oob_output, native_oob, oob_length);
-        OPENSSL_cleanse(native_oob, owned_oob_bytes);
+        pe_crypto_secure_zero(native_oob, owned_oob_bytes);
         g_free(native_oob);
     }
     return write_page_result(result, 0, 0, request->ppa, latency);
@@ -780,7 +1012,9 @@ int32_t policy_api_crypto_random(struct pe_policy_execution *execution,
     if (!output) {
         return -SXS_WASM_EINVAL;
     }
-    return pe_crypto_random(output, length) == 0 ? 0 : -SXS_WASM_EIO;
+    return qcrypto_random_bytes(output, length, NULL) == 0
+               ? 0
+               : -SXS_WASM_EIO;
 }
 
 int32_t
@@ -889,8 +1123,8 @@ int32_t policy_api_crypto_hkdf_sha256(struct pe_policy_execution *execution,
         !output || output_length == 0) {
         return -SXS_WASM_EINVAL;
     }
-    return pe_crypto_hkdf_sha256(key, key_length, info, info_length,
-                                 output, output_length) == 0
+    return pe_crypto_hkdf_sha256(key, key_length, NULL, 0,
+                                 info, info_length, output, output_length) == 0
                ? 0
                : -SXS_WASM_EIO;
 }
@@ -1244,10 +1478,10 @@ bool flash_subsystem_eswd_config_valid(const struct eswd_config *config,
     uint32_t tt_luns = nchs * luns_per_ch;
     uint32_t blocks_per_eswd = config->blocks_per_eswd;
     if (blocks_per_eswd == 0) {
-        blocks_per_eswd = tt_luns;  /* default */
+        blocks_per_eswd = tt_luns * pls_per_lun;  /* one full stripe */
     }
-    /* blocks_per_eswd must be a positive multiple of tt_luns for simple mapping */
-    if (blocks_per_eswd % tt_luns != 0) {
+    /* An eSWD contains complete per-plane lanes. */
+    if (blocks_per_eswd % (tt_luns * pls_per_lun) != 0) {
         return false;
     }
     uint64_t total_blocks = (uint64_t)blks_per_lun_log * tt_luns;
@@ -1282,10 +1516,13 @@ int flash_subsystem_eswd_layout_compute(struct eswd_layout *layout,
     uint32_t tt_luns = geom->nchs * geom->luns_per_ch;
     uint32_t blocks_per_eswd = config->blocks_per_eswd;
     if (blocks_per_eswd == 0) {
-        blocks_per_eswd = tt_luns;
+        blocks_per_eswd = tt_luns * geom->pls_per_lun;
     }
     uint64_t total_blocks = (uint64_t)geom->blks_per_lun_log * tt_luns;
     if (total_blocks % (uint64_t)blocks_per_eswd != 0) {
+        return -1;
+    }
+    if (blocks_per_eswd % (tt_luns * geom->pls_per_lun) != 0) {
         return -1;
     }
     layout->blks_per_eswd = blocks_per_eswd;
@@ -1293,13 +1530,53 @@ int flash_subsystem_eswd_layout_compute(struct eswd_layout *layout,
     layout->pgs_per_eswd = layout->blks_per_eswd * geom->pgs_per_blk;
     layout->striping_level = config->striping_level;
 
-    /* Initialize eSWD → starting block mapping (identity by default) */
+    /* Initialize explicit eSWD → pseudo-block membership (identity by default). */
     layout->tt_pl = tt_luns * geom->pls_per_lun;
     layout->blks_per_pl = layout->blks_per_eswd / layout->tt_pl;
-    layout->eswd_to_starting_block = g_malloc0(sizeof(uint32_t) * layout->tt_eswds);
+    layout->members = g_malloc0(sizeof(PseudoPba) * layout->tt_eswds *
+                                layout->blks_per_eswd);
+    layout->pseudo_block_owner = g_new(int32_t, geom->tt_blks_log);
+    if (!layout->members || !layout->pseudo_block_owner) {
+        flash_subsystem_eswd_layout_cleanup(layout);
+        return -1;
+    }
+    for (uint64_t i = 0; i < geom->tt_blks_log; i++) {
+        layout->pseudo_block_owner[i] = -1;
+    }
+    for (uint32_t eswd = 0; eswd < layout->tt_eswds; eswd++) {
+        for (uint32_t slot = 0; slot < layout->blks_per_eswd; slot++) {
+            uint32_t block_slot = slot / layout->tt_pl;
+            uint32_t lane = slot % layout->tt_pl;
+            PseudoPba *member =
+                &layout->members[eswd * layout->blks_per_eswd + slot];
+            uint64_t owner_index;
 
-    for (uint32_t i = 0; i < layout->tt_eswds; i++) {
-        layout->eswd_to_starting_block[i] = i * layout->blks_per_pl;
+            switch (layout->striping_level) {
+            case ESWD_STRIPE_CHANNEL:
+                member->g.ch = lane % geom->nchs;
+                member->g.pl = (lane / geom->nchs) % geom->pls_per_lun;
+                member->g.lun = lane / (geom->nchs * geom->pls_per_lun);
+                break;
+            case ESWD_STRIPE_LUN:
+                member->g.lun = lane % geom->luns_per_ch;
+                member->g.pl = (lane / geom->luns_per_ch) % geom->pls_per_lun;
+                member->g.ch = lane / (geom->luns_per_ch * geom->pls_per_lun);
+                break;
+            case ESWD_STRIPE_PLANE:
+                member->g.pl = lane / tt_luns;
+                member->g.ch = (lane % tt_luns) % geom->nchs;
+                member->g.lun = (lane % tt_luns) / geom->nchs;
+                break;
+            default:
+                flash_subsystem_eswd_layout_cleanup(layout);
+                return -1;
+            }
+            member->g.blk = eswd * layout->blks_per_pl + block_slot;
+            owner_index = ((((uint64_t)member->g.ch * geom->luns_per_ch) +
+                            member->g.lun) * geom->pls_per_lun + member->g.pl) *
+                          geom->blks_per_pl_log + member->g.blk;
+            layout->pseudo_block_owner[owner_index] = (int32_t)eswd;
+        }
     }
 
     return 0;
@@ -1312,13 +1589,18 @@ static int native_layout_ppa_to_eswd(const struct eswd_layout *layout,
     if (!layout || !geom || !ppa) {
         return -1;
     }
-    uint32_t tt_luns = geom->nchs * geom->luns_per_ch;
-    uint32_t blk = ppa->g.blk;
-    uint32_t eswd_id = blk * tt_luns / layout->blks_per_eswd;
-    if (eswd_id >= layout->tt_eswds) {
+    uint64_t index;
+
+    if (ppa->g.ch >= geom->nchs || ppa->g.lun >= geom->luns_per_ch ||
+        ppa->g.pl >= geom->pls_per_lun ||
+        ppa->g.blk >= geom->blks_per_pl_log ||
+        !layout->pseudo_block_owner) {
         return -1;
     }
-    return (int)eswd_id;
+    index = ((((uint64_t)ppa->g.ch * geom->luns_per_ch) + ppa->g.lun) *
+             geom->pls_per_lun + ppa->g.pl) * geom->blks_per_pl_log +
+            ppa->g.blk;
+    return layout->pseudo_block_owner[index];
 }
 
 /* PLANE striping: pl first, then ch, lun, block_slot. */
@@ -1390,17 +1672,34 @@ static int native_layout_page_to_ppa(const struct eswd_layout *layout,
         return -1;
     }
 
-    /* Look up starting block from mapping table */
-    uint32_t starting_block = layout->eswd_to_starting_block[eswd_id];
+    uint32_t lane;
+    uint32_t member_index;
+    const PseudoPba *member;
 
-    /* Add block_slot offset within this eSWD */
-    uint32_t blk = starting_block + block_slot;
+    switch (layout->striping_level) {
+    case ESWD_STRIPE_CHANNEL:
+        lane = ch + pl * nchs + lun * (nchs * pls_per_lun);
+        break;
+    case ESWD_STRIPE_LUN:
+        lane = lun + pl * luns_per_ch + ch * (luns_per_ch * pls_per_lun);
+        break;
+    case ESWD_STRIPE_PLANE:
+        lane = pl * tt_luns + ch + lun * nchs;
+        break;
+    default:
+        return -1;
+    }
+    member_index = block_slot * layout->tt_pl + lane;
+    if (!layout->members || member_index >= layout->blks_per_eswd) {
+        return -1;
+    }
+    member = &layout->members[eswd_id * layout->blks_per_eswd + member_index];
 
     memset(ppa, 0, sizeof(PseudoPpa));
-    ppa->g.ch = ch;
-    ppa->g.lun = lun;
-    ppa->g.pl = pl;
-    ppa->g.blk = blk;
+    ppa->g.ch = member->g.ch;
+    ppa->g.lun = member->g.lun;
+    ppa->g.pl = member->g.pl;
+    ppa->g.blk = member->g.blk;
     ppa->g.pg = pg;
     return 0;
 }
@@ -1411,61 +1710,52 @@ static int native_layout_ppa_to_page(const struct eswd_layout *layout,
                      uint32_t *out_eswd_id,
                      uint32_t *out_page_index)
 {
+    uint32_t eswd_id;
+    uint32_t slot;
+    uint32_t block_slot;
+    uint32_t lane;
+    int eswd_id_ret;
+
     if (!layout || !geom || !ppa || !out_eswd_id || !out_page_index) {
         return -1;
     }
-    int eswd_id_ret = native_layout_ppa_to_eswd(layout, geom, ppa);
+    eswd_id_ret = native_layout_ppa_to_eswd(layout, geom, ppa);
     if (eswd_id_ret < 0) {
         return -1;
     }
-    *out_eswd_id = (uint32_t)eswd_id_ret;
-
-    uint32_t tt_luns = geom->nchs * geom->luns_per_ch;
-    uint32_t nchs = geom->nchs;
-    uint32_t luns_per_ch = geom->luns_per_ch;
-    uint32_t pls_per_lun = geom->pls_per_lun;
-    uint32_t pgs_per_blk = geom->pgs_per_blk;
-    uint32_t blk = ppa->g.blk;
-    uint32_t ch = ppa->g.ch;
-    uint32_t lun = ppa->g.lun;
-    uint32_t pl = ppa->g.pl;
-    uint32_t pg = ppa->g.pg;
-
-    uint32_t eswd_id = (uint32_t)eswd_id_ret;
-
-    /* Extract block_slot using mapping table */
-    uint32_t starting_block = layout->eswd_to_starting_block[eswd_id];
-    uint32_t block_slot = blk - starting_block;
-
-    /* Validate block is within this eSWD */
-    if (block_slot >= layout->blks_per_pl) {
+    eswd_id = (uint32_t)eswd_id_ret;
+    if (!layout->members) {
         return -1;
     }
+    for (slot = 0; slot < layout->blks_per_eswd; slot++) {
+        const PseudoPba *member =
+            &layout->members[eswd_id * layout->blks_per_eswd + slot];
 
-    /* Inverse of page_to_ppa: page_index = rem*(tt_luns*pls_per_lun) + (ch,lun,pl)_ordinal, rem = block_slot*pgs_per_blk+pg */
-    uint32_t rem = block_slot * pgs_per_blk + pg;
-    uint32_t ord;
+        if (member->g.ch == ppa->g.ch && member->g.lun == ppa->g.lun &&
+            member->g.pl == ppa->g.pl && member->g.blk == ppa->g.blk) {
+            break;
+        }
+    }
+    if (slot == layout->blks_per_eswd || ppa->g.pg >= geom->pgs_per_blk) {
+        return -1;
+    }
+    *out_eswd_id = eswd_id;
+    block_slot = slot / layout->tt_pl;
+    lane = slot % layout->tt_pl;
     switch (layout->striping_level) {
     case ESWD_STRIPE_CHANNEL:
-        /* Inverse: page_index has ch fastest, then pl, then lun */
-        ord = ch + pl * nchs + lun * (nchs * pls_per_lun);
-        break;
     case ESWD_STRIPE_LUN:
-        /* Inverse: page_index has lun fastest, then pl, then ch */
-        ord = lun + pl * luns_per_ch + ch * (luns_per_ch * pls_per_lun);
+        *out_page_index =
+            (block_slot * geom->pgs_per_blk + ppa->g.pg) * layout->tt_pl + lane;
         break;
-    case ESWD_STRIPE_PLANE: {
-        uint32_t tt_pl = tt_luns * pls_per_lun;
-        ord = block_slot * tt_pl + pl * tt_luns + ch + lun * nchs;
-        *out_page_index = ord * pgs_per_blk + pg;
-        goto check;
-    }
+    case ESWD_STRIPE_PLANE:
+        *out_page_index = (block_slot * layout->tt_pl + lane) *
+                          geom->pgs_per_blk + ppa->g.pg;
+        break;
     case ESWD_STRIPE_BLOCK:
     default:
         return -1;
     }
-    *out_page_index = rem * (tt_luns * pls_per_lun) + ord;
-check:
     if (*out_page_index >= layout->pgs_per_eswd) {
         return -1;
     }
@@ -1478,72 +1768,32 @@ static int native_layout_block_to_ppa(const struct eswd_layout *layout,
                       uint32_t block_index,
                       PseudoPpa *ppa)
 {
+    const PseudoPba *member;
+
     if (!layout || !geom || !ppa || eswd_id >= layout->tt_eswds || block_index >= layout->blks_per_eswd) {
         return -1;
     }
-
-    uint32_t tt_luns = geom->nchs * geom->luns_per_ch;
-    uint32_t nchs = geom->nchs;
-    uint32_t luns_per_ch = geom->luns_per_ch;
-    uint32_t pls_per_lun = geom->pls_per_lun;
-
-    /* With page-level striping, block_index maps to a (ch, lun, pl) tuple.
-     * Each "eSWD block" represents all pages on one (ch, lun, pl) within this eSWD. */
-    uint32_t ch, lun, pl, blk;
-
-    switch (layout->striping_level) {
-    case ESWD_STRIPE_CHANNEL:
-        /* block_index maps: ch, then pl, then lun */
-        ch = block_index % nchs;
-        pl = (block_index / nchs) % pls_per_lun;
-        lun = block_index / (nchs * pls_per_lun);
-        break;
-    case ESWD_STRIPE_LUN:
-        /* block_index maps: lun, then pl, then ch */
-        lun = block_index % luns_per_ch;
-        pl = (block_index / luns_per_ch) % pls_per_lun;
-        ch = block_index / (luns_per_ch * pls_per_lun);
-        break;
-    case ESWD_STRIPE_PLANE:
-        if (pls_per_lun == 0) {
-            return -1;
-        }
-        /* block_index maps: pl, then ch, then lun */
-        pl = block_index / tt_luns;
-        {
-            uint32_t rem = block_index % tt_luns;
-            ch = rem % nchs;
-            lun = rem / nchs;
-        }
-        break;
-    case ESWD_STRIPE_BLOCK:
-    default:
+    (void)geom;
+    if (!layout->members) {
         return -1;
     }
-
-    /* Look up starting block from mapping table */
-    uint32_t starting_block = layout->eswd_to_starting_block[eswd_id];
-    uint32_t tt_pl = layout->tt_pl;
-
-    /* Each block_index maps to a (ch, lun, pl) tuple.
-     * Multiple tuples may share the same physical block when blks_per_eswd > tt_pl. */
-    uint32_t block_offset_within_eswd = block_index / tt_pl;
-    blk = starting_block + block_offset_within_eswd;
-
+    member = &layout->members[eswd_id * layout->blks_per_eswd + block_index];
     memset(ppa, 0, sizeof(PseudoPpa));
-    ppa->g.ch = ch;
-    ppa->g.lun = lun;
-    ppa->g.pl = pl;
-    ppa->g.blk = blk;
+    ppa->g.ch = member->g.ch;
+    ppa->g.lun = member->g.lun;
+    ppa->g.pl = member->g.pl;
+    ppa->g.blk = member->g.blk;
     ppa->g.pg = 0;  /* First page of the block */
     return 0;
 }
 
 void flash_subsystem_eswd_layout_cleanup(struct eswd_layout *layout)
 {
-    if (layout && layout->eswd_to_starting_block) {
-        g_free(layout->eswd_to_starting_block);
-        layout->eswd_to_starting_block = NULL;
+    if (layout) {
+        g_free(layout->members);
+        g_free(layout->pseudo_block_owner);
+        layout->members = NULL;
+        layout->pseudo_block_owner = NULL;
     }
 }
 
@@ -1617,13 +1867,15 @@ static uint64_t native_write_pages_raw(struct ssd *ssd, const uint8_t *buffer,
                                     FtlInternalOobFill fill_oob,
                                     void *oob_ctx,
                                     uint64_t start_lpn,
-                                    int64_t stime_ns)
+                                    int64_t stime_ns,
+                                    uint32_t *committed_out)
 {
     struct BbmEvent event = {0};
     uint64_t page_size = eswd_page_size_bytes(ssd);
     uint8_t *oob_pages = NULL;
     size_t oob_offset = 0;
     size_t oob_len = 0;
+    uint32_t committed = 0;
     if (!ssd || !buffer || !ppas || page_count == 0) {
         return 0;
     }
@@ -1644,11 +1896,24 @@ static uint64_t native_write_pages_raw(struct ssd *ssd, const uint8_t *buffer,
     event.type = BBM_EVENT_POLICY_IO;
     event.count = page_count;
     event.stime = stime_ns;
+    event.status_list = g_try_new0(int, page_count);
+    if (!event.status_list) {
+        g_free(oob_pages);
+        return 0;
+    }
     bbm_write(ssd->raw_flash, ssd->bbm, (uint8_t *)buffer, ppas, page_count,
                   page_size, oob_pages, oob_offset, oob_len, &event);
     g_free(oob_pages);
     for (uint32_t i = 0; i < page_count; i++) {
+        if (event.status_list[i] != 0) {
+            break;
+        }
         native_mark_page_valid(ssd, &ppas[i]);
+        committed++;
+    }
+    g_free(event.status_list);
+    if (committed_out) {
+        *committed_out = committed;
     }
     return (uint64_t)event.lat;
 }
@@ -1667,6 +1932,7 @@ static uint64_t native_write_direct_pages(struct ssd *ssd, uint32_t eswd_id,
     struct eswd *e;
     PseudoPpa *ppas;
     uint32_t pages_until_end;
+    uint32_t committed = 0;
     uint64_t lat;
     if (!ssd || eswd_id >= ssd->tt_eswds || !buffer || !page_count) {
         return 0;
@@ -1696,8 +1962,9 @@ static uint64_t native_write_direct_pages(struct ssd *ssd, uint32_t eswd_id,
     }
 
     lat = native_write_pages_raw(ssd, buffer, ppas, page_count, oob_handle,
-                              fill_oob, oob_ctx, start_lpn, stime_ns);
-    for (uint32_t i = 0; i < page_count; i++) {
+                              fill_oob, oob_ctx, start_lpn, stime_ns,
+                              &committed);
+    for (uint32_t i = 0; i < committed; i++) {
         uint64_t lpn = start_lpn + i;
 
         if (ppa_out) {
@@ -1709,7 +1976,7 @@ static uint64_t native_write_direct_pages(struct ssd *ssd, uint32_t eswd_id,
         native_eswd_increment_wp(ssd, eswd_id);
     }
     g_free(ppas);
-    return lat;
+    return committed == page_count ? lat : 0;
 }
 
 struct native_fixed_oob_context {
@@ -1772,9 +2039,8 @@ static int native_read_physical_page(struct ssd *ssd, const PseudoPpa *ppa,
         !native_ppa_valid(ssd, (PseudoPpa *)ppa)) {
         return -1;
     }
-    *latency_out = native_read_page_buffer(ssd, ppa, page_data, oob_handle, oob_data,
-                                    stime_ns);
-    return 0;
+    return native_read_page_buffer(ssd, ppa, page_data, oob_handle, oob_data,
+                                   stime_ns, latency_out);
 }
 
 /* Copy between native NVMe scatter-gather buffers and contiguous memory. */
@@ -2031,7 +2297,7 @@ static int native_command_data_transfer(struct NvmeCommandEvent *event,
     }
 
 cleanup:
-    OPENSSL_cleanse(temporary, total);
+    pe_crypto_secure_zero(temporary, total);
     g_free(temporary);
     return rc;
 }
@@ -2165,6 +2431,7 @@ static void ssd_init_eswds(struct ssd *ssd)
     ssd->eswds = g_malloc0(sizeof(struct eswd) * tt);
     for (uint32_t i = 0; i < tt; i++) {
         ssd->eswds[i].id = i;
+        ssd->eswds[i].active = true;
         ssd->eswds[i].ipc = 0;
         ssd->eswds[i].vpc = 0;
         ssd->eswds[i].wp_page_index = 0;
@@ -2206,7 +2473,7 @@ static struct eswd *native_find_eswd(struct ssd *ssd, PseudoPpa *ppa)
     if (native_layout_ppa_to_page(&ssd->eswd_layout, ssd->bbm->geom, ppa, &eswd_id, &page_index) != 0) {
         return NULL;
     }
-    if (eswd_id >= ssd->tt_eswds) {
+    if (eswd_id >= ssd->tt_eswds || !ssd->eswds[eswd_id].active) {
         return NULL;
     }
     return &ssd->eswds[eswd_id];
@@ -2252,7 +2519,7 @@ static void native_mark_page_valid(struct ssd *ssd, PseudoPpa *ppa)
 
 static struct eswd *native_find_eswd_by_id(struct ssd *ssd, uint32_t eswd_id)
 {
-    if (eswd_id >= ssd->tt_eswds) {
+    if (eswd_id >= ssd->tt_eswds || !ssd->eswds[eswd_id].active) {
         return NULL;
     }
     return &ssd->eswds[eswd_id];
@@ -2288,10 +2555,10 @@ static uint64_t native_eswd_wp_lba(struct ssd *ssd, uint32_t eswd_id)
 }
 
 
-static uint64_t native_read_page_buffer(struct ssd *ssd, const PseudoPpa *ppa,
-                          uint8_t *buffer,
-                          int oob_handle, void *oob_buf,
-                          int64_t stime_ns)
+static int native_read_page_buffer(struct ssd *ssd, const PseudoPpa *ppa,
+                                   uint8_t *buffer, int oob_handle,
+                                   void *oob_buf, int64_t stime_ns,
+                                   uint64_t *latency_out)
 {
     struct BbmEvent event = {0};
     uint64_t page_size;
@@ -2299,12 +2566,12 @@ static uint64_t native_read_page_buffer(struct ssd *ssd, const PseudoPpa *ppa,
     size_t oob_offset = 0;
     size_t oob_len = 0;
 
-    if (!ssd || !ppa || !buffer) {
-        return 0;
+    if (!ssd || !ppa || !buffer || !latency_out) {
+        return -1;
     }
     local = *ppa;
     if (!native_ppa_valid(ssd, &local)) {
-        return 0;
+        return -1;
     }
 
     page_size = eswd_page_size_bytes(ssd);
@@ -2312,6 +2579,7 @@ static uint64_t native_read_page_buffer(struct ssd *ssd, const PseudoPpa *ppa,
     event.type = BBM_EVENT_POLICY_IO;
     event.count = 1;
     event.stime = stime_ns;
+    event.status_list = g_new0(int, 1);
     if (!oob_buf || !native_get_oob_range(ssd, oob_handle, &oob_offset, &oob_len)) {
         oob_buf = NULL;
         oob_offset = 0;
@@ -2319,7 +2587,13 @@ static uint64_t native_read_page_buffer(struct ssd *ssd, const PseudoPpa *ppa,
     }
     bbm_read(ssd->raw_flash, ssd->bbm, buffer, &local, 1, page_size,
                  oob_buf, oob_offset, oob_len, &event);
-    return (uint64_t)event.lat;
+    *latency_out = (uint64_t)event.lat;
+    if (event.status_list[0] != 0) {
+        g_free(event.status_list);
+        return -1;
+    }
+    g_free(event.status_list);
+    return 0;
 }
 
 /* eSWD layout query wrappers */
@@ -2372,7 +2646,6 @@ static uint64_t native_eswd_erase_physical(struct ssd *ssd, uint32_t eswd_id, in
         if (native_eswd_block_to_ppa(ssd, eswd_id, blk, &ppa) != 0) {
             continue;
         }
-        native_mark_block_free(ssd, &ppa);
         pba.g.ch = ppa.g.ch;
         pba.g.lun = ppa.g.lun;
         pba.g.pl = ppa.g.pl;
@@ -2438,14 +2711,22 @@ static int native_migrate_page(struct ssd *ssd, const PseudoPpa *source,
     read_event.cmd = BBM_EVENT_READ;
     read_event.type = BBM_EVENT_POLICY_IO;
     read_event.count = 1;
+    read_event.status_list = g_new0(int, 1);
     bbm_read(ssd->raw_flash, ssd->bbm, page_buffer, &source_copy, 1,
                  page_size, oob_buffer, 0, oob_size, &read_event);
+    if (read_event.status_list[0] != 0) {
+        goto out;
+    }
 
     write_event.cmd = BBM_EVENT_WRITE;
     write_event.type = BBM_EVENT_POLICY_IO;
     write_event.count = 1;
+    write_event.status_list = g_new0(int, 1);
     bbm_write(ssd->raw_flash, ssd->bbm, page_buffer, destination_out, 1,
                   page_size, oob_buffer, 0, oob_size, &write_event);
+    if (write_event.status_list[0] != 0) {
+        goto out;
+    }
 
     bbm_mark_page_invalid(ssd->raw_flash, ssd->bbm, &source_copy);
     bbm_mark_page_valid(ssd->raw_flash, ssd->bbm, destination_out);
@@ -2456,6 +2737,9 @@ static int native_migrate_page(struct ssd *ssd, const PseudoPpa *source,
     *latency_out = MAX((uint64_t)read_event.lat,
                        (uint64_t)write_event.lat);
     rc = 0;
+out:
+    g_free(read_event.status_list);
+    g_free(write_event.status_list);
     return rc;
 }
 
@@ -2594,15 +2878,9 @@ static bool native_ppa_valid(struct ssd *ssd, PseudoPpa *ppa)
     int sec = ppa->g.sec;
 
     if (ch >= 0 && ch < (int)geom->nchs && lun >= 0 && lun < (int)geom->luns_per_ch &&
-        pl >= 0 && pl < (int)geom->pls_per_lun && blk >= 0 && blk < (int)geom->blks_per_lun_log &&
+        pl >= 0 && pl < (int)geom->pls_per_lun && blk >= 0 && blk < (int)geom->blks_per_pl_log &&
         pg >= 0 && pg < (int)geom->pgs_per_blk && sec >= 0 && sec < (int)geom->secs_per_pg)
         return true;
 
     return false;
-}
-
-/* Reset BBM validity for a block after the eSWD has been cleaned. */
-static void native_mark_block_free(struct ssd *ssd, PseudoPpa *ppa)
-{
-    bbm_mark_block_free(ssd->raw_flash, ssd->bbm, ppa);
 }

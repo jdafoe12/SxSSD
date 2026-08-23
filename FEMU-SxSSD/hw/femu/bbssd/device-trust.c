@@ -1,6 +1,8 @@
-#include "device-trust.h"
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 
-#include <openssl/evp.h>
+#include "device-trust.h"
+#include "policy-crypto.h"
+
 #include <string.h>
 
 /* Simulated firmware-owned device identity key. */
@@ -15,40 +17,10 @@ static int sign_with_private_key(
     const uint8_t private_key[32], const uint8_t *data, size_t data_len,
     uint8_t signature[SXS_DEVICE_SIGNATURE_SIZE])
 {
-    static const uint8_t empty_message = 0;
-    EVP_PKEY *pkey = NULL;
-    EVP_MD_CTX *md_ctx = NULL;
-    size_t signature_len = SXS_DEVICE_SIGNATURE_SIZE;
-    int rc = -1;
-
     if (!signature || (!data && data_len != 0)) {
         return -1;
     }
-
-    pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL,
-                                        private_key, 32);
-    if (!pkey) {
-        goto cleanup;
-    }
-
-    md_ctx = EVP_MD_CTX_new();
-    if (!md_ctx ||
-        EVP_DigestSignInit(md_ctx, NULL, NULL, NULL, pkey) != 1 ||
-        EVP_DigestSign(md_ctx, signature, &signature_len,
-                       data ? data : &empty_message, data_len) != 1 ||
-        signature_len != SXS_DEVICE_SIGNATURE_SIZE) {
-        goto cleanup;
-    }
-
-    rc = 0;
-
-cleanup:
-    if (rc != 0) {
-        memset(signature, 0, SXS_DEVICE_SIGNATURE_SIZE);
-    }
-    EVP_MD_CTX_free(md_ctx);
-    EVP_PKEY_free(pkey);
-    return rc;
+    return pe_crypto_ed25519_sign(private_key, data, data_len, signature);
 }
 
 int device_trust_sign_policy_key_bootstrap(

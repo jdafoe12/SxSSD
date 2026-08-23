@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 set -eu
 
 output=${1:?usage: build-meta-interface-wasm.sh OUTPUT INPUT ALLOWLIST}
@@ -7,7 +8,7 @@ allowlist=${3:?usage: build-meta-interface-wasm.sh OUTPUT INPUT ALLOWLIST}
 script_dir=$(dirname "$0")
 
 "$script_dir/generate-policy-import-allowlists.sh" --check \
-    "$script_dir/policy-imports.def" \
+    "$script_dir/include/policy-imports.def" \
     "$script_dir/wasm-imports.allow" \
     "$script_dir/privileged-wasm-imports.allow"
 

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #ifndef SXS_META_INTERFACE_PROTOCOL_H
 #define SXS_META_INTERFACE_PROTOCOL_H
 

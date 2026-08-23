@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 set -eu
 
 mode=${1:?usage: generate-policy-import-allowlists.sh --write|--check CATALOG COMMON PRIVILEGED}

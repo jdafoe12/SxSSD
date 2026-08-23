@@ -1,3 +1,10 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/*
+ * Derived in part from the FEMU BBSSD FTL through the former
+ * hw/femu/backend/ftl-backend.c implementation.
+ * SxSSD modifications by Josh Dafoe: 2025-12-04 through 2026-08-23.
+ */
+
 #include "raw-flash.h"
 #include <assert.h>
 #include <inttypes.h>
@@ -73,13 +80,13 @@ int raw_flash_init(struct RawFlash *fb, SsdDramBackend *mbe, const BbCtrlParams 
     spp->gc_thres_lines = (int)((1.0 - spp->gc_thres_pcent) * spp->tt_lines);
     spp->gc_thres_lines_high = (int)((1.0 - spp->gc_thres_pcent_high) * spp->tt_lines);
 
-    fb->pswd_state = g_malloc0(sizeof(struct pswd_block_ctx) * spp->tt_blks);
+    fb->physical_state = g_malloc0(sizeof(struct raw_block_ctx) * spp->tt_blks);
     for (uint64_t i = 0; i < (uint64_t)spp->tt_blks; ++i) {
-        fb->pswd_state[i].state = PSWD_FREE;
-        fb->pswd_state[i].wp = 0;
-        fb->pswd_state[i].erase_cnt = 0;
-        fb->pswd_state[i].vpc = 0;
-        fb->pswd_state[i].ipc = 0;
+        fb->physical_state[i].state = PSWD_FREE;
+        fb->physical_state[i].wp = 0;
+        fb->physical_state[i].erase_cnt = 0;
+        fb->physical_state[i].vpc = 0;
+        fb->physical_state[i].ipc = 0;
     }
 
     fb->page_validity = g_malloc0((size_t)(spp->tt_blks * spp->pgs_per_blk));
@@ -94,9 +101,6 @@ int raw_flash_init(struct RawFlash *fb, SsdDramBackend *mbe, const BbCtrlParams 
     fb->migration_page_buf = g_malloc0(fb->migration_page_buf_size);
     fb->migration_oob_buf_size = fb->oob_size_per_page;
     fb->migration_oob_buf = g_malloc0(fb->migration_oob_buf_size);
-
-    fb->pswd_transition_notify = NULL;
-    fb->pswd_transition_notify_ctx = NULL;
 
     /* initialize timing metadata (per-LUN/channel availability & GC end times) */
     fb->bt.lun_next_avail = g_malloc0(sizeof(uint64_t) * spp->tt_luns);
@@ -223,48 +227,17 @@ static uint64_t ppa2blkidx(const struct ssdparams *spp, const struct ppa *ppa)
     return blkidx;
 }
 
-static void blkidx2pba(const struct ssdparams *spp, uint64_t blkidx, struct pba *pba)
+/* Advance raw NAND programming state.  BBM publishes logical pSWD events. */
+static void raw_block_do_transition(struct RawFlash *fb, uint64_t blkidx,
+                                    enum pswd_block_state new_state)
 {
-    assert(spp);
-    assert(pba);
-    assert(blkidx < (uint64_t)spp->tt_blks);
-
-    uint64_t rem = blkidx;
-    pba->g.ch = (uint32_t)(rem / (uint64_t)spp->blks_per_ch);
-    rem %= (uint64_t)spp->blks_per_ch;
-    pba->g.lun = (uint32_t)(rem / (uint64_t)spp->blks_per_lun);
-    rem %= (uint64_t)spp->blks_per_lun;
-    pba->g.pl = (uint32_t)(rem / (uint64_t)spp->blks_per_pl);
-    rem %= (uint64_t)spp->blks_per_pl;
-    pba->g.blk = (uint32_t)rem;
-}
-
-/*
- * Perform a pSWD state transition, fill event, and notify upper layer.
- * Call sites: pswd_validate_write (FREE->OPEN, OPEN->CLOSED), raw_erase (->FREE).
- */
-static void pswd_do_transition(struct RawFlash *fb, uint64_t blkidx, enum pswd_block_state new_state)
-{
-    const struct ssdparams *spp = &fb->sp;
-    struct pswd_block_ctx *ctx = &fb->pswd_state[blkidx];
-    enum pswd_block_state old_state = ctx->state;
+    struct raw_block_ctx *ctx = &fb->physical_state[blkidx];
 
     ctx->state = new_state;
     if (new_state == PSWD_OPEN || new_state == PSWD_FREE) {
         ctx->wp = 0;
     }
 
-    struct PswdStateTransitionEvent ev = {
-        .old_state = old_state,
-        .new_state = new_state,
-        .erase_cnt = ctx->erase_cnt,
-        .wp = ctx->wp,
-    };
-    blkidx2pba(spp, blkidx, &ev.pba);
-
-    if (fb->pswd_transition_notify) {
-        fb->pswd_transition_notify(fb, &ev, fb->pswd_transition_notify_ctx);
-    }
 }
 
 static uint64_t *build_offset_list(const struct ssdparams *spp,
@@ -289,21 +262,53 @@ static uint64_t *build_offset_list(const struct ssdparams *spp,
 
 static int get_read_status(struct RawFlash *fb, struct ppa page_addr)
 {
-    return 0; // zero is success. other number is ecc error count.
+    struct pba block = {0};
+
+    block.g.ch = page_addr.g.ch;
+    block.g.lun = page_addr.g.lun;
+    block.g.pl = page_addr.g.pl;
+    block.g.blk = page_addr.g.blk;
+    if (fb->test_fault.active &&
+        fb->test_fault.command == RAW_FLASH_EVENT_READ &&
+        fb->test_fault.block.pba == block.pba) {
+        int status = fb->test_fault.status;
+
+        if (fb->test_fault.one_shot) {
+            fb->test_fault.active = false;
+        }
+        return status;
+    }
+    return raw_flash_block_is_bad(fb, &block) ? -1 : 0;
 }
 
 static int get_write_status(struct RawFlash *fb, struct ppa page_addr)
 {
-    return 0; // zero is success. other number is failure (e.g. for bad-block / error modeling).
+    struct pba block = {0};
+
+    block.g.ch = page_addr.g.ch;
+    block.g.lun = page_addr.g.lun;
+    block.g.pl = page_addr.g.pl;
+    block.g.blk = page_addr.g.blk;
+    if (fb->test_fault.active &&
+        fb->test_fault.command == RAW_FLASH_EVENT_WRITE &&
+        fb->test_fault.block.pba == block.pba) {
+        int status = fb->test_fault.status;
+
+        if (fb->test_fault.one_shot) {
+            fb->test_fault.active = false;
+        }
+        return status;
+    }
+    return raw_flash_block_is_bad(fb, &block) ? -1 : 0;
 }
 
 /*
  * Validate PPA for sequential write and update pSWD state for this block.
  * Returns 0 on success (write allowed), non-zero on failure.
- * On success, updates ctx->wp and possibly ctx->state via pswd_do_transition.
+ * On success, updates physical program state and write pointer.
  */
-static int pswd_validate_write(struct RawFlash *fb, const struct ppa *ppa,
-                               struct pswd_block_ctx *ctx)
+static int raw_block_validate_write(struct RawFlash *fb, const struct ppa *ppa,
+                                    struct raw_block_ctx *ctx)
 {
     const struct ssdparams *spp = &fb->sp;
     const uint64_t blkidx = ppa2blkidx(spp, ppa);
@@ -312,10 +317,10 @@ static int pswd_validate_write(struct RawFlash *fb, const struct ppa *ppa,
         if (ppa->g.pg != 0) {
             return -1;
         }
-        pswd_do_transition(fb, blkidx, PSWD_OPEN);
+        raw_block_do_transition(fb, blkidx, PSWD_OPEN);
         ctx->wp = 1;
         if (ctx->wp == spp->pgs_per_blk) {
-            pswd_do_transition(fb, blkidx, PSWD_CLOSED);
+            raw_block_do_transition(fb, blkidx, PSWD_CLOSED);
         }
         return 0;
     }
@@ -325,7 +330,7 @@ static int pswd_validate_write(struct RawFlash *fb, const struct ppa *ppa,
         }
         ctx->wp++;
         if (ctx->wp == spp->pgs_per_blk) {
-            pswd_do_transition(fb, blkidx, PSWD_CLOSED);
+            raw_block_do_transition(fb, blkidx, PSWD_CLOSED);
         }
         return 0;
     }
@@ -335,7 +340,17 @@ static int pswd_validate_write(struct RawFlash *fb, const struct ppa *ppa,
 
 static int get_erase_status(struct RawFlash *fb, struct pba block_addr)
 {
-    return 0; // zero is success. other number is failure.
+    if (fb->test_fault.active &&
+        fb->test_fault.command == RAW_FLASH_EVENT_ERASE &&
+        fb->test_fault.block.pba == block_addr.pba) {
+        int status = fb->test_fault.status;
+
+        if (fb->test_fault.one_shot) {
+            fb->test_fault.active = false;
+        }
+        return status;
+    }
+    return raw_flash_block_is_bad(fb, &block_addr) ? -1 : 0;
 }
 
 static void fill_read_event(struct RawFlash *fb, struct RawFlashEvent *event, struct ppa *ppa_list, uint64_t count, int lat)
@@ -374,7 +389,9 @@ static void fill_erase_event(struct RawFlash *fb, struct RawFlashEvent *event, s
     event->count = count;
     /* Ownership: upper layer allocates/frees status_list. Backend only fills it. */
     for (uint64_t i = 0; i < count; ++i) {
-        const int st = get_erase_status(fb, pba[i]);
+        const int st = event->status_list && event->status_list[i] != 0
+                           ? event->status_list[i]
+                           : get_erase_status(fb, pba[i]);
         const uint64_t blkidx = pba2blkidx(spp, &pba[i]);
 
         if (event->status_list) {
@@ -382,8 +399,8 @@ static void fill_erase_event(struct RawFlash *fb, struct RawFlashEvent *event, s
         }
 
         /* Update persistent physical erase counters on successful erase. */
-        if (st == 0 && fb->pswd_state) {
-            fb->pswd_state[blkidx].erase_cnt++;
+        if (st == 0 && fb->physical_state) {
+            fb->physical_state[blkidx].erase_cnt++;
         }
     }
     event->lat = lat;
@@ -391,7 +408,7 @@ static void fill_erase_event(struct RawFlash *fb, struct RawFlashEvent *event, s
 
 int raw_flash_get_erase_cnt(const struct RawFlash *fb, const struct pba *pba)
 {
-    if (!fb || !pba || !fb->pswd_state) {
+    if (!fb || !pba || !fb->physical_state) {
         return -1;
     }
 
@@ -413,7 +430,7 @@ int raw_flash_get_erase_cnt(const struct RawFlash *fb, const struct pba *pba)
         return -1;
     }
 
-    return fb->pswd_state[blkidx].erase_cnt;
+    return fb->physical_state[blkidx].erase_cnt;
 }
 
 static inline uint64_t page_validity_index(const struct RawFlash *fb, uint64_t blkidx, uint64_t pg)
@@ -424,7 +441,7 @@ static inline uint64_t page_validity_index(const struct RawFlash *fb, uint64_t b
 
 void raw_flash_mark_page_valid(struct RawFlash *fb, const struct ppa *ppa)
 {
-    if (!fb || !ppa || !fb->pswd_state || !fb->page_validity) {
+    if (!fb || !ppa || !fb->physical_state || !fb->page_validity) {
         return;
     }
     const struct ssdparams *spp = &fb->sp;
@@ -445,12 +462,12 @@ void raw_flash_mark_page_valid(struct RawFlash *fb, const struct ppa *ppa)
     assert(fb->page_validity[idx] == PG_FREE);
 
     fb->page_validity[idx] = PG_VALID;
-    fb->pswd_state[blkidx].vpc++;
+    fb->physical_state[blkidx].vpc++;
 }
 
 void raw_flash_mark_page_invalid(struct RawFlash *fb, const struct ppa *ppa)
 {
-    if (!fb || !ppa || !fb->pswd_state || !fb->page_validity) {
+    if (!fb || !ppa || !fb->physical_state || !fb->page_validity) {
         return;
     }
     const struct ssdparams *spp = &fb->sp;
@@ -459,13 +476,13 @@ void raw_flash_mark_page_invalid(struct RawFlash *fb, const struct ppa *ppa)
     uint64_t idx = page_validity_index(fb, blkidx, pg);
     assert(fb->page_validity[idx] == PG_VALID);
     fb->page_validity[idx] = PG_INVALID;
-    fb->pswd_state[blkidx].vpc--;
-    fb->pswd_state[blkidx].ipc++;
+    fb->physical_state[blkidx].vpc--;
+    fb->physical_state[blkidx].ipc++;
 }
 
 void raw_flash_mark_block_free(struct RawFlash *fb, const struct pba *pba)
 {
-    if (!fb || !pba || !fb->pswd_state || !fb->page_validity) {
+    if (!fb || !pba || !fb->physical_state || !fb->page_validity) {
         return;
     }
     const struct ssdparams *spp = &fb->sp;
@@ -481,8 +498,8 @@ void raw_flash_mark_block_free(struct RawFlash *fb, const struct pba *pba)
         uint64_t idx = page_validity_index(fb, blkidx, (uint64_t)pg);
         fb->page_validity[idx] = PG_FREE;
     }
-    fb->pswd_state[blkidx].vpc = 0;
-    fb->pswd_state[blkidx].ipc = 0;
+    fb->physical_state[blkidx].vpc = 0;
+    fb->physical_state[blkidx].ipc = 0;
 }
 
 int raw_flash_get_page_status(const struct RawFlash *fb, const struct ppa *ppa)
@@ -499,7 +516,7 @@ int raw_flash_get_page_status(const struct RawFlash *fb, const struct ppa *ppa)
 
 void raw_flash_get_block_vpc_ipc(const struct RawFlash *fb, const struct pba *pba, int *vpc, int *ipc)
 {
-    if (!fb || !pba || !fb->pswd_state || !vpc || !ipc) {
+    if (!fb || !pba || !fb->physical_state || !vpc || !ipc) {
         return;
     }
     const struct ssdparams *spp = &fb->sp;
@@ -507,8 +524,8 @@ void raw_flash_get_block_vpc_ipc(const struct RawFlash *fb, const struct pba *pb
     if (blkidx >= (uint64_t)spp->tt_blks) {
         return;
     }
-    *vpc = fb->pswd_state[blkidx].vpc;
-    *ipc = fb->pswd_state[blkidx].ipc;
+    *vpc = fb->physical_state[blkidx].vpc;
+    *ipc = fb->physical_state[blkidx].ipc;
 }
 
 static int raw_flash_latency(struct RawFlash *fb, struct ppa *ppa_list,
@@ -583,12 +600,16 @@ int raw_flash_write(struct RawFlash *fb, const uint8_t *buffer,
         return 0;
     }
 
-    /* Validate each PPA for sequential write and update pSWD state; set status_list */
+    /* Validate physical sequential programming state; BBM updates logical pSWDs. */
     int *valid = g_new0(int, ppa_count);
     for (uint64_t i = 0; i < ppa_count; ++i) {
         uint64_t blkidx = ppa2blkidx(spp, &ppa_list[i]);
-        struct pswd_block_ctx *ctx = &fb->pswd_state[blkidx];
-        int st = pswd_validate_write(fb, &ppa_list[i], ctx);
+        struct raw_block_ctx *ctx = &fb->physical_state[blkidx];
+        int st = get_write_status(fb, ppa_list[i]);
+
+        if (st == 0) {
+            st = raw_block_validate_write(fb, &ppa_list[i], ctx);
+        }
         valid[i] = (st == 0);
         if (event && event->status_list) {
             event->status_list[i] = st;
@@ -642,12 +663,20 @@ int raw_flash_erase(struct RawFlash *fb, struct pba *pba_list,
 
     for (uint64_t i = 0; i < block_count; ++i) {
         uint64_t blkidx = pba2blkidx(spp, &pba_list[i]);
+        int status = get_erase_status(fb, pba_list[i]);
+
+        if (event && event->status_list) {
+            event->status_list[i] = status;
+        }
+        if (status != 0) {
+            continue;
+        }
         memset(fb->mbe->backend_memory + blkidx * bytes_per_block, 0xFF,
                bytes_per_block);
-        /* Reset validity and block counts; state transition via pswd_do_transition */
-        if (fb->pswd_state) {
-            fb->pswd_state[blkidx].vpc = 0;
-            fb->pswd_state[blkidx].ipc = 0;
+        /* Reset physical validity and NAND programming state. */
+        if (fb->physical_state) {
+            fb->physical_state[blkidx].vpc = 0;
+            fb->physical_state[blkidx].ipc = 0;
         }
         if (fb->page_validity) {
             for (int pg = 0; pg < spp->pgs_per_blk; pg++) {
@@ -655,8 +684,8 @@ int raw_flash_erase(struct RawFlash *fb, struct pba *pba_list,
                 fb->page_validity[idx] = PG_FREE;
             }
         }
-        if (fb->pswd_state) {
-            pswd_do_transition(fb, blkidx, PSWD_FREE);
+        if (fb->physical_state) {
+            raw_block_do_transition(fb, blkidx, PSWD_FREE);
         }
     }
 
@@ -883,15 +912,41 @@ int raw_flash_get_oob_policy_info(struct RawFlash *fb,
     return 0;
 }
 
-void raw_flash_set_pswd_transition_notify(struct RawFlash *fb,
-                                            RawFlashPswdTransitionNotify notify,
-                                            void *notify_ctx)
+int raw_flash_mark_block_bad(struct RawFlash *fb, const struct pba *pba)
 {
-    if (!fb) {
+    uint64_t blkidx;
+
+    if (!fb || !pba || !fb->physical_state) {
+        return -1;
+    }
+    blkidx = pba2blkidx(&fb->sp, pba);
+    fb->physical_state[blkidx].state = PSWD_BAD;
+    return 0;
+}
+
+bool raw_flash_block_is_bad(const struct RawFlash *fb, const struct pba *pba)
+{
+    if (!fb || !pba || !fb->physical_state) {
+        return true;
+    }
+    return fb->physical_state[pba2blkidx(&fb->sp, pba)].state == PSWD_BAD;
+}
+
+void raw_flash_test_inject_failure(struct RawFlash *fb,
+                                   enum RawFlashEventCommand command,
+                                   const struct pba *block, int status,
+                                   bool one_shot)
+{
+    if (!fb || !block || status == 0) {
         return;
     }
-    fb->pswd_transition_notify = notify;
-    fb->pswd_transition_notify_ctx = notify_ctx;
+    fb->test_fault = (struct RawFlashFaultInjection) {
+        .active = true,
+        .one_shot = one_shot,
+        .command = command,
+        .block = *block,
+        .status = status,
+    };
 }
 
 void* raw_flash_get_oob_for_policy(struct RawFlash *fb,

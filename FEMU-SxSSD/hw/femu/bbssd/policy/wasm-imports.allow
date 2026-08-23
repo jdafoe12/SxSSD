@@ -2,6 +2,7 @@ sxs_execution_get
 sxs_nvme_event_get
 sxs_backend_event_get
 sxs_pswd_event_get
+sxs_flash_error_event_get
 sxs_subscribe
 sxs_backend_status_get
 sxs_geometry_get
@@ -11,6 +12,9 @@ sxs_eswd_from_ppa
 sxs_ppa_validate
 sxs_ppa_to_page_index
 sxs_page_status_get
+sxs_pswd_get
+sxs_pswd_retire
+sxs_pswd_remap
 sxs_request_read
 sxs_request_write
 sxs_command_read
@@ -26,6 +30,9 @@ sxs_oob_register_stage
 sxs_eswd_wp_get
 sxs_eswd_to_ppa
 sxs_ppa_to_eswd
+sxs_eswd_member_get
+sxs_eswd_release
+sxs_eswd_rebind
 sxs_page_read
 sxs_page_append
 sxs_page_invalidate

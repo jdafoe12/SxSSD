@@ -1,3 +1,8 @@
+/*
+ * Modified for SxSSD by Josh Dafoe.
+ * SxSSD modifications: 2026-04-04 through 2026-08-23.
+ */
+
 #include "./nvme.h"
 
 #define NVME_IDENTIFY_DATA_SIZE 4096

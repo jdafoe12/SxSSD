@@ -1,36 +1,51 @@
-# SxSSD: A Secure and eXtensible Software-defined Solid State Drive
+# SxSSD
 
-This branch contains the standalone SxSSD implementation. The source tree is
-under [`FEMU-SxSSD/`](FEMU-SxSSD/), with the main SxSSD-specific code under
-`FEMU-SxSSD/hw/femu/bbssd/`.
+SxSSD is a research prototype of a secure and extensible solid state drive. It is
+built on [FEMU](https://github.com/MoatLab/FEMU) and uses WebAssembly Micro
+Runtime (WAMR) to execute device-side policies with JIT compilation.
 
-The repository's `evaluation` branch adds the comparison FEMU implementation,
-measurement instrumentation, workload drivers, and figure-generation tools
-used to collect evaluation data. Those components are intentionally excluded
-from `main`.
+## Repository layout
 
-## Build
+- `FEMU-SxSSD/` contains the FEMU/QEMU source tree used by SxSSD.
+- `FEMU-SxSSD/hw/femu/bbssd/` contains the main SxSSD implementation.
+- `FEMU-SxSSD/hw/femu/bbssd/policy/` contains the policy code.
+- `FEMU-SxSSD/hw/femu/bbssd/scripts/` contains policy-management tools and
+  tests.
+- `FEMU-SxSSD/subprojects/wamr/` is the WAMR Git submodule.
 
-The build should run on Ubuntu 20.04 LTS or newer.
+The fixed keys under the BBSSD simulation directories are intentionally public
+test fixtures. They are not secret or production credentials.
+
+See [`UPSTREAM.md`](UPSTREAM.md) for FEMU/QEMU
+lineage and third-party dependency provenance.
+
+## Getting the source
+
+Clone the repository with its submodules:
 
 ```bash
-cd FEMU-SxSSD
-mkdir -p build-femu
-cd build-femu
-cp ../femu-scripts/femu-copy-scripts.sh .
-./femu-copy-scripts.sh .
-./femu-compile.sh
+git clone --recurse-submodules <SxSSD repository URL>
+cd SxSSD
 ```
 
-See [`FEMU-SxSSD/README.md`](FEMU-SxSSD/README.md) for FEMU's detailed build,
-configuration, and usage documentation.
+For an existing clone:
 
-## SxSSD components
+```bash
+git submodule update --init --recursive
+```
 
-- `FEMU-SxSSD/hw/femu/bbssd/`: SxSSD storage and extensibility implementation
-- `FEMU-SxSSD/hw/femu/bbssd/policy/`: implemented storage policies
-- `FEMU-SxSSD/hw/femu/bbssd/scripts/`: policy and meta-interface utilities
+## Building
+
+The build and execution instructions are available in
+[`FEMU-SxSSD/README.md`](FEMU-SxSSD/README.md).
 
 ## License
 
-See [`LICENSE`](LICENSE) and the licensing files within `FEMU-SxSSD/`.
+Copyright (C) 2025-2026 Josh Dafoe.
+
+SxSSD-authored files and modifications are licensed under
+`GPL-2.0-or-later`. FEMU, QEMU, WAMR, and other third-party components retain
+their upstream licenses. See [`LICENSE`](LICENSE) and
+[`UPSTREAM.md`](UPSTREAM.md).
+
+SxSSD is distributed without any warranty; see `LICENSE` for details.

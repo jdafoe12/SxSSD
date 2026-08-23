@@ -1,31 +1,17 @@
-#include <openssl/evp.h>
-#include <openssl/pem.h>
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "../device-trust.h"
+#include "../policy-crypto.h"
+#include "host-crypto.h"
 
 static int verify(const uint8_t public_key[32], const uint8_t *data,
                   size_t data_len, const uint8_t signature[64])
 {
-    static const uint8_t empty = 0;
-    EVP_PKEY *pkey = NULL;
-    EVP_MD_CTX *ctx = NULL;
-    int rc = -1;
-
-    pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL,
-                                       public_key, 32);
-    ctx = EVP_MD_CTX_new();
-    if (pkey && ctx &&
-        EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pkey) == 1 &&
-        EVP_DigestVerify(ctx, signature, 64, data ? data : &empty,
-                         data_len) == 1) {
-        rc = 0;
-    }
-    EVP_MD_CTX_free(ctx);
-    EVP_PKEY_free(pkey);
-    return rc;
+    return pe_crypto_ed25519_verify(public_key, data, data_len, signature);
 }
 
 static int read_exact_file(const char *path, uint8_t *buffer, size_t size)
@@ -42,33 +28,64 @@ static int read_exact_file(const char *path, uint8_t *buffer, size_t size)
     return rc;
 }
 
-static int verify_with_pem_public_key(const char *path, const uint8_t *data,
-                                      size_t data_len,
-                                      const uint8_t signature[64])
+static int verify_identity_files(char **paths)
 {
-    FILE *fp = NULL;
-    EVP_PKEY *pkey = NULL;
-    EVP_MD_CTX *ctx = NULL;
+    uint8_t device_private_key[32];
+    uint8_t device_public_key[32];
+    uint8_t derived_public_key[32];
+    uint8_t manufacturer_private_key[32];
+    uint8_t manufacturer_public_key[32];
+    uint8_t certified_device_public_key[32];
+    uint8_t device_certificate_signature[64];
+    uint8_t admin_private_key[32];
+    uint8_t admin_public_key[32];
+    uint8_t certified_admin_public_key[32];
+    uint8_t admin_certificate_signature[64];
     int rc = -1;
 
-    fp = fopen(path, "rb");
-    if (!fp) {
+    if (sxs_host_read_hex(paths[0], device_private_key, 32) != 0 ||
+        sxs_host_read_hex(paths[1], device_public_key, 32) != 0 ||
+        pe_crypto_ed25519_public(device_private_key, derived_public_key) != 0 ||
+        !pe_crypto_equal(derived_public_key, device_public_key, 32) ||
+        !pe_crypto_equal(device_public_key, SXS_DEVICE_PUBLIC_KEY, 32) ||
+        read_exact_file(paths[4], certified_device_public_key, 32) != 0 ||
+        !pe_crypto_equal(device_public_key, certified_device_public_key, 32)) {
+        fprintf(stderr, "device simulation key mismatch\n");
         goto cleanup;
     }
-    pkey = PEM_read_PUBKEY(fp, NULL, NULL, NULL);
-    ctx = EVP_MD_CTX_new();
-    if (pkey && ctx &&
-        EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pkey) == 1 &&
-        EVP_DigestVerify(ctx, signature, 64, data, data_len) == 1) {
-        rc = 0;
+
+    if (sxs_host_read_hex(paths[2], manufacturer_private_key, 32) != 0 ||
+        sxs_host_read_hex(paths[3], manufacturer_public_key, 32) != 0 ||
+        pe_crypto_ed25519_public(manufacturer_private_key,
+                                  derived_public_key) != 0 ||
+        !pe_crypto_equal(derived_public_key, manufacturer_public_key, 32) ||
+        read_exact_file(paths[5], device_certificate_signature, 64) != 0 ||
+        verify(manufacturer_public_key, certified_device_public_key, 32,
+               device_certificate_signature) != 0) {
+        fprintf(stderr, "device certificate verification failed\n");
+        goto cleanup;
     }
 
-cleanup:
-    EVP_MD_CTX_free(ctx);
-    EVP_PKEY_free(pkey);
-    if (fp) {
-        fclose(fp);
+    if (sxs_host_read_hex(paths[6], admin_private_key, 32) != 0 ||
+        sxs_host_read_hex(paths[7], admin_public_key, 32) != 0 ||
+        pe_crypto_ed25519_public(admin_private_key, derived_public_key) != 0 ||
+        !pe_crypto_equal(derived_public_key, admin_public_key, 32) ||
+        read_exact_file(paths[8], certified_admin_public_key, 32) != 0 ||
+        !pe_crypto_equal(admin_public_key, certified_admin_public_key, 32) ||
+        read_exact_file(paths[9], admin_certificate_signature, 64) != 0 ||
+        verify(manufacturer_public_key, certified_admin_public_key, 32,
+               admin_certificate_signature) != 0) {
+        fprintf(stderr, "admin certificate verification failed\n");
+        goto cleanup;
     }
+    rc = 0;
+
+cleanup:
+    pe_crypto_secure_zero(device_private_key, sizeof(device_private_key));
+    pe_crypto_secure_zero(manufacturer_private_key,
+                           sizeof(manufacturer_private_key));
+    pe_crypto_secure_zero(admin_private_key, sizeof(admin_private_key));
+    pe_crypto_secure_zero(derived_public_key, sizeof(derived_public_key));
     return rc;
 }
 
@@ -80,46 +97,20 @@ int main(int argc, char **argv)
     uint8_t bootstrap_message[SXS_KEY_BOOTSTRAP_MESSAGE_SIZE];
     uint8_t attestation_like[] = { 0x01, 0x01, 0x00, 0x00 };
     uint8_t signature[64];
-    uint8_t device_public_key[32];
-    uint8_t admin_public_key[32];
-    uint8_t device_certificate_signature[64];
-    uint8_t admin_certificate_signature[64];
     size_t offset = 0;
 
-    if (argc != 1 && argc != 6) {
+    if (argc != 1 && argc != 11) {
         fprintf(stderr,
-                "Usage: %s [device-public-key.bin manufacturer-public-key.pem "
-                "device-cert-signature.bin admin-public-key.bin "
-                "admin-cert-signature.bin]\n",
+                "Usage: %s [device-private.hex device-public.hex "
+                "manufacturer-private.hex manufacturer-public.hex "
+                "certified-device-public.bin device-certificate.bin "
+                "admin-private.hex admin-public.hex "
+                "certified-admin-public.bin admin-certificate.bin]\n",
                 argv[0]);
         return 1;
     }
-    if (argc == 6) {
-        if (read_exact_file(argv[1], device_public_key,
-                            sizeof(device_public_key)) != 0 ||
-            memcmp(device_public_key, SXS_DEVICE_PUBLIC_KEY,
-                   sizeof(device_public_key)) != 0) {
-            fprintf(stderr, "device public key mismatch: %s\n", argv[1]);
-            return 1;
-        }
-        if (read_exact_file(argv[3], device_certificate_signature,
-                            sizeof(device_certificate_signature)) != 0 ||
-            verify_with_pem_public_key(argv[2], device_public_key,
-                                       sizeof(device_public_key),
-                                       device_certificate_signature) != 0) {
-            fprintf(stderr, "device certificate verification failed\n");
-            return 1;
-        }
-        if (read_exact_file(argv[4], admin_public_key,
-                            sizeof(admin_public_key)) != 0 ||
-            read_exact_file(argv[5], admin_certificate_signature,
-                            sizeof(admin_certificate_signature)) != 0 ||
-            verify_with_pem_public_key(argv[2], admin_public_key,
-                                       sizeof(admin_public_key),
-                                       admin_certificate_signature) != 0) {
-            fprintf(stderr, "admin certificate verification failed\n");
-            return 1;
-        }
+    if (argc == 11 && verify_identity_files(argv + 1) != 0) {
+        return 1;
     }
 
     memcpy(bootstrap_message + offset, SXS_KEY_BOOTSTRAP_DOMAIN,
@@ -133,8 +124,9 @@ int main(int argc, char **argv)
     memcpy(bootstrap_message + offset, policy_ephemeral_public_key,
            sizeof(policy_ephemeral_public_key));
 
-    if (device_trust_sign_policy_key_bootstrap(owner_nonce, owner_ephemeral_public_key,
-                                  policy_ephemeral_public_key, signature) != 0 ||
+    if (device_trust_sign_policy_key_bootstrap(
+            owner_nonce, owner_ephemeral_public_key,
+            policy_ephemeral_public_key, signature) != 0 ||
         verify(SXS_DEVICE_PUBLIC_KEY, bootstrap_message,
                sizeof(bootstrap_message), signature) != 0 ||
         verify(SXS_DEVICE_PUBLIC_KEY, attestation_like,
@@ -148,24 +140,27 @@ int main(int argc, char **argv)
         fprintf(stderr, "modified bootstrap transcript verified unexpectedly\n");
         return 1;
     }
-    if (device_trust_sign_attestation(attestation_like, sizeof(attestation_like),
-                                  signature) != 0 ||
+    if (device_trust_sign_attestation(attestation_like,
+                                      sizeof(attestation_like),
+                                      signature) != 0 ||
         verify(SXS_DEVICE_PUBLIC_KEY, attestation_like,
                sizeof(attestation_like), signature) != 0) {
         fprintf(stderr, "privileged device signing failed\n");
         return 1;
     }
-    if (device_trust_sign_policy_key_bootstrap(NULL, owner_ephemeral_public_key,
-                                  policy_ephemeral_public_key, signature) == 0 ||
-        device_trust_sign_policy_key_bootstrap(owner_nonce, NULL,
-                                  policy_ephemeral_public_key, signature) == 0 ||
-        device_trust_sign_policy_key_bootstrap(owner_nonce, owner_ephemeral_public_key,
-                                  NULL, signature) == 0 ||
-        device_trust_sign_policy_key_bootstrap(owner_nonce, owner_ephemeral_public_key,
-                                  policy_ephemeral_public_key, NULL) == 0 ||
+    if (device_trust_sign_policy_key_bootstrap(
+            NULL, owner_ephemeral_public_key,
+            policy_ephemeral_public_key, signature) == 0 ||
+        device_trust_sign_policy_key_bootstrap(
+            owner_nonce, NULL, policy_ephemeral_public_key, signature) == 0 ||
+        device_trust_sign_policy_key_bootstrap(
+            owner_nonce, owner_ephemeral_public_key, NULL, signature) == 0 ||
+        device_trust_sign_policy_key_bootstrap(
+            owner_nonce, owner_ephemeral_public_key,
+            policy_ephemeral_public_key, NULL) == 0 ||
         device_trust_sign_attestation(NULL, 1, signature) == 0 ||
         device_trust_sign_attestation(attestation_like,
-                                  sizeof(attestation_like), NULL) == 0) {
+                                      sizeof(attestation_like), NULL) == 0) {
         fprintf(stderr, "invalid signing arguments were accepted\n");
         return 1;
     }

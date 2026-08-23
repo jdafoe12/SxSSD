@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 # Short Figure 5-style validation of SxSSD's block and ZNS policies.
 set -euo pipefail

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #ifndef FEMU_SXSSD_POLICY_WAMR_H
 #define FEMU_SXSSD_POLICY_WAMR_H
 
@@ -6,7 +8,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define PE_WAMR_INSTRUCTION_LIMIT 10000000
 #define PE_WAMR_PAGE_BYTES 65536U
 #define PE_WAMR_MAX_LINEAR_MEMORY_PAGES 4096U
 #define PE_WAMR_EXEC_ENV_STACK_BYTES 65536U

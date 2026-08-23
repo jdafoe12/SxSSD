@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,7 +9,7 @@ NS_DEVICE="${NS_DEVICE:-/dev/nvme0n1}"
 POLICY_ID="${POLICY_ID:-103}"
 POLICY_VERSION="${POLICY_VERSION:-1}"
 SESSION_MODE="${SESSION_MODE:-confidential}"
-POLICY_PATH="${POLICY_PATH:-$POLICY_DIR/block-interface-flashguard-policy.wasm}"
+POLICY_PATH="${POLICY_PATH:-$POLICY_DIR/block-interface-policy-flashguard.wasm}"
 
 fail() {
     echo "[setup-flashguard] ERROR: $*" >&2

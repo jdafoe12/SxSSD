@@ -1,3 +1,6 @@
+# Modified for SxSSD by Josh Dafoe.
+# SxSSD modifications: 2026-07-11 through 2026-08-23.
+
 /config-devices.*
 /config-all-devices.*
 /config-all-disas.*
@@ -137,3 +140,4 @@ build/
 !/hw/femu/bbssd/README.md
 /hw/femu/bbssd/scripts/test_device_signing
 /hw/femu/bbssd/scripts/key-sharing-client
+/hw/femu/bbssd/scripts/test_sxssd_crypto

@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for SxSSD by Josh Dafoe.
+# SxSSD modifications: 2026-07-18 through 2026-08-23.
+
 # Huaicheng <huaicheng@cs.uchicago.edu>
 # Please run this script as root.
 
@@ -12,7 +15,7 @@ if [[ -f /etc/debian_version ]]; then
 	# Additional dependencies
 	apt-get install -y libnuma-dev
     # WAMR policy runtime and freestanding wasm32 policy toolchain.
-    apt-get install -y clang lld llvm cmake ninja-build libssl-dev
+    apt-get install -y clang lld llvm cmake ninja-build nettle-dev
 else
     echo "pkgdep: unsupported system type ($SYSTEM), please install QEMU depencies manually"
 	exit 1

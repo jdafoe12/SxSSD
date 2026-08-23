@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #ifndef FEMU_SXSSD_POLICY_ENGINE_H
 #define FEMU_SXSSD_POLICY_ENGINE_H
 
@@ -10,6 +12,7 @@
 #define MAX_PSWD_TRANSITION_HOOKS 64
 #define MAX_BACKGROUND_HOOKS 64
 #define MAX_ADMIN_HOOKS 256
+#define MAX_FLASH_ERROR_HOOKS 128
 
 #define PE_MAX_STAGED_OOB 16U
 #define PE_MAX_NAMESPACE_BLOB_BYTES (64U * 1024U)
@@ -30,7 +33,8 @@ enum pe_policy_origin {
     (MAX_STORED_RUNTIME_POLICIES + MAX_FIRMWARE_RUNTIME_POLICIES)
 #define MAX_POLICY_SUBSCRIPTIONS                                        \
     (MAX_NVME_HOOKS + MAX_ADMIN_HOOKS + MAX_BACKEND_EVENT_HOOKS +      \
-     MAX_PSWD_TRANSITION_HOOKS + MAX_BACKGROUND_HOOKS)
+     MAX_PSWD_TRANSITION_HOOKS + MAX_BACKGROUND_HOOKS +                \
+     MAX_FLASH_ERROR_HOOKS)
 #define MAX_POLICY_OWNED_OOB 16
 
 struct pe_wamr_vm;
@@ -134,11 +138,13 @@ struct pe_policy_execution {
         struct sxs_nvme_event nvme;
         struct sxs_backend_event backend;
         struct sxs_pswd_event pswd;
+        struct sxs_flash_error_event flash_error;
     } event_snapshot;
     union {
         struct NvmeCommandEvent *nvme;
         const struct BbmEvent *backend;
         const struct PswdStateTransitionEvent *pswd;
+        const struct BbmErrorEvent *flash_error;
     } native_event;
     struct pe_activation_transaction *activation;
 };
@@ -167,9 +173,9 @@ uint64_t pe_dispatch_nvme_cmd(struct policy_engine *pe, struct ssd *ssd,
 uint64_t pe_dispatch_admin_cmd(struct policy_engine *pe, struct ssd *ssd,
                                struct NvmeCommandEvent *event);
 void pe_dispatch_flash_event(const struct BbmEvent *event, void *context);
-void pe_dispatch_pswd_transition(struct RawFlash *fb,
-                                 const struct PswdStateTransitionEvent *event,
+void pe_dispatch_pswd_transition(const struct PswdStateTransitionEvent *event,
                                  void *notify_ctx);
+void pe_dispatch_flash_error(const struct BbmErrorEvent *event, void *context);
 void pe_dispatch_background_event(struct policy_engine *pe, struct ssd *ssd);
 
 bool pe_has_nvme_hook(struct policy_engine *pe, uint8_t opcode);

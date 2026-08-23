@@ -1,10 +1,8 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/nvme_ioctl.h>
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
-#include <openssl/kdf.h>
-#include <openssl/rand.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -16,6 +14,8 @@
 
 #include "../device-trust.h"
 #include "../meta-interface-protocol.h"
+#include "../policy-crypto.h"
+#include "host-crypto.h"
 
 #define NVME_CMD_INIT_SESSION_SUBMIT  0x93
 #define NVME_CMD_INIT_SESSION_FETCH   0x94
@@ -260,161 +260,34 @@ static void build_ssd_response_message(const uint8_t *admin_ephem_pub,
 static int sign_with_admin_private_key(const uint8_t *message, size_t message_len,
                                        uint8_t *sig_out)
 {
-    EVP_PKEY *pkey = NULL;
-    EVP_MD_CTX *md_ctx = NULL;
-    size_t sig_len = 64;
-    int rc = -1;
-
-    pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, ADMIN_PRIVATE_KEY, 32);
-    if (!pkey) {
-        goto cleanup;
-    }
-
-    md_ctx = EVP_MD_CTX_new();
-    if (!md_ctx) {
-        goto cleanup;
-    }
-
-    if (EVP_DigestSignInit(md_ctx, NULL, NULL, NULL, pkey) != 1) {
-        goto cleanup;
-    }
-    if (EVP_DigestSign(md_ctx, sig_out, &sig_len, message, message_len) != 1 ||
-        sig_len != 64) {
-        goto cleanup;
-    }
-
-    rc = 0;
-
-cleanup:
-    if (md_ctx) {
-        EVP_MD_CTX_free(md_ctx);
-    }
-    if (pkey) {
-        EVP_PKEY_free(pkey);
-    }
-    return rc;
+    return pe_crypto_ed25519_sign(ADMIN_PRIVATE_KEY, message, message_len,
+                                   sig_out);
 }
 
 static int generate_ephemeral_keypair(uint8_t *public_key_out, uint8_t *private_key_out)
 {
-    EVP_PKEY_CTX *pctx = NULL;
-    EVP_PKEY *pkey = NULL;
-    size_t len;
-    int rc = -1;
-
-    pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
-    if (!pctx) {
-        goto cleanup;
+    if (sxs_host_random(private_key_out, 32) != 0 ||
+        pe_crypto_x25519_public(private_key_out, public_key_out) != 0) {
+        pe_crypto_secure_zero(public_key_out, 32);
+        pe_crypto_secure_zero(private_key_out, 32);
+        return -1;
     }
-    if (EVP_PKEY_keygen_init(pctx) != 1) {
-        goto cleanup;
-    }
-    if (EVP_PKEY_keygen(pctx, &pkey) != 1) {
-        goto cleanup;
-    }
-
-    len = 32;
-    if (EVP_PKEY_get_raw_private_key(pkey, private_key_out, &len) != 1 || len != 32) {
-        goto cleanup;
-    }
-    len = 32;
-    if (EVP_PKEY_get_raw_public_key(pkey, public_key_out, &len) != 1 || len != 32) {
-        goto cleanup;
-    }
-
-    rc = 0;
-
-cleanup:
-    if (rc != 0) {
-        memset(public_key_out, 0, 32);
-        memset(private_key_out, 0, 32);
-    }
-    if (pkey) {
-        EVP_PKEY_free(pkey);
-    }
-    if (pctx) {
-        EVP_PKEY_CTX_free(pctx);
-    }
-    return rc;
+    return 0;
 }
 
 static int verify_ssd_signature(const uint8_t *message, size_t message_len,
                                 const uint8_t *sig)
 {
-    EVP_PKEY *pkey = NULL;
-    EVP_MD_CTX *md_ctx = NULL;
-    int rc = -1;
-
-    pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL,
-                                       SXS_DEVICE_PUBLIC_KEY,
-                                       sizeof(SXS_DEVICE_PUBLIC_KEY));
-    if (!pkey) {
-        goto cleanup;
-    }
-
-    md_ctx = EVP_MD_CTX_new();
-    if (!md_ctx) {
-        goto cleanup;
-    }
-
-    if (EVP_DigestVerifyInit(md_ctx, NULL, NULL, NULL, pkey) != 1) {
-        goto cleanup;
-    }
-    if (EVP_DigestVerify(md_ctx, sig, 64, message, message_len) != 1) {
-        goto cleanup;
-    }
-
-    rc = 0;
-
-cleanup:
-    if (md_ctx) {
-        EVP_MD_CTX_free(md_ctx);
-    }
-    if (pkey) {
-        EVP_PKEY_free(pkey);
-    }
-    return rc;
+    return pe_crypto_ed25519_verify(SXS_DEVICE_PUBLIC_KEY, message,
+                                     message_len, sig);
 }
 
 static int derive_labeled_key(const uint8_t base_key[32], const char *label,
                               uint8_t derived_key[32])
 {
-    EVP_PKEY_CTX *pctx = NULL;
-    size_t derived_len = 32;
-    int rc = -1;
-
-    pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
-    if (!pctx) {
-        goto cleanup;
-    }
-    if (EVP_PKEY_derive_init(pctx) != 1) {
-        goto cleanup;
-    }
-    if (EVP_PKEY_CTX_set_hkdf_md(pctx, EVP_sha256()) != 1) {
-        goto cleanup;
-    }
-    if (EVP_PKEY_CTX_set1_hkdf_key(pctx, base_key, 32) != 1) {
-        goto cleanup;
-    }
-    if (EVP_PKEY_CTX_add1_hkdf_info(pctx, (const unsigned char *)label,
-                                    (int)strlen(label)) != 1) {
-        goto cleanup;
-    }
-    if (EVP_PKEY_derive(pctx, derived_key, &derived_len) != 1 ||
-        derived_len != 32) {
-        goto cleanup;
-    }
-
-    rc = 0;
-
-cleanup:
-    if (rc != 0) {
-        memset(derived_key, 0, 32);
-    }
-    if (pctx) {
-        EVP_PKEY_CTX_free(pctx);
-    }
-    return rc;
+    return pe_crypto_hkdf_sha256(base_key, 32, NULL, 0,
+                                  (const uint8_t *)label, strlen(label),
+                                  derived_key, 32);
 }
 
 static int derive_session_key(const uint8_t *admin_ephem_priv,
@@ -424,44 +297,13 @@ static int derive_session_key(const uint8_t *admin_ephem_priv,
                               uint64_t counter,
                               uint8_t *session_key_out)
 {
-    EVP_PKEY *admin_priv_pkey = NULL;
-    EVP_PKEY *ssd_pub_pkey = NULL;
-    EVP_PKEY_CTX *ctx = NULL;
-    EVP_PKEY_CTX *kctx = NULL;
     uint8_t shared_secret[32];
-    size_t secret_len = 32;
-    size_t session_key_len = 32;
     uint8_t kdf_info[1 + 32 + 32 + 1 + 8];
     uint8_t counter_le[8];
     int rc = -1;
 
-    admin_priv_pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, admin_ephem_priv, 32);
-    if (!admin_priv_pkey) {
-        goto cleanup;
-    }
-    ssd_pub_pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, ssd_ephem_pub, 32);
-    if (!ssd_pub_pkey) {
-        goto cleanup;
-    }
-    ctx = EVP_PKEY_CTX_new(admin_priv_pkey, NULL);
-    if (!ctx) {
-        goto cleanup;
-    }
-    if (EVP_PKEY_derive_init(ctx) != 1) {
-        goto cleanup;
-    }
-    if (EVP_PKEY_derive_set_peer(ctx, ssd_pub_pkey) != 1) {
-        goto cleanup;
-    }
-    if (EVP_PKEY_derive(ctx, shared_secret, &secret_len) != 1 || secret_len != 32) {
-        goto cleanup;
-    }
-
-    kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
-    if (!kctx) {
-        goto cleanup;
-    }
-    if (EVP_PKEY_derive_init(kctx) != 1) {
+    if (pe_crypto_x25519_shared(admin_ephem_priv, ssd_ephem_pub,
+                                 shared_secret) != 0) {
         goto cleanup;
     }
 
@@ -472,40 +314,20 @@ static int derive_session_key(const uint8_t *admin_ephem_priv,
     encode_u64_le(counter, counter_le);
     memcpy(kdf_info + 66, counter_le, sizeof(counter_le));
 
-    if (EVP_PKEY_CTX_set_hkdf_md(kctx, EVP_sha256()) != 1) {
-        goto cleanup;
-    }
-    if (EVP_PKEY_CTX_set1_hkdf_key(kctx, shared_secret, 32) != 1) {
-        goto cleanup;
-    }
-    if (EVP_PKEY_CTX_add1_hkdf_info(kctx, kdf_info, sizeof(kdf_info)) != 1) {
-        goto cleanup;
-    }
-    if (EVP_PKEY_derive(kctx, session_key_out, &session_key_len) != 1 ||
-        session_key_len != 32) {
+    if (pe_crypto_hkdf_sha256(shared_secret, sizeof(shared_secret),
+                                NULL, 0, kdf_info, sizeof(kdf_info),
+                                session_key_out, 32) != 0) {
         goto cleanup;
     }
 
     rc = 0;
 
 cleanup:
-    OPENSSL_cleanse(shared_secret, sizeof(shared_secret));
-    OPENSSL_cleanse(kdf_info, sizeof(kdf_info));
-    OPENSSL_cleanse(counter_le, sizeof(counter_le));
+    pe_crypto_secure_zero(shared_secret, sizeof(shared_secret));
+    pe_crypto_secure_zero(kdf_info, sizeof(kdf_info));
+    pe_crypto_secure_zero(counter_le, sizeof(counter_le));
     if (rc != 0) {
-        memset(session_key_out, 0, 32);
-    }
-    if (kctx) {
-        EVP_PKEY_CTX_free(kctx);
-    }
-    if (ctx) {
-        EVP_PKEY_CTX_free(ctx);
-    }
-    if (ssd_pub_pkey) {
-        EVP_PKEY_free(ssd_pub_pkey);
-    }
-    if (admin_priv_pkey) {
-        EVP_PKEY_free(admin_priv_pkey);
+        pe_crypto_secure_zero(session_key_out, 32);
     }
     return rc;
 }
@@ -521,44 +343,16 @@ static int compute_meta_hmac(const uint8_t key[32], uint8_t opcode,
                              size_t ciphertext_len,
                              uint8_t out[META_AUTH_HMAC_SIZE])
 {
-    HMAC_CTX *ctx = NULL;
+    struct pe_crypto_buffer parts[3];
     uint8_t counter_le[8];
-    unsigned int mac_len = 0;
-    int rc = -1;
+    int rc;
 
     encode_u64_le(counter, counter_le);
-    ctx = HMAC_CTX_new();
-    if (!ctx) {
-        return -1;
-    }
-
-    if (HMAC_Init_ex(ctx, key, 32, EVP_sha256(), NULL) != 1) {
-        goto cleanup;
-    }
-    if (HMAC_Update(ctx, &opcode, 1) != 1) {
-        goto cleanup;
-    }
-    if (HMAC_Update(ctx, counter_le, sizeof(counter_le)) != 1) {
-        goto cleanup;
-    }
-    if (ciphertext_len > 0 &&
-        HMAC_Update(ctx, ciphertext, ciphertext_len) != 1) {
-        goto cleanup;
-    }
-    if (HMAC_Final(ctx, out, &mac_len) != 1 || mac_len != META_AUTH_HMAC_SIZE) {
-        goto cleanup;
-    }
-
-    rc = 0;
-
-cleanup:
-    OPENSSL_cleanse(counter_le, sizeof(counter_le));
-    if (ctx) {
-        HMAC_CTX_free(ctx);
-    }
-    if (rc != 0) {
-        memset(out, 0, META_AUTH_HMAC_SIZE);
-    }
+    parts[0] = (struct pe_crypto_buffer){ &opcode, 1 };
+    parts[1] = (struct pe_crypto_buffer){ counter_le, sizeof(counter_le) };
+    parts[2] = (struct pe_crypto_buffer){ ciphertext, ciphertext_len };
+    rc = pe_crypto_hmac_sha256v(key, 32, parts, 3, out);
+    pe_crypto_secure_zero(counter_le, sizeof(counter_le));
     return rc;
 }
 
@@ -567,48 +361,14 @@ static int aes256_gcm_encrypt(const uint8_t key[32], uint64_t counter,
                               size_t plaintext_len, uint8_t *ciphertext,
                               uint8_t tag[META_AUTH_TAG_SIZE])
 {
-    EVP_CIPHER_CTX *ctx = NULL;
     uint8_t nonce[12];
-    int len = 0;
-    int out_len = 0;
-    int rc = -1;
+    int rc;
 
     build_meta_nonce(counter, nonce);
-    ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        return -1;
-    }
-
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) {
-        goto cleanup;
-    }
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, (int)sizeof(nonce), NULL) != 1) {
-        goto cleanup;
-    }
-    if (EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) {
-        goto cleanup;
-    }
-    if (EVP_EncryptUpdate(ctx, NULL, &len, &opcode, 1) != 1) {
-        goto cleanup;
-    }
-    if (plaintext_len > 0 &&
-        EVP_EncryptUpdate(ctx, ciphertext, &out_len, plaintext, (int)plaintext_len) != 1) {
-        goto cleanup;
-    }
-    if (EVP_EncryptFinal_ex(ctx, ciphertext + out_len, &len) != 1) {
-        goto cleanup;
-    }
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, META_AUTH_TAG_SIZE, tag) != 1) {
-        goto cleanup;
-    }
-
-    rc = 0;
-
-cleanup:
-    OPENSSL_cleanse(nonce, sizeof(nonce));
-    if (ctx) {
-        EVP_CIPHER_CTX_free(ctx);
-    }
+    rc = pe_crypto_aes256_gcm_encrypt(key, nonce, &opcode, 1,
+                                        plaintext, plaintext_len,
+                                        ciphertext, tag);
+    pe_crypto_secure_zero(nonce, sizeof(nonce));
     return rc;
 }
 
@@ -736,11 +496,11 @@ static int establish_session(const char *device, uint8_t session_mode,
     rc = 0;
 
 cleanup:
-    OPENSSL_cleanse(admin_ephem_priv, sizeof(admin_ephem_priv));
-    OPENSSL_cleanse(request, sizeof(request));
-    OPENSSL_cleanse(response, sizeof(response));
-    OPENSSL_cleanse(admin_init_message, sizeof(admin_init_message));
-    OPENSSL_cleanse(proof_message, sizeof(proof_message));
+    pe_crypto_secure_zero(admin_ephem_priv, sizeof(admin_ephem_priv));
+    pe_crypto_secure_zero(request, sizeof(request));
+    pe_crypto_secure_zero(response, sizeof(response));
+    pe_crypto_secure_zero(admin_init_message, sizeof(admin_init_message));
+    pe_crypto_secure_zero(proof_message, sizeof(proof_message));
     return rc;
 }
 
@@ -778,30 +538,30 @@ static int build_authenticated_envelope(const struct policy_session *session,
         uint8_t mac_key[32];
 
         if (derive_labeled_key(session->key, "meta-normal-mac", mac_key) != 0) {
-            OPENSSL_cleanse(mac_key, sizeof(mac_key));
+            pe_crypto_secure_zero(mac_key, sizeof(mac_key));
             goto cleanup;
         }
         memcpy(ciphertext, plaintext, plaintext_len);
         if (compute_meta_hmac(mac_key, opcode, counter, ciphertext, plaintext_len,
                               request + 8) != 0) {
-            OPENSSL_cleanse(mac_key, sizeof(mac_key));
+            pe_crypto_secure_zero(mac_key, sizeof(mac_key));
             goto cleanup;
         }
 
-        OPENSSL_cleanse(mac_key, sizeof(mac_key));
+        pe_crypto_secure_zero(mac_key, sizeof(mac_key));
     } else if (session->mode == SESSION_MODE_CONFIDENTIAL) {
         uint8_t aead_key[32];
 
         if (derive_labeled_key(session->key, "meta-conf-aead", aead_key) != 0) {
-            OPENSSL_cleanse(aead_key, sizeof(aead_key));
+            pe_crypto_secure_zero(aead_key, sizeof(aead_key));
             goto cleanup;
         }
         if (aes256_gcm_encrypt(aead_key, counter, opcode, plaintext, plaintext_len,
                                ciphertext, request + 8) != 0) {
-            OPENSSL_cleanse(aead_key, sizeof(aead_key));
+            pe_crypto_secure_zero(aead_key, sizeof(aead_key));
             goto cleanup;
         }
-        OPENSSL_cleanse(aead_key, sizeof(aead_key));
+        pe_crypto_secure_zero(aead_key, sizeof(aead_key));
     } else {
         goto cleanup;
     }
@@ -813,7 +573,7 @@ static int build_authenticated_envelope(const struct policy_session *session,
 
 cleanup:
     if (request) {
-        OPENSSL_cleanse(request, request_len);
+        pe_crypto_secure_zero(request, request_len);
         free(request);
     }
     return rc;
@@ -853,7 +613,7 @@ static int send_authenticated_meta_cmd(const char *device,
 
 cleanup:
     if (request) {
-        OPENSSL_cleanse(request, request_len);
+        pe_crypto_secure_zero(request, request_len);
         free(request);
     }
     return rc;
@@ -864,27 +624,13 @@ static int sha256_parts(const uint8_t *part1, size_t part1_len,
                         const uint8_t *part3, size_t part3_len,
                         uint8_t out[POLICY_ATTESTATION_HASH_SIZE])
 {
-    EVP_MD_CTX *ctx = NULL;
-    unsigned int digest_len = 0;
-    int rc = -1;
+    const struct pe_crypto_buffer parts[] = {
+        { part1, part1_len },
+        { part2, part2_len },
+        { part3, part3_len },
+    };
 
-    ctx = EVP_MD_CTX_new();
-    if (!ctx || EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1 ||
-        (part1_len && EVP_DigestUpdate(ctx, part1, part1_len) != 1) ||
-        (part2_len && EVP_DigestUpdate(ctx, part2, part2_len) != 1) ||
-        (part3_len && EVP_DigestUpdate(ctx, part3, part3_len) != 1) ||
-        EVP_DigestFinal_ex(ctx, out, &digest_len) != 1 ||
-        digest_len != POLICY_ATTESTATION_HASH_SIZE) {
-        goto cleanup;
-    }
-    rc = 0;
-
-cleanup:
-    EVP_MD_CTX_free(ctx);
-    if (rc != 0) {
-        memset(out, 0, POLICY_ATTESTATION_HASH_SIZE);
-    }
-    return rc;
+    return pe_crypto_sha256v(parts, 3, out);
 }
 
 static int initial_history_head(
@@ -1338,7 +1084,8 @@ static int do_attestation(const char *device, uint8_t report_type,
     request[0] = POLICY_ATTESTATION_FORMAT_VERSION;
     request[1] = report_type;
     request[2] = history_mode;
-    if (RAND_bytes(request + 3, POLICY_ATTESTATION_NONCE_SIZE) != 1) {
+    if (sxs_host_random(request + 3,
+                        POLICY_ATTESTATION_NONCE_SIZE) != 0) {
         fprintf(stderr, "Failed to generate attestation nonce\n");
         goto cleanup;
     }
@@ -1347,8 +1094,8 @@ static int do_attestation(const char *device, uint8_t report_type,
                           &report, &report_len) != 0 ||
         parse_attestation(report, report_len, &view) != 0 ||
         view.report_type != report_type || view.history_mode != history_mode ||
-        CRYPTO_memcmp(view.nonce, request + 3,
-                      POLICY_ATTESTATION_NONCE_SIZE) != 0) {
+        !pe_crypto_equal(view.nonce, request + 3,
+                          POLICY_ATTESTATION_NONCE_SIZE)) {
         fprintf(stderr, "Failed to fetch or verify attestation\n");
         goto cleanup;
     }
@@ -1360,8 +1107,8 @@ static int do_attestation(const char *device, uint8_t report_type,
         }
         base_sequence = 0;
     } else if (history_mode == POLICY_ATTESTATION_HISTORY_DELTA) {
-        if (CRYPTO_memcmp(base_epoch, view.boot_epoch,
-                          sizeof(base_epoch)) != 0 ||
+        if (!pe_crypto_equal(base_epoch, view.boot_epoch,
+                              sizeof(base_epoch)) ||
             view.snapshot_sequence < base_sequence ||
             view.history_count != view.snapshot_sequence - base_sequence) {
             goto verification_failure;
@@ -1387,8 +1134,8 @@ static int do_attestation(const char *device, uint8_t report_type,
         }
         memcpy(computed_head, next_head, sizeof(computed_head));
     }
-    if (CRYPTO_memcmp(computed_head, view.history_head,
-                      sizeof(computed_head)) != 0) {
+    if (!pe_crypto_equal(computed_head, view.history_head,
+                          sizeof(computed_head))) {
         goto verification_failure;
     }
     if ((history_mode == POLICY_ATTESTATION_HISTORY_FULL &&
@@ -1438,16 +1185,16 @@ verification_failure:
 
 cleanup:
     if (prior_report) {
-        OPENSSL_cleanse(prior_report, prior_report_len);
+        pe_crypto_secure_zero(prior_report, prior_report_len);
         free(prior_report);
     }
     if (report) {
-        OPENSSL_cleanse(report, report_len);
+        pe_crypto_secure_zero(report, report_len);
         free(report);
     }
-    OPENSSL_cleanse(request, sizeof(request));
-    OPENSSL_cleanse(base_head, sizeof(base_head));
-    OPENSSL_cleanse(computed_head, sizeof(computed_head));
+    pe_crypto_secure_zero(request, sizeof(request));
+    pe_crypto_secure_zero(base_head, sizeof(base_head));
+    pe_crypto_secure_zero(computed_head, sizeof(computed_head));
     return rc;
 }
 
@@ -1461,7 +1208,7 @@ static int do_session(const char *device, uint8_t session_mode)
         fprintf(stderr, "Failed to persist session state\n");
         rc = -1;
     }
-    OPENSSL_cleanse(&session, sizeof(session));
+    pe_crypto_secure_zero(&session, sizeof(session));
     return rc;
 }
 
@@ -1522,14 +1269,14 @@ cleanup:
         close(policy_fd);
     }
     if (policy) {
-        OPENSSL_cleanse(policy, (size_t)st.st_size);
+        pe_crypto_secure_zero(policy, (size_t)st.st_size);
         free(policy);
     }
     if (plaintext) {
-        OPENSSL_cleanse(plaintext, plaintext_len);
+        pe_crypto_secure_zero(plaintext, plaintext_len);
         free(plaintext);
     }
-    OPENSSL_cleanse(&session, sizeof(session));
+    pe_crypto_secure_zero(&session, sizeof(session));
     return rc;
 }
 
@@ -1560,8 +1307,8 @@ static int do_simple_opcode(const char *device, uint8_t opcode, uint32_t policy_
 
     encode_u32_le(policy_id, plaintext);
     rc = send_authenticated_meta_cmd(device, &session, opcode, plaintext, sizeof(plaintext));
-    OPENSSL_cleanse(&session, sizeof(session));
-    OPENSSL_cleanse(plaintext, sizeof(plaintext));
+    pe_crypto_secure_zero(&session, sizeof(session));
+    pe_crypto_secure_zero(plaintext, sizeof(plaintext));
     return rc;
 }
 

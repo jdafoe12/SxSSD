@@ -1,1 +1,0 @@
-/home/femu/scripts/atc21_zns_comparison/atc21-write --mode block --device /dev/nvme0n1 --output-dir /home/femu/steady-state-campaign-20260813/block-20260813-233106 --offset 0 --working-set 12884901888 --zone-size 67108864 --bs 65536 --streams 1 --iodepth 1 --warmup 240 --runtime 300

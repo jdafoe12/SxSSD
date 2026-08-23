@@ -1,8 +1,0 @@
-[atc21-validation] Mode: block-28
-[atc21-validation] Device: /dev/nvme0n1
-[atc21-validation] Results: /home/femu/atc21-zns-validation-results/block-28-20260815-004510
-[atc21-validation] Calibration only: 0
-[atc21-validation] Normalized to ZNS peak: 290.283 MiB/s
-[atc21-validation] Discarding the block working set
-[atc21-validation] Peak write throughput: 103.314 MiB/s
-[atc21-validation] Complete: /home/femu/atc21-zns-validation-results/block-28-20260815-004510

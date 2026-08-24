@@ -1,3 +1,8 @@
+/*
+ * Modified for SxSSD by Josh Dafoe.
+ * SxSSD modifications: 2025-12-04 through 2026-07-11.
+ */
+
 #include "./nvme.h"
 
 static uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req);

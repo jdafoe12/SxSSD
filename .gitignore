@@ -18,6 +18,21 @@ FEMU/hw/femu/bbssd/workload-eval/workload_sets/results/
 device_timing.csv
 policyctl_timing.csv
 
+# Local SxSSD build products
+/FEMU-SxSSD/build-*/
+/FEMU-SxSSD/hw/femu/bbssd/scripts/policyctl
+/FEMU-SxSSD/hw/femu/bbssd/scripts/key-sharing-client
+/FEMU-SxSSD/hw/femu/bbssd/scripts/test_device_signing
+/FEMU-SxSSD/hw/femu/bbssd/scripts/test_sxssd_crypto
+/FEMU-SxSSD/subprojects/wamr/
+*.wasm
+
+# Files from other SxSSD branches
+/SxSSD
+/benchmark-results/
+/steady-state-results/
+/FEMU-SxSSD/hw/femu/bbssd/scripts/steady-state-comparison/
+
 # Local VM images and editor files
 *.qcow2
 .DS_Store

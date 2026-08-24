@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* Includes FEMU BBSSD adaptations by Josh Dafoe. */
+
 // Bad block manager mapping (simple OP-aware placeholder)
 #include "./bbm.h"
 #include "./policy-engine.h"

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Modified for SxSSD by Josh Dafoe.
+# SxSSD modifications: 2026-04-29 through 2026-07-11.
 
 set -u
 

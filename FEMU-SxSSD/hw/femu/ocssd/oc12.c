@@ -1,3 +1,8 @@
+/*
+ * Modified for SxSSD by Josh Dafoe.
+ * SxSSD modifications: 2025-12-04 through 2026-07-11.
+ */
+
 #include "./oc12.h"
 
 static inline int qemu_fls(int i)

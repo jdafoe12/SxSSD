@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #include "eswd-layout.h"
 #include <assert.h>
 #include <string.h>

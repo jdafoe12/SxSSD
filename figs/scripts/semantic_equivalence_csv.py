@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 """Generate semantic-equivalence percent-difference CSV for FEMU vs SxSSD.
 
 The output table is intended for the paper: rows are internal behavior metrics,

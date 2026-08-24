@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 """Generate peak random read/write throughput CSV for FEMU vs SxSSD."""
 
 from __future__ import annotations

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 # Source this file from your shell before following REVIEWER_EVALUATION.md.
 # Example:

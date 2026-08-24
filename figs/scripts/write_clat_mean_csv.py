@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 """Generate mean write completion latency CSV for baseline, SxSSD-Block, and SxSSD-FlashGuard."""
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #ifndef BLOCK_INTERFACE_POLICY_STATE_H
 #define BLOCK_INTERFACE_POLICY_STATE_H
 

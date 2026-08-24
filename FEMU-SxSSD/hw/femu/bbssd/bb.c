@@ -1,3 +1,9 @@
+/*
+ * Modified for SxSSD by Josh Dafoe.
+ * SxSSD modifications: 2025-12-16 through 2026-07-11.
+ * Includes code reorganized from FEMU BBSSD ftl.c.
+ */
+
 #include "../nvme.h"
 #include "./ftl.h"
 #include "./policy-engine.h"

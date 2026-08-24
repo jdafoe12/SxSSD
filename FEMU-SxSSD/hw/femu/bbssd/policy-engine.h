@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #ifndef POLICY_ENGINE_H
 #define POLICY_ENGINE_H
 

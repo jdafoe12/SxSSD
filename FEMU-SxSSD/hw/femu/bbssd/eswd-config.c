@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #include "eswd-config.h"
 
 bool eswd_config_valid(const struct eswd_config *config,

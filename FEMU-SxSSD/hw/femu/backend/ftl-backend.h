@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* Derived in part from FEMU BBSSD code; modifications by Josh Dafoe. */
+
 #ifndef FTL_BACKEND_H
 #define FTL_BACKEND_H
 

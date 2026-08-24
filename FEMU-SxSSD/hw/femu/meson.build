@@ -1,3 +1,6 @@
+# Modified for SxSSD by Josh Dafoe.
+# SxSSD modifications: 2025-12-04 through 2026-07-11.
+
 # OpenSSL dependency for meta-interface-policy crypto operations
 openssl = dependency('openssl', version: '>= 1.1.1', required: true)
 dl = cc.find_library('dl', required: false)

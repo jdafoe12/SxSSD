@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #ifndef META_INTERFACE_POLICY_H
 #define META_INTERFACE_POLICY_H
 

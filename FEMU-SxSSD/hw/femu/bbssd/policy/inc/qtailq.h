@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #ifndef FEMU_POLICY_QTAILQ_H
 #define FEMU_POLICY_QTAILQ_H
 

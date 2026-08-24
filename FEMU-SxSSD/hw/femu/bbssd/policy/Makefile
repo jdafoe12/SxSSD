@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -fPIC -I. -Iinc
 POLICY_LDFLAGS = -shared

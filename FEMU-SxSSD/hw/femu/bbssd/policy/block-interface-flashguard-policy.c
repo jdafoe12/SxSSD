@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #include "block-interface-policy.h"
 #include <assert.h>
 #include <stdio.h>

@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* Includes FEMU BBSSD adaptations by Josh Dafoe. */
+
 #ifndef BBM_H
 #define BBM_H
 

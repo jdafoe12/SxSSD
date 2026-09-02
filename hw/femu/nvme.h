@@ -1169,6 +1169,10 @@ typedef struct BbCtrlParams {
 
     int gc_thres_pcent;
     int gc_thres_pcent_high;
+#ifdef FEMU_EVAL
+    uint32_t host_mhz;
+    uint32_t ctrl_mhz;
+#endif
 } BbCtrlParams;
 
 typedef struct ZNSCtrlParams {

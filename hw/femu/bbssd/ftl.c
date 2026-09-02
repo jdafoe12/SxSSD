@@ -6,6 +6,270 @@
 
 static void *ftl_thread(void *arg);
 
+#ifdef FEMU_EVAL
+#define FEMU_STATS_IDLE_TIMEOUT_MS 10000
+
+static uint64_t thread_cpu_time_ns(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) {
+        return 0;
+    }
+
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + ts.tv_nsec;
+}
+
+static uint64_t scaled_controller_time_ns(const struct ssd *ssd,
+                                          uint64_t raw_ns)
+{
+    uint64_t host_mhz = ssd->stats_ctl.host_mhz;
+    uint64_t ctrl_mhz = ssd->stats_ctl.ctrl_mhz;
+
+    return (raw_ns / ctrl_mhz) * host_mhz +
+           ((raw_ns % ctrl_mhz) * host_mhz) / ctrl_mhz;
+}
+
+static bool ssd_ftl_rings_empty(FemuCtrl *n)
+{
+    struct ssd *ssd = n->ssd;
+    int i;
+
+    if (!ssd->to_ftl) {
+        return true;
+    }
+
+    for (i = 1; i <= n->nr_pollers; i++) {
+        if (ssd->to_ftl[i] && femu_ring_count(ssd->to_ftl[i])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/* Returns with stats_ctl.lock held when the FTL has reached a phase boundary. */
+static int ssd_stats_lock_idle(FemuCtrl *n)
+{
+    struct ssd *ssd = n->ssd;
+    struct ssd_stats_control *ctl = &ssd->stats_ctl;
+
+    qemu_mutex_lock(&ctl->lock);
+    while (ctl->handler_active || !ssd_ftl_rings_empty(n)) {
+        if (!qemu_cond_timedwait(&ctl->idle_cond, &ctl->lock,
+                                 FEMU_STATS_IDLE_TIMEOUT_MS)) {
+            qemu_mutex_unlock(&ctl->lock);
+            return -ETIMEDOUT;
+        }
+    }
+
+    return 0;
+}
+
+static void ssd_stats_handler_begin(struct ssd *ssd)
+{
+    struct ssd_stats_control *ctl = &ssd->stats_ctl;
+
+    qemu_mutex_lock(&ctl->lock);
+    ctl->handler_active = true;
+    qemu_mutex_unlock(&ctl->lock);
+}
+
+static void ssd_stats_handler_end(struct ssd *ssd)
+{
+    struct ssd_stats_control *ctl = &ssd->stats_ctl;
+
+    qemu_mutex_lock(&ctl->lock);
+    ctl->handler_active = false;
+    qemu_cond_broadcast(&ctl->idle_cond);
+    qemu_mutex_unlock(&ctl->lock);
+}
+
+static void stats_json_u64(FILE *f, const char *name, uint64_t value,
+                           bool trailing_comma)
+{
+    fprintf(f, "  \"%s\": %" PRIu64 "%s\n", name, value,
+            trailing_comma ? "," : "");
+}
+
+static int ssd_stats_write_json(FemuCtrl *n, uint32_t run_id)
+{
+    struct ssd *ssd = n->ssd;
+    struct ssdparams *spp = &ssd->sp;
+    struct ssd_stats *stats = &ssd->stats_ctl.stats;
+    const char *dir = getenv(FEMU_STATS_DIR_ENV);
+    uint64_t physical_page_reads;
+    uint64_t physical_page_programs;
+    char *path = NULL;
+    char *tmp_path = NULL;
+    FILE *f = NULL;
+    int fd = -1;
+    int ret = -1;
+
+    if (!dir || !*dir) {
+        ftl_err("%s is not set\n", FEMU_STATS_DIR_ENV);
+        return -EINVAL;
+    }
+
+    path = g_strdup_printf("%s/stats_%" PRIu32 ".json", dir, run_id);
+    tmp_path = g_strdup_printf("%s/.stats_%" PRIu32 ".XXXXXX", dir, run_id);
+    if (g_file_test(path, G_FILE_TEST_EXISTS)) {
+        ftl_err("refusing to overwrite evaluation statistics %s\n", path);
+        ret = -EEXIST;
+        goto out;
+    }
+
+    fd = g_mkstemp(tmp_path);
+    if (fd < 0) {
+        ftl_err("failed to create evaluation statistics %s: %s\n", tmp_path,
+                strerror(errno));
+        ret = -errno;
+        goto out;
+    }
+    f = fdopen(fd, "w");
+    if (!f) {
+        ftl_err("failed to open evaluation statistics %s: %s\n", tmp_path,
+                strerror(errno));
+        ret = -errno;
+        close(fd);
+        fd = -1;
+        goto out;
+    }
+    fd = -1;
+
+    physical_page_reads = stats->host_read_page_reads +
+                          stats->rmw_read_page_reads + stats->gc_page_reads;
+    physical_page_programs = stats->host_write_page_programs +
+                             stats->gc_page_programs;
+
+    fprintf(f, "{\n");
+    fprintf(f, "  \"schema_version\": \"femu-bbssd-eval-v1\",\n");
+    stats_json_u64(f, "run_id", run_id, true);
+    stats_json_u64(f, "logical_capacity_bytes", n->ns_size, true);
+    stats_json_u64(f, "physical_capacity_bytes",
+                   (uint64_t)spp->tt_secs * spp->secsz, true);
+    stats_json_u64(f, "sector_size_bytes", spp->secsz, true);
+    stats_json_u64(f, "sectors_per_page", spp->secs_per_pg, true);
+    stats_json_u64(f, "pages_per_block", spp->pgs_per_blk, true);
+    stats_json_u64(f, "blocks_per_plane", spp->blks_per_pl, true);
+    stats_json_u64(f, "planes_per_lun", spp->pls_per_lun, true);
+    stats_json_u64(f, "luns_per_channel", spp->luns_per_ch, true);
+    stats_json_u64(f, "channels", spp->nchs, true);
+    stats_json_u64(f, "page_read_latency_ns", spp->pg_rd_lat, true);
+    stats_json_u64(f, "page_program_latency_ns", spp->pg_wr_lat, true);
+    stats_json_u64(f, "block_erase_latency_ns", spp->blk_er_lat, true);
+    stats_json_u64(f, "gc_threshold_percent", n->bb_params.gc_thres_pcent,
+                   true);
+    stats_json_u64(f, "gc_high_threshold_percent",
+                   n->bb_params.gc_thres_pcent_high, true);
+    stats_json_u64(f, "host_mhz", ssd->stats_ctl.host_mhz, true);
+    stats_json_u64(f, "ctrl_mhz", ssd->stats_ctl.ctrl_mhz, true);
+    stats_json_u64(f, "host_read_cmds", stats->host_read_cmds, true);
+    stats_json_u64(f, "host_write_cmds", stats->host_write_cmds, true);
+    stats_json_u64(f, "host_trim_cmds", stats->host_trim_cmds, true);
+    stats_json_u64(f, "host_read_sectors", stats->host_read_sectors, true);
+    stats_json_u64(f, "host_write_sectors", stats->host_write_sectors, true);
+    stats_json_u64(f, "host_trim_sectors", stats->host_trim_sectors, true);
+    stats_json_u64(f, "host_read_page_reads", stats->host_read_page_reads,
+                   true);
+    stats_json_u64(f, "host_write_page_programs",
+                   stats->host_write_page_programs, true);
+    stats_json_u64(f, "host_write_page_spans", stats->host_write_page_spans,
+                   true);
+    stats_json_u64(f, "full_page_write_spans", stats->full_page_write_spans,
+                   true);
+    stats_json_u64(f, "partial_write_page_spans",
+                   stats->partial_write_page_spans, true);
+    stats_json_u64(f, "partial_write_unmapped_page_spans",
+                   stats->partial_write_unmapped_page_spans, true);
+    stats_json_u64(f, "rmw_read_page_reads", stats->rmw_read_page_reads,
+                   true);
+    stats_json_u64(f, "gc_page_reads", stats->gc_page_reads, true);
+    stats_json_u64(f, "gc_page_programs", stats->gc_page_programs, true);
+    stats_json_u64(f, "gc_page_copies", stats->gc_page_copies, true);
+    stats_json_u64(f, "gc_pages_migrated", stats->gc_pages_migrated, true);
+    stats_json_u64(f, "gc_invocations", stats->gc_invocations, true);
+    stats_json_u64(f, "foreground_gc_invocations",
+                   stats->foreground_gc_invocations, true);
+    stats_json_u64(f, "background_gc_invocations",
+                   stats->background_gc_invocations, true);
+    stats_json_u64(f, "block_erases", stats->block_erases, true);
+    stats_json_u64(f, "physical_page_reads", physical_page_reads, true);
+    stats_json_u64(f, "physical_page_programs", physical_page_programs, true);
+    stats_json_u64(f, "foreground_handler_cpu_ns_raw",
+                   stats->foreground_handler_cpu_ns_raw, true);
+    stats_json_u64(f, "foreground_handler_cpu_ns_scaled",
+                   stats->foreground_handler_cpu_ns_scaled, true);
+    stats_json_u64(f, "background_gc_cpu_ns_raw",
+                   stats->background_gc_cpu_ns_raw, true);
+    stats_json_u64(f, "background_gc_cpu_ns_scaled",
+                   stats->background_gc_cpu_ns_scaled, false);
+    fprintf(f, "}\n");
+
+    if (fflush(f) || fsync(fileno(f))) {
+        ftl_err("failed to flush evaluation statistics %s: %s\n", tmp_path,
+                strerror(errno));
+        fclose(f);
+        f = NULL;
+        ret = -EIO;
+        goto out;
+    }
+    if (fclose(f)) {
+        ftl_err("failed to close evaluation statistics %s: %s\n", tmp_path,
+                strerror(errno));
+        f = NULL;
+        ret = -EIO;
+        goto out;
+    }
+    f = NULL;
+    if (rename(tmp_path, path)) {
+        ftl_err("failed to publish evaluation statistics %s: %s\n", path,
+                strerror(errno));
+        ret = -errno;
+        goto out;
+    }
+
+    femu_log("FEMU: evaluation statistics dumped to %s\n", path);
+    ret = 0;
+out:
+    if (f) {
+        fclose(f);
+    }
+    if (ret && tmp_path) {
+        unlink(tmp_path);
+    }
+    g_free(tmp_path);
+    g_free(path);
+    return ret;
+}
+
+int ssd_stats_reset(FemuCtrl *n)
+{
+    struct ssd_stats_control *ctl = &n->ssd->stats_ctl;
+    int ret = ssd_stats_lock_idle(n);
+
+    if (ret) {
+        return ret;
+    }
+    memset(&ctl->stats, 0, sizeof(ctl->stats));
+    qemu_mutex_unlock(&ctl->lock);
+    return 0;
+}
+
+int ssd_stats_dump_json(FemuCtrl *n, uint32_t run_id)
+{
+    struct ssd_stats_control *ctl = &n->ssd->stats_ctl;
+    int ret = ssd_stats_lock_idle(n);
+
+    if (ret) {
+        return ret;
+    }
+    ret = ssd_stats_write_json(n, run_id);
+    qemu_mutex_unlock(&ctl->lock);
+    return ret;
+}
+#endif
+
 static inline bool should_gc(struct ssd *ssd)
 {
     return (ssd->lm.free_line_cnt <= ssd->sp.gc_thres_lines);
@@ -424,6 +688,13 @@ void ssd_init(FemuCtrl *n)
     /* initialize write pointer, this is how we allocate new pages for writes */
     ssd_init_write_pointer(ssd);
 
+#ifdef FEMU_EVAL
+    qemu_mutex_init(&ssd->stats_ctl.lock);
+    qemu_cond_init(&ssd->stats_ctl.idle_cond);
+    ssd->stats_ctl.host_mhz = n->bb_params.host_mhz;
+    ssd->stats_ctl.ctrl_mhz = n->bb_params.ctrl_mhz;
+#endif
+
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
                        QEMU_THREAD_JOINABLE);
 }
@@ -649,10 +920,16 @@ static void mark_block_free(struct ssd *ssd, struct ppa *ppa)
     blk->ipc = 0;
     blk->vpc = 0;
     blk->erase_cnt++;
+#ifdef FEMU_EVAL
+    ssd->stats_ctl.stats.block_erases++;
+#endif
 }
 
 static void gc_read_page(struct ssd *ssd, struct ppa *ppa)
 {
+#ifdef FEMU_EVAL
+    ssd->stats_ctl.stats.gc_page_reads++;
+#endif
     /* advance ssd status, we don't care about how long it takes */
     if (ssd->sp.enable_gc_delay) {
         struct nand_cmd gcr;
@@ -679,6 +956,11 @@ static uint64_t gc_write_page(SsdDramBackend *mbe, struct ssd *ssd,
         ftl_err("failed to copy GC page data\n");
         abort();
     }
+#ifdef FEMU_EVAL
+    ssd->stats_ctl.stats.gc_page_programs++;
+    ssd->stats_ctl.stats.gc_page_copies++;
+    ssd->stats_ctl.stats.gc_pages_migrated++;
+#endif
     /* update maptbl */
     set_maptbl_ent(ssd, lpn, &new_ppa);
     /* update rmap */
@@ -779,6 +1061,15 @@ static int do_gc(SsdDramBackend *mbe, struct ssd *ssd, bool force)
         return -1;
     }
 
+#ifdef FEMU_EVAL
+    ssd->stats_ctl.stats.gc_invocations++;
+    if (force) {
+        ssd->stats_ctl.stats.foreground_gc_invocations++;
+    } else {
+        ssd->stats_ctl.stats.background_gc_invocations++;
+    }
+#endif
+
     ppa.g.blk = victim_line->id;
     ftl_debug("GC-ing line:%d,ipc=%d,victim=%d,full=%d,free=%d\n", ppa.g.blk,
               victim_line->ipc, ssd->lm.victim_line_cnt, ssd->lm.full_line_cnt,
@@ -848,6 +1139,10 @@ static uint64_t ssd_read(SsdDramBackend *mbe, struct ssd *ssd,
                                         page_size) != 0) {
                 ftl_err("failed to read BBSSD page data\n");
                 memset(page, 0, page_size);
+            } else {
+#ifdef FEMU_EVAL
+                ssd->stats_ctl.stats.host_read_page_reads++;
+#endif
             }
 
             struct nand_cmd srd;
@@ -910,6 +1205,18 @@ static uint64_t ssd_write(SsdDramBackend *mbe, struct ssd *ssd,
         bool old_page_valid = mapped_ppa(&old_ppa) &&
                               valid_ppa(ssd, &old_ppa);
 
+#ifdef FEMU_EVAL
+        ssd->stats_ctl.stats.host_write_page_spans++;
+        if (full_page) {
+            ssd->stats_ctl.stats.full_page_write_spans++;
+        } else {
+            ssd->stats_ctl.stats.partial_write_page_spans++;
+            if (!old_page_valid) {
+                ssd->stats_ctl.stats.partial_write_unmapped_page_spans++;
+            }
+        }
+#endif
+
         if (!full_page && old_page_valid) {
             struct nand_cmd srd;
 
@@ -919,6 +1226,9 @@ static uint64_t ssd_write(SsdDramBackend *mbe, struct ssd *ssd,
                 ftl_err("failed to read old BBSSD page data\n");
                 abort();
             }
+#ifdef FEMU_EVAL
+            ssd->stats_ctl.stats.rmw_read_page_reads++;
+#endif
             srd.type = USER_IO;
             srd.cmd = NAND_READ;
             srd.stime = req->stime;
@@ -949,6 +1259,9 @@ static uint64_t ssd_write(SsdDramBackend *mbe, struct ssd *ssd,
             ftl_err("failed to write BBSSD page data\n");
             abort();
         }
+#ifdef FEMU_EVAL
+        ssd->stats_ctl.stats.host_write_page_programs++;
+#endif
         /* update maptbl */
         set_maptbl_ent(ssd, lpn, &ppa);
         /* update rmap */
@@ -1079,12 +1392,60 @@ static void *ftl_thread(void *arg)
             if (!ssd->to_ftl[i] || !femu_ring_count(ssd->to_ftl[i]))
                 continue;
 
+#ifdef FEMU_EVAL
+            ssd_stats_handler_begin(ssd);
+#endif
             rc = femu_ring_dequeue(ssd->to_ftl[i], (void *)&req, 1);
             if (rc != 1) {
                 printf("FEMU: FTL to_ftl dequeue failed\n");
             }
 
             ftl_assert(req);
+#ifdef FEMU_EVAL
+            {
+                uint64_t cpu_t0;
+                uint64_t cpu_t1;
+                uint64_t raw_cpu_ns;
+                uint64_t scaled_cpu_ns;
+
+                cpu_t0 = thread_cpu_time_ns();
+                lat = 0;
+                switch (req->cmd.opcode) {
+                case NVME_CMD_WRITE:
+                    ssd->stats_ctl.stats.host_write_cmds++;
+                    ssd->stats_ctl.stats.host_write_sectors += req->nlb;
+                    lat = ssd_write(n->mbe, ssd, req);
+                    break;
+                case NVME_CMD_READ:
+                    ssd->stats_ctl.stats.host_read_cmds++;
+                    ssd->stats_ctl.stats.host_read_sectors += req->nlb;
+                    lat = ssd_read(n->mbe, ssd, req);
+                    break;
+                case NVME_CMD_DSM:
+                    if (req->dsm_ranges && req->dsm_nr_ranges > 0) {
+                        int range_idx;
+
+                        ssd->stats_ctl.stats.host_trim_cmds++;
+                        for (range_idx = 0;
+                             range_idx < req->dsm_nr_ranges; range_idx++) {
+                            ssd->stats_ctl.stats.host_trim_sectors +=
+                                le32_to_cpu(req->dsm_ranges[range_idx].nlb);
+                        }
+                        lat = ssd_trim(ssd, req);
+                    }
+                    break;
+                default:
+                    break;
+                }
+                cpu_t1 = thread_cpu_time_ns();
+                raw_cpu_ns = cpu_t1 - cpu_t0;
+                scaled_cpu_ns = scaled_controller_time_ns(ssd, raw_cpu_ns);
+                ssd->stats_ctl.stats.foreground_handler_cpu_ns_raw += raw_cpu_ns;
+                ssd->stats_ctl.stats.foreground_handler_cpu_ns_scaled +=
+                    scaled_cpu_ns;
+                lat += scaled_cpu_ns;
+            }
+#else
             switch (req->cmd.opcode) {
             case NVME_CMD_WRITE:
                 lat = ssd_write(n->mbe, ssd, req);
@@ -1101,6 +1462,7 @@ static void *ftl_thread(void *arg)
                 //ftl_err("FTL received unkown request type, ERROR\n");
                 ;
             }
+#endif
 
             req->reqlat = lat;
             req->expire_time += lat;
@@ -1112,8 +1474,24 @@ static void *ftl_thread(void *arg)
 
             /* clean one line if needed (in the background) */
             if (should_gc(ssd)) {
+#ifdef FEMU_EVAL
+                uint64_t gc_t0 = thread_cpu_time_ns();
+                uint64_t gc_t1;
+                uint64_t raw_gc_cpu_ns;
+
                 do_gc(n->mbe, ssd, false);
+                gc_t1 = thread_cpu_time_ns();
+                raw_gc_cpu_ns = gc_t1 - gc_t0;
+                ssd->stats_ctl.stats.background_gc_cpu_ns_raw += raw_gc_cpu_ns;
+                ssd->stats_ctl.stats.background_gc_cpu_ns_scaled +=
+                    scaled_controller_time_ns(ssd, raw_gc_cpu_ns);
+#else
+                do_gc(n->mbe, ssd, false);
+#endif
             }
+#ifdef FEMU_EVAL
+            ssd_stats_handler_end(ssd);
+#endif
         }
     }
 

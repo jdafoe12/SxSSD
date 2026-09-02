@@ -42,7 +42,55 @@ enum {
     FEMU_RESET_ACCT = 5,
     FEMU_ENABLE_LOG = 6,
     FEMU_DISABLE_LOG = 7,
+#ifdef FEMU_EVAL
+    FEMU_STATS_RESET = 8,
+    FEMU_STATS_DUMP = 9,
+#endif
 };
+
+#ifdef FEMU_EVAL
+#define FEMU_STATS_DIR_ENV "FEMU_STATS_DIR"
+
+struct ssd_stats {
+    uint64_t host_read_cmds;
+    uint64_t host_write_cmds;
+    uint64_t host_trim_cmds;
+    uint64_t host_read_sectors;
+    uint64_t host_write_sectors;
+    uint64_t host_trim_sectors;
+
+    uint64_t host_read_page_reads;
+    uint64_t host_write_page_programs;
+    uint64_t host_write_page_spans;
+    uint64_t full_page_write_spans;
+    uint64_t partial_write_page_spans;
+    uint64_t partial_write_unmapped_page_spans;
+    uint64_t rmw_read_page_reads;
+
+    uint64_t gc_page_reads;
+    uint64_t gc_page_programs;
+    uint64_t gc_page_copies;
+    uint64_t gc_pages_migrated;
+    uint64_t gc_invocations;
+    uint64_t foreground_gc_invocations;
+    uint64_t background_gc_invocations;
+    uint64_t block_erases;
+
+    uint64_t foreground_handler_cpu_ns_raw;
+    uint64_t foreground_handler_cpu_ns_scaled;
+    uint64_t background_gc_cpu_ns_raw;
+    uint64_t background_gc_cpu_ns_scaled;
+};
+
+struct ssd_stats_control {
+    QemuMutex lock;
+    QemuCond idle_cond;
+    bool handler_active;
+    uint32_t host_mhz;
+    uint32_t ctrl_mhz;
+    struct ssd_stats stats;
+};
+#endif
 
 
 #define BLK_BITS    (16)
@@ -207,10 +255,17 @@ struct ssd {
     struct rte_ring **to_ftl;
     struct rte_ring **to_poller;
     bool *dataplane_started_ptr;
+#ifdef FEMU_EVAL
+    struct ssd_stats_control stats_ctl;
+#endif
     QemuThread ftl_thread;
 };
 
 void ssd_init(FemuCtrl *n);
+#ifdef FEMU_EVAL
+int ssd_stats_reset(FemuCtrl *n);
+int ssd_stats_dump_json(FemuCtrl *n, uint32_t run_id);
+#endif
 
 #ifdef FEMU_DEBUG_FTL
 #define ftl_debug(fmt, ...) \

@@ -694,6 +694,10 @@ static const Property femu_props[] = {
     DEFINE_PROP_INT32("ch_xfer_lat", FemuCtrl, bb_params.ch_xfer_lat, 0),
     DEFINE_PROP_INT32("gc_thres_pcent", FemuCtrl, bb_params.gc_thres_pcent, 75),
     DEFINE_PROP_INT32("gc_thres_pcent_high", FemuCtrl, bb_params.gc_thres_pcent_high, 95),
+#ifdef FEMU_EVAL
+    DEFINE_PROP_UINT32("host_mhz", FemuCtrl, bb_params.host_mhz, 3900),
+    DEFINE_PROP_UINT32("ctrl_mhz", FemuCtrl, bb_params.ctrl_mhz, 500),
+#endif
 };
 
 static const VMStateDescription femu_vmstate = {

@@ -13,6 +13,12 @@ static void bb_init_ctrl_str(FemuCtrl *n)
 /* bb <=> black-box */
 static void bb_init(FemuCtrl *n, Error **errp)
 {
+#ifdef FEMU_EVAL
+    if (!n->bb_params.host_mhz || !n->bb_params.ctrl_mhz) {
+        error_setg(errp, "host_mhz and ctrl_mhz must both be nonzero");
+        return;
+    }
+#endif
     struct ssd *ssd = n->ssd = g_malloc0(sizeof(struct ssd));
 
     bb_init_ctrl_str(n);
@@ -23,7 +29,7 @@ static void bb_init(FemuCtrl *n, Error **errp)
     ssd_init(n);
 }
 
-static void bb_flip(FemuCtrl *n, NvmeCmd *cmd)
+static uint16_t bb_flip(FemuCtrl *n, NvmeCmd *cmd)
 {
     struct ssd *ssd = n->ssd;
     int64_t cdw10 = le64_to_cpu(cmd->cdw10);
@@ -32,41 +38,56 @@ static void bb_flip(FemuCtrl *n, NvmeCmd *cmd)
     case FEMU_ENABLE_GC_DELAY:
         ssd->sp.enable_gc_delay = true;
         femu_log("%s,FEMU GC Delay Emulation [Enabled]!\n", n->devname);
-        break;
+        return NVME_SUCCESS;
     case FEMU_DISABLE_GC_DELAY:
         ssd->sp.enable_gc_delay = false;
         femu_log("%s,FEMU GC Delay Emulation [Disabled]!\n", n->devname);
-        break;
+        return NVME_SUCCESS;
     case FEMU_ENABLE_DELAY_EMU:
         ssd->sp.pg_rd_lat = NAND_READ_LATENCY;
         ssd->sp.pg_wr_lat = NAND_PROG_LATENCY;
         ssd->sp.blk_er_lat = NAND_ERASE_LATENCY;
         ssd->sp.ch_xfer_lat = 0;
         femu_log("%s,FEMU Delay Emulation [Enabled]!\n", n->devname);
-        break;
+        return NVME_SUCCESS;
     case FEMU_DISABLE_DELAY_EMU:
         ssd->sp.pg_rd_lat = 0;
         ssd->sp.pg_wr_lat = 0;
         ssd->sp.blk_er_lat = 0;
         ssd->sp.ch_xfer_lat = 0;
         femu_log("%s,FEMU Delay Emulation [Disabled]!\n", n->devname);
-        break;
+        return NVME_SUCCESS;
     case FEMU_RESET_ACCT:
         n->nr_tt_ios = 0;
         n->nr_tt_late_ios = 0;
         femu_log("%s,Reset tt_late_ios/tt_ios,%lu/%lu\n", n->devname,
                 n->nr_tt_late_ios, n->nr_tt_ios);
-        break;
+        return NVME_SUCCESS;
     case FEMU_ENABLE_LOG:
         n->print_log = true;
         femu_log("%s,Log print [Enabled]!\n", n->devname);
-        break;
+        return NVME_SUCCESS;
     case FEMU_DISABLE_LOG:
         n->print_log = false;
         femu_log("%s,Log print [Disabled]!\n", n->devname);
-        break;
+        return NVME_SUCCESS;
+#ifdef FEMU_EVAL
+    case FEMU_STATS_RESET:
+        if (ssd_stats_reset(n)) {
+            ftl_err("failed to reset evaluation statistics\n");
+            return NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+        }
+        return NVME_SUCCESS;
+    case FEMU_STATS_DUMP:
+        if (ssd_stats_dump_json(n, le32_to_cpu(cmd->cdw11))) {
+            ftl_err("failed to dump evaluation statistics\n");
+            return NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+        }
+        return NVME_SUCCESS;
+#endif
     default:
         printf("FEMU:%s,Not implemented flip cmd (%lu)\n", n->devname, cdw10);
+        return NVME_SUCCESS;
     }
 }
 
@@ -92,8 +113,7 @@ static uint16_t bb_admin_cmd(FemuCtrl *n, NvmeCmd *cmd)
 {
     switch (cmd->opcode) {
     case NVME_ADM_CMD_FEMU_FLIP:
-        bb_flip(n, cmd);
-        return NVME_SUCCESS;
+        return bb_flip(n, cmd);
     default:
         return NVME_INVALID_OPCODE | NVME_DNR;
     }
@@ -113,4 +133,3 @@ int nvme_register_bbssd(FemuCtrl *n)
 
     return 0;
 }
-

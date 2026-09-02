@@ -1,4 +1,6 @@
 #include "ftl.h"
+#include "../backend/bbssd-backend.h"
+#include <errno.h>
 
 //#define FEMU_DEBUG_FTL
 
@@ -39,6 +41,41 @@ static uint64_t ppa2pgidx(struct ssd *ssd, struct ppa *ppa)
     ftl_assert(pgidx < spp->tt_pgs);
 
     return pgidx;
+}
+
+static int bbssd_rw_one(QEMUSGList *qsg, int *sg_cur_index,
+                        dma_addr_t *sg_cur_byte, void *buf, uint32_t len,
+                        DMADirection dir)
+{
+    uint8_t *ptr = buf;
+
+    while (len > 0) {
+        dma_addr_t cur_addr;
+        dma_addr_t cur_len;
+        dma_addr_t sg_avail;
+
+        if (*sg_cur_index >= qsg->nsg) {
+            return -EINVAL;
+        }
+
+        cur_addr = qsg->sg[*sg_cur_index].base + *sg_cur_byte;
+        sg_avail = qsg->sg[*sg_cur_index].len - *sg_cur_byte;
+        cur_len = MIN((dma_addr_t)len, sg_avail);
+        if (dma_memory_rw(qsg->as, cur_addr, ptr, cur_len, dir,
+                          MEMTXATTRS_UNSPECIFIED)) {
+            return -EIO;
+        }
+
+        *sg_cur_byte += cur_len;
+        if (*sg_cur_byte == qsg->sg[*sg_cur_index].len) {
+            *sg_cur_byte = 0;
+            (*sg_cur_index)++;
+        }
+        ptr += cur_len;
+        len -= cur_len;
+    }
+
+    return 0;
 }
 
 static inline uint64_t get_rmap_ent(struct ssd *ssd, struct ppa *ppa)
@@ -627,14 +664,21 @@ static void gc_read_page(struct ssd *ssd, struct ppa *ppa)
 }
 
 /* move valid page data (already in DRAM) from victim line to a new page */
-static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
+static uint64_t gc_write_page(SsdDramBackend *mbe, struct ssd *ssd,
+                              struct ppa *old_ppa)
 {
     struct ppa new_ppa;
     struct nand_lun *new_lun;
     uint64_t lpn = get_rmap_ent(ssd, old_ppa);
+    uint32_t page_size = ssd->sp.secs_per_pg * ssd->sp.secsz;
 
     ftl_assert(valid_lpn(ssd, lpn));
     new_ppa = get_new_page(ssd);
+    if (bbssd_backend_copy_page(mbe, ppa2pgidx(ssd, old_ppa),
+                                ppa2pgidx(ssd, &new_ppa), page_size) != 0) {
+        ftl_err("failed to copy GC page data\n");
+        abort();
+    }
     /* update maptbl */
     set_maptbl_ent(ssd, lpn, &new_ppa);
     /* update rmap */
@@ -688,7 +732,8 @@ static struct line *select_victim_line(struct ssd *ssd, bool force)
 }
 
 /* here ppa identifies the block we want to clean */
-static void clean_one_block(struct ssd *ssd, struct ppa *ppa)
+static void clean_one_block(SsdDramBackend *mbe, struct ssd *ssd,
+                            struct ppa *ppa)
 {
     struct ssdparams *spp = &ssd->sp;
     struct nand_page *pg_iter = NULL;
@@ -702,7 +747,7 @@ static void clean_one_block(struct ssd *ssd, struct ppa *ppa)
         if (pg_iter->status == PG_VALID) {
             gc_read_page(ssd, ppa);
             /* delay the maptbl update until "write" happens */
-            gc_write_page(ssd, ppa);
+            gc_write_page(mbe, ssd, ppa);
             cnt++;
         }
     }
@@ -721,7 +766,7 @@ static void mark_line_free(struct ssd *ssd, struct ppa *ppa)
     lm->free_line_cnt++;
 }
 
-static int do_gc(struct ssd *ssd, bool force)
+static int do_gc(SsdDramBackend *mbe, struct ssd *ssd, bool force)
 {
     struct line *victim_line = NULL;
     struct ssdparams *spp = &ssd->sp;
@@ -746,7 +791,7 @@ static int do_gc(struct ssd *ssd, bool force)
             ppa.g.lun = lun;
             ppa.g.pl = 0;
             lunp = get_lun(ssd, &ppa);
-            clean_one_block(ssd, &ppa);
+            clean_one_block(mbe, ssd, &ppa);
             mark_block_free(ssd, &ppa);
 
             if (spp->enable_gc_delay) {
@@ -767,7 +812,8 @@ static int do_gc(struct ssd *ssd, bool force)
     return 0;
 }
 
-static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
+static uint64_t ssd_read(SsdDramBackend *mbe, struct ssd *ssd,
+                         NvmeRequest *req)
 {
     struct ssdparams *spp = &ssd->sp;
     uint64_t lba = req->slba;
@@ -777,6 +823,10 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
     uint64_t end_lpn = (lba + nsecs - 1) / spp->secs_per_pg;
     uint64_t lpn;
     uint64_t sublat, maxlat = 0;
+    uint32_t page_size = spp->secs_per_pg * spp->secsz;
+    uint8_t *page = g_malloc(page_size);
+    int sg_cur_index = 0;
+    dma_addr_t sg_cur_byte = 0;
 
     if (end_lpn >= spp->tt_pgs) {
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
@@ -784,26 +834,45 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 
     /* normal IO read path */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        uint64_t page_lba = lpn * spp->secs_per_pg;
+        uint64_t read_start = MAX(lba, page_lba);
+        uint64_t read_end = MIN(lba + nsecs, page_lba + spp->secs_per_pg);
+        uint32_t page_offset = (read_start - page_lba) * spp->secsz;
+        uint32_t bytes = (read_end - read_start) * spp->secsz;
+
         ppa = get_maptbl_ent(ssd, lpn);
         if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) {
-            //printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
-            //printf("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n",
-            //ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
-            continue;
+            memset(page, 0, page_size);
+        } else {
+            if (bbssd_backend_read_page(mbe, page, ppa2pgidx(ssd, &ppa),
+                                        page_size) != 0) {
+                ftl_err("failed to read BBSSD page data\n");
+                memset(page, 0, page_size);
+            }
+
+            struct nand_cmd srd;
+            srd.type = USER_IO;
+            srd.cmd = NAND_READ;
+            srd.stime = req->stime;
+            sublat = ssd_advance_status(ssd, &ppa, &srd);
+            maxlat = (sublat > maxlat) ? sublat : maxlat;
         }
 
-        struct nand_cmd srd;
-        srd.type = USER_IO;
-        srd.cmd = NAND_READ;
-        srd.stime = req->stime;
-        sublat = ssd_advance_status(ssd, &ppa, &srd);
-        maxlat = (sublat > maxlat) ? sublat : maxlat;
+        if (bbssd_rw_one(&req->qsg, &sg_cur_index, &sg_cur_byte,
+                         page + page_offset, bytes,
+                         DMA_DIRECTION_FROM_DEVICE) != 0) {
+            ftl_err("failed to copy BBSSD read data to guest\n");
+        }
     }
+
+    qemu_sglist_destroy(&req->qsg);
+    g_free(page);
 
     return maxlat;
 }
 
-static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
+static uint64_t ssd_write(SsdDramBackend *mbe, struct ssd *ssd,
+                          NvmeRequest *req)
 {
     uint64_t lba = req->slba;
     struct ssdparams *spp = &ssd->sp;
@@ -814,6 +883,10 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     uint64_t lpn;
     uint64_t curlat = 0, maxlat = 0;
     int r;
+    uint32_t page_size = spp->secs_per_pg * spp->secsz;
+    uint8_t *page = g_malloc(page_size);
+    int sg_cur_index = 0;
+    dma_addr_t sg_cur_byte = 0;
 
     if (end_lpn >= spp->tt_pgs) {
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
@@ -821,12 +894,47 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 
     while (should_gc_high(ssd)) {
         /* perform GC here until !should_gc(ssd) */
-        r = do_gc(ssd, true);
+        r = do_gc(mbe, ssd, true);
         if (r == -1)
             break;
     }
 
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        uint64_t page_lba = lpn * spp->secs_per_pg;
+        uint64_t write_start = MAX(lba, page_lba);
+        uint64_t write_end = MIN(lba + len, page_lba + spp->secs_per_pg);
+        uint32_t page_offset = (write_start - page_lba) * spp->secsz;
+        uint32_t bytes = (write_end - write_start) * spp->secsz;
+        bool full_page = page_offset == 0 && bytes == page_size;
+        struct ppa old_ppa = get_maptbl_ent(ssd, lpn);
+        bool old_page_valid = mapped_ppa(&old_ppa) &&
+                              valid_ppa(ssd, &old_ppa);
+
+        if (!full_page && old_page_valid) {
+            struct nand_cmd srd;
+
+            if (bbssd_backend_read_page(mbe, page,
+                                        ppa2pgidx(ssd, &old_ppa),
+                                        page_size) != 0) {
+                ftl_err("failed to read old BBSSD page data\n");
+                abort();
+            }
+            srd.type = USER_IO;
+            srd.cmd = NAND_READ;
+            srd.stime = req->stime;
+            curlat = ssd_advance_status(ssd, &old_ppa, &srd);
+            maxlat = (curlat > maxlat) ? curlat : maxlat;
+        } else {
+            memset(page, 0, page_size);
+        }
+
+        if (bbssd_rw_one(&req->qsg, &sg_cur_index, &sg_cur_byte,
+                         page + page_offset, bytes,
+                         DMA_DIRECTION_TO_DEVICE) != 0) {
+            ftl_err("failed to copy BBSSD write data from guest\n");
+            abort();
+        }
+
         ppa = get_maptbl_ent(ssd, lpn);
         if (mapped_ppa(&ppa)) {
             /* update old page information first */
@@ -836,6 +944,11 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 
         /* new write */
         ppa = get_new_page(ssd);
+        if (bbssd_backend_write_page(mbe, page, ppa2pgidx(ssd, &ppa),
+                                     page_size) != 0) {
+            ftl_err("failed to write BBSSD page data\n");
+            abort();
+        }
         /* update maptbl */
         set_maptbl_ent(ssd, lpn, &ppa);
         /* update rmap */
@@ -854,6 +967,9 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         curlat = ssd_advance_status(ssd, &ppa, &swr);
         maxlat = (curlat > maxlat) ? curlat : maxlat;
     }
+
+    qemu_sglist_destroy(&req->qsg);
+    g_free(page);
 
     return maxlat;
 }
@@ -971,10 +1087,10 @@ static void *ftl_thread(void *arg)
             ftl_assert(req);
             switch (req->cmd.opcode) {
             case NVME_CMD_WRITE:
-                lat = ssd_write(ssd, req);
+                lat = ssd_write(n->mbe, ssd, req);
                 break;
             case NVME_CMD_READ:
-                lat = ssd_read(ssd, req);
+                lat = ssd_read(n->mbe, ssd, req);
                 break;
             case NVME_CMD_DSM:
                 if (req->dsm_ranges && req->dsm_nr_ranges > 0) {
@@ -996,7 +1112,7 @@ static void *ftl_thread(void *arg)
 
             /* clean one line if needed (in the background) */
             if (should_gc(ssd)) {
-                do_gc(ssd, false);
+                do_gc(n->mbe, ssd, false);
             }
         }
     }

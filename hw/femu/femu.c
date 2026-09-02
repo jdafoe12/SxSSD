@@ -530,10 +530,18 @@ static int nvme_register_extensions(FemuCtrl *n)
     return 0;
 }
 
+static int64_t bbssd_physical_bytes(const BbCtrlParams *bbp)
+{
+    return (int64_t)bbp->secsz * bbp->secs_per_pg * bbp->pgs_per_blk *
+           bbp->blks_per_pl * bbp->pls_per_lun * bbp->luns_per_ch *
+           bbp->nchs;
+}
+
 static void femu_realize(PCIDevice *pci_dev, Error **errp)
 {
     FemuCtrl *n = FEMU(pci_dev);
     int64_t bs_size;
+    int64_t ns_size;
 
     nvme_check_size();
 
@@ -541,7 +549,11 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
         return;
     }
 
-    bs_size = ((int64_t)n->memsz) * 1024 * 1024;
+    ns_size = ((int64_t)n->memsz) * 1024 * 1024;
+    bs_size = ns_size;
+    if (BBSSD(n)) {
+        bs_size = bbssd_physical_bytes(&n->bb_params);
+    }
 
     init_dram_backend(&n->mbe, bs_size);
     n->mbe->femu_mode = n->femu_mode;
@@ -549,7 +561,7 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     n->completed = 0;
     n->start_time = time(NULL);
     n->reg_size = pow2ceil(0x1004 + 2 * (n->nr_io_queues + 1) * 4);
-    n->ns_size = bs_size / (uint64_t)n->num_namespaces;
+    n->ns_size = ns_size / (uint64_t)n->num_namespaces;
 
     /* Coperd: [1..nr_io_queues] are used as IO queues */
     n->sq = g_malloc0(sizeof(*n->sq) * (n->nr_io_queues + 1));

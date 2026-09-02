@@ -590,7 +590,8 @@ static sxs_u64 block_write_action(struct sxs_policy_context *context,
             return 0;
         }
         block_bytes_zero(page, metadata->page_size);
-        if (old_ppa != BLOCK_UNMAPPED &&
+        if ((page_sector != 0 || sectors != metadata->sectors_per_page) &&
+            old_ppa != BLOCK_UNMAPPED &&
             sxs_ppa_validate(old_ppa) == 1 &&
             block_page_read(old_ppa, page, metadata->page_size,
                             &ignored_read_latency) != 0) {

@@ -1177,6 +1177,11 @@ typedef struct BbCtrlParams {
     int gc_thres_pcent_high;
     int op_pct; /* overprovision percentage (0-100), logical space excludes this */
 
+#ifdef FEMU_EVAL
+    uint32_t host_mhz;
+    uint32_t ctrl_mhz;
+#endif
+
 } BbCtrlParams;
 
 typedef struct ZNSCtrlParams {

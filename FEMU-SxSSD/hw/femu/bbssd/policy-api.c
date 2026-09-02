@@ -808,6 +808,30 @@ static int write_page_result(struct sxs_page_result *result, int32_t status,
     return 0;
 }
 
+#ifdef FEMU_EVAL
+/*
+ * The comparable projection is defined for the Block policy: its read action
+ * reads mapped host pages, its write action reads only old partial pages, and
+ * its migration/erase operations implement GC.  Keep the raw operation
+ * counters at this native boundary so the policy artifact remains unchanged.
+ */
+static uint8_t eval_nvme_opcode(const struct pe_policy_execution *execution)
+{
+    if (!execution ||
+        execution->authoritative_event_kind != SXS_EVENT_NVME_IO) {
+        return UINT8_MAX;
+    }
+    return execution->event_snapshot.nvme.opcode;
+}
+
+static bool eval_is_gc_execution(const struct pe_policy_execution *execution)
+{
+    return execution &&
+           (execution->authoritative_event_kind == SXS_EVENT_BACKGROUND ||
+            eval_nvme_opcode(execution) == NVME_CMD_WRITE);
+}
+#endif
+
 /* Physical-page and eSWD lifecycle operations. */
 int32_t policy_api_page_read(struct pe_policy_execution *execution,
                          const struct sxs_page_read_request *request,
@@ -857,6 +881,18 @@ int32_t policy_api_page_read(struct pe_policy_execution *execution,
         g_free(native_oob);
         return -SXS_WASM_EIO;
     }
+#ifdef FEMU_EVAL
+    switch (eval_nvme_opcode(execution)) {
+    case NVME_CMD_READ:
+        execution->engine->ssd->stats_ctl.stats.host_read_page_reads++;
+        break;
+    case NVME_CMD_WRITE:
+        execution->engine->ssd->stats_ctl.stats.rmw_read_page_reads++;
+        break;
+    default:
+        break;
+    }
+#endif
     if (data_length) {
         memcpy(data, page + request->page_offset, data_length);
     }
@@ -904,6 +940,11 @@ int32_t policy_api_page_append(struct pe_policy_execution *execution,
                                execution_start_time_ns(execution)) != 0) {
         return write_page_result(result, -SXS_WASM_EIO, 0, UINT64_MAX, 0);
     }
+#ifdef FEMU_EVAL
+    if (eval_nvme_opcode(execution) == NVME_CMD_WRITE) {
+        execution->engine->ssd->stats_ctl.stats.host_write_page_programs++;
+    }
+#endif
     return write_page_result(result, 0,
                              execution->engine->ssd->raw_flash->sp.secs_per_pg,
                              ppa.ppa, latency);
@@ -954,6 +995,8 @@ int32_t policy_api_eswd_advance_wp(struct pe_policy_execution *execution,
 uint64_t policy_api_eswd_erase(struct pe_policy_execution *execution,
                            uint32_t eswd_id)
 {
+    uint64_t latency;
+
     execution = validated_execution(execution);
     if (!phase_is(execution, SXS_PHASE_ACTION)) {
         return (uint64_t)-SXS_WASM_EPERM;
@@ -961,8 +1004,22 @@ uint64_t policy_api_eswd_erase(struct pe_policy_execution *execution,
     if (eswd_id >= execution->engine->ssd->tt_eswds) {
         return (uint64_t)-SXS_WASM_EINVAL;
     }
-    return native_eswd_erase_physical(execution->engine->ssd, eswd_id,
-                                   execution_start_time_ns(execution));
+    latency = native_eswd_erase_physical(execution->engine->ssd, eswd_id,
+                                          execution_start_time_ns(execution));
+#ifdef FEMU_EVAL
+    if (eval_is_gc_execution(execution)) {
+        struct ssd_stats *stats = &execution->engine->ssd->stats_ctl.stats;
+
+        stats->gc_invocations++;
+        stats->block_erases += execution->engine->ssd->eswd_layout.blks_per_eswd;
+        if (execution->authoritative_event_kind == SXS_EVENT_BACKGROUND) {
+            stats->background_gc_invocations++;
+        } else {
+            stats->foreground_gc_invocations++;
+        }
+    }
+#endif
+    return latency;
 }
 
 int32_t policy_api_page_migrate(struct pe_policy_execution *execution,
@@ -986,6 +1043,16 @@ int32_t policy_api_page_migrate(struct pe_policy_execution *execution,
                                 &latency) != 0) {
         return write_page_result(result, -SXS_WASM_EIO, 0, UINT64_MAX, 0);
     }
+#ifdef FEMU_EVAL
+    if (eval_is_gc_execution(execution)) {
+        struct ssd_stats *stats = &execution->engine->ssd->stats_ctl.stats;
+
+        stats->gc_page_reads++;
+        stats->gc_page_programs++;
+        stats->gc_page_copies++;
+        stats->gc_pages_migrated++;
+    }
+#endif
     return write_page_result(result, 0,
                              execution->engine->ssd->raw_flash->sp.secs_per_pg,
                              destination.ppa, latency);

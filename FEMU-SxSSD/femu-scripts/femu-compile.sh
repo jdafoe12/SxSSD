@@ -3,8 +3,10 @@
 NRCPUS="$(cat /proc/cpuinfo | grep "vendor_id" | wc -l)"
 
 make clean
-# --disable-werror --extra-cflags=-w --disable-git-update
-../configure --enable-kvm --target-list=x86_64-softmmu --enable-slirp
+# Keep newer compiler warnings from turning an otherwise valid FEMU build
+# into a hard failure (for example, bundled DTC with GCC 16).
+../configure --enable-kvm --target-list=x86_64-softmmu --enable-slirp \
+    --disable-werror
 make -j $NRCPUS
 
 echo ""

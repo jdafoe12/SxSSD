@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Modified for SxSSD: 2026-09-03.
 
 usage() {
     cat <<EOF

@@ -5,6 +5,9 @@
 # Huaicheng Li <huaicheng@cs.uchicago.edu>
 # Run FEMU as a black-box SSD (FTL managed by the device)
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SxSSD_ROOT="$(realpath "$SCRIPT_DIR/../..")"
+
 # image directory
 IMGDIR=$HOME/images
 # Virtual machine disk image
@@ -58,7 +61,7 @@ echo ${FEMU_OPTIONS}
 #   sudo mkdir -p /mnt/femu-host-results
 #   sudo mount -t 9p -o trans=virtio,version=9p2000.L femu_host_results /mnt/femu-host-results
 if [[ -z "${FEMU_HOST_RESULTS_DIR:-}" ]]; then
-    FEMU_HOST_RESULTS_DIR="${HOME}/femu-results"
+    FEMU_HOST_RESULTS_DIR="$SxSSD_ROOT/femu-results"
 fi
 mkdir -p "$FEMU_HOST_RESULTS_DIR"
 FEMU_HOST_RESULTS_DIR="$(realpath "$FEMU_HOST_RESULTS_DIR")"
@@ -73,7 +76,7 @@ if [[ ! -e "$OSIMGF" ]]; then
 	exit
 fi
 
-sudo ./qemu-system-x86_64 \
+sudo env FEMU_STATS_DIR="$FEMU_HOST_RESULTS_DIR" ./qemu-system-x86_64 \
     -name "FEMU-BBSSD-VM" \
     -enable-kvm \
     -cpu host \

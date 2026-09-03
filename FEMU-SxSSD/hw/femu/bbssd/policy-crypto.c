@@ -216,11 +216,19 @@ int pe_crypto_hkdf_sha256(const uint8_t *key, size_t key_length,
 
     hmac_sha256_set_key(&context, salt_length,
                         salt_length ? salt : &pe_crypto_empty);
+#if NETTLE_VERSION_MAJOR >= 4
     hkdf_extract(&context,
                  (nettle_hash_update_func *)hmac_sha256_update,
                  (nettle_hash_digest_func *)hmac_sha256_digest,
                  key_length, key_length ? key : &pe_crypto_empty,
                  pseudorandom_key);
+#else
+    hkdf_extract(&context,
+                 (nettle_hash_update_func *)hmac_sha256_update,
+                 (nettle_hash_digest_func *)hmac_sha256_digest,
+                 PE_SHA256_SIZE, key_length,
+                 key_length ? key : &pe_crypto_empty, pseudorandom_key);
+#endif
     hmac_sha256_set_key(&context, sizeof(pseudorandom_key),
                         pseudorandom_key);
     hkdf_expand(&context,

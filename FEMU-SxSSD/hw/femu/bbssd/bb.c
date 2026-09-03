@@ -2,6 +2,7 @@
 /*
  * Modified for SxSSD by Josh Dafoe.
  * SxSSD modifications: 2025-12-16 through 2026-08-23.
+ * Additional SxSSD modification: 2026-09-03.
  * Includes code reorganized from the FEMU BBSSD ftl.c implementation.
  */
 
@@ -197,6 +198,10 @@ static int ssd_stats_write_json(FemuCtrl *n, uint32_t run_id)
     fprintf(f, "}\n");
 
     if (fflush(f) != 0 || fsync(fileno(f)) != 0) {
+        ret = -errno;
+        goto out;
+    }
+    if (fchmod(fileno(f), 0644) != 0) {
         ret = -errno;
         goto out;
     }

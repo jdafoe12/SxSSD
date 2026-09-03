@@ -12,6 +12,7 @@ __pycache__/
 
 # Generated evaluation data
 results/
+/femu-results/
 *.iolog
 FEMU-SxSSD/hw/femu/bbssd/workload-eval/workload_sets/results/
 FEMU/hw/femu/bbssd/workload-eval/workload_sets/results/
